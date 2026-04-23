@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Laporan Intelijen Bisnis — RETRO</title>
+  <link rel="stylesheet" href="proposal.css">
+</head>
+<body class="{{ theme }}">
+
+<!-- ═══════════════════════════════════════
+     HALAMAN COVER
+     ═══════════════════════════════════════ -->
+<div class="cover">
+  <div class="cover-logo">RETRO · Internal Intelligence Report</div>
+
+  <div>
+    <div class="cover-title">Laporan Intelijen Bisnis</div>
+    <div class="cover-subtitle">Analisis Batch — {{ stats.companies_count | default(0) }} Perusahaan</div>
+    <div class="cover-subtitle" style="font-size:11pt; margin-top:6mm; opacity:0.75;">
+      Disiapkan untuk: <strong>{{ author }}</strong>
+    </div>
+  </div>
+
+  <div class="cover-meta">
+    <span>{{ date }}</span>
+    <span>INTERNAL — RAHASIA</span>
+    <span>RETRO Pipeline v{{ stats.version | default("0.1.0") }}</span>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     DAFTAR ISI
+     ═══════════════════════════════════════ -->
+<div class="toc">
+  <div class="confidential">— Dokumen Internal — Tidak untuk Didistribusikan —</div>
+  <h2>Daftar Isi</h2>
+  {% set chapters = [
+    ("1", "Executive Summary"),
+    ("2", "Statistik Pipeline Run"),
+    ("3", "Profil Semua Perusahaan (Ranked)"),
+    ("4", "Top 3 Rekomendasi"),
+    ("5", "Error Log &amp; Catatan Teknis"),
+    ("A", "Apendiks — Data Mentah Entitas"),
+  ] %}
+  {% for num, title in chapters %}
+  <div class="toc-item">
+    <span class="toc-num">{{ num }}</span>
+    <span>{{ title }}</span>
+    <span class="toc-dots"></span>
+    <span class="toc-page">{{ loop.index + 1 }}</span>
+  </div>
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 1: EXECUTIVE SUMMARY
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>1. Executive Summary</h1>
+  {% if synthesis and synthesis.executive_summary %}
+  <div class="callout">{{ synthesis.executive_summary }}</div>
+  {% endif %}
+
+  {% if synthesis and synthesis.batch_notes %}
+  <div class="card" style="margin-top:5mm;">
+    <div class="card-title">Catatan Batch</div>
+    <p>{{ synthesis.batch_notes }}</p>
+  </div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 2: STATISTIK PIPELINE
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>2. Statistik Pipeline Run</h1>
+
+  <div class="stats-row">
+    <div class="stat-box">
+      <span class="stat-number">{{ stats.companies_count | default(0) }}</span>
+      <span class="stat-label">Total Company</span>
+    </div>
+    <div class="stat-box">
+      <span class="stat-number">{{ stats.success_count | default(0) }}</span>
+      <span class="stat-label">Crawl Sukses</span>
+    </div>
+    <div class="stat-box">
+      <span class="stat-number">{{ stats.duration_seconds | default(0) | round(1) }}s</span>
+      <span class="stat-label">Total Waktu</span>
+    </div>
+    <div class="stat-box">
+      <span class="stat-number">{{ stats.error_count | default(0) }}</span>
+      <span class="stat-label">Error</span>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Parameter</th><th>Nilai</th></tr>
+    <tr><td>Input File</td><td>{{ stats.input_file | default("—") }}</td></tr>
+    <tr><td>Groq Model</td><td>{{ stats.groq_model | default("—") }}</td></tr>
+    <tr><td>Crawler MAIN</td><td>httpx + BeautifulSoup4</td></tr>
+    <tr><td>NLP Engine</td><td>spaCy xx_ent_wiki_sm</td></tr>
+    <tr><td>Storage</td><td>SQLite</td></tr>
+    <tr><td>PDF Engine</td><td>WeasyPrint + Jinja2</td></tr>
+    <tr><td>Waktu Mulai</td><td>{{ stats.start_time | default("—") }}</td></tr>
+    <tr><td>Waktu Selesai</td><td>{{ stats.end_time | default("—") }}</td></tr>
+  </table>
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 3: PROFIL SEMUA PERUSAHAAN
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>3. Profil Perusahaan (Ranked by Potential)</h1>
+
+  {% for profile in profiles %}
+  <div class="card" style="margin-bottom:5mm; page-break-inside:avoid;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3mm;">
+      <div class="card-title">{{ loop.index }}. {{ profile.company_name }}</div>
+      <div>
+        <span class="tag {{ 'success' if profile.confidence_score | default(0) >= 0.7 else '' }}">
+          Score: {{ "%.0f" | format((profile.confidence_score | default(0)) * 100) }}%
+        </span>
+      </div>
+    </div>
+
+    <div class="card-grid">
+      <div>
+        <div class="card-label">Industri</div>
+        <div class="card-value">{{ profile.industry | default("—") }}</div>
+      </div>
+      <div>
+        <div class="card-label">Skala</div>
+        <div class="card-value">{{ profile.company_size | default("—") | title }}</div>
+      </div>
+      <div>
+        <div class="card-label">Tech Maturity</div>
+        <div class="card-value">{{ profile.tech_maturity | default("—") | replace("_", " ") | title }}</div>
+      </div>
+      <div>
+        <div class="card-label">Bahasa</div>
+        <div class="card-value">{{ profile.language_detected | default("—") | upper }}</div>
+      </div>
+    </div>
+
+    {% if profile.products_services %}
+    <div style="margin-top:3mm;">
+      <div class="card-label">Produk / Layanan</div>
+      <div style="margin-top:1.5mm;">
+        {% for ps in profile.products_services %}
+          <span class="tag">{{ ps }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% if profile.collaboration_potential %}
+    <div style="margin-top:3mm;">
+      <div class="card-label">Peluang Kolaborasi</div>
+      <ul style="margin-top:1.5mm; margin-left:5mm; font-size:9.5pt;">
+        {% for cp in profile.collaboration_potential %}
+          <li>{{ cp }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if profile.red_flags %}
+    <div style="margin-top:3mm;">
+      <div class="card-label">Red Flags</div>
+      <div style="margin-top:1.5mm;">
+        {% for rf in profile.red_flags %}
+          <span class="tag danger">{{ rf }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div style="margin-top:3mm;">
+      <div class="card-label">Confidence</div>
+      <div class="confidence-bar">
+        <div class="confidence-fill" style="width:{{ (profile.confidence_score | default(0)) * 100 }}%;"></div>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <p><em>Tidak ada profil perusahaan yang berhasil dibuat.</em></p>
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 4: TOP 3 REKOMENDASI
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>4. Top 3 Rekomendasi</h1>
+
+  {% if synthesis and synthesis.top_matches %}
+    {% for rec in synthesis.top_matches[:3] %}
+    <div class="card" style="margin-bottom:5mm;">
+      <div class="card-title">#{{ loop.index }} — {{ rec.company_name | default("—") }}</div>
+      {% if rec.ranking_reason %}
+      <p><strong>Alasan:</strong> {{ rec.ranking_reason }}</p>
+      {% endif %}
+      {% if rec.collaboration_strategy %}
+      <p><strong>Strategi:</strong> {{ rec.collaboration_strategy }}</p>
+      {% endif %}
+      {% if rec.priority_score is defined %}
+      <p><strong>Priority Score:</strong> {{ "%.2f" | format(rec.priority_score) }}</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  {% else %}
+  <p><em>Data sintesis tidak tersedia.</em></p>
+  {% endif %}
+
+  {% if synthesis and synthesis.market_insight %}
+  <div class="callout">
+    <strong>Market Insight:</strong> {{ synthesis.market_insight }}
+  </div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 5: ERROR LOG
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>5. Error Log &amp; Catatan Teknis</h1>
+
+  {% if error_log %}
+  <table>
+    <tr><th>#</th><th>Error</th></tr>
+    {% for err in error_log %}
+    <tr><td>{{ loop.index }}</td><td>{{ err }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="callout">Tidak ada error yang tercatat dalam run ini.</div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     APENDIKS
+     ═══════════════════════════════════════ -->
+<div class="appendix">
+  <h1>Apendiks A — Data Mentah Entitas NLP</h1>
+
+  {% for profile in profiles %}
+  <h3>{{ profile.company_name }}</h3>
+  {% if profile.domain %}<p><strong>Domain:</strong> {{ profile.domain }}</p>{% endif %}
+  {% if profile.target_customers %}<p><strong>Target:</strong> {{ profile.target_customers }}</p>{% endif %}
+  <hr>
+  {% endfor %}
+
+  <p style="font-size:8.5pt; color:var(--text-muted); margin-top:6mm;">
+    Laporan ini dibuat secara otomatis oleh <strong>RETRO Pipeline</strong> pada {{ generated_at }}.
+    Data bersumber dari informasi publik. Hanya untuk penggunaan internal.
+  </p>
+</div>
+
+</body>
+</html>

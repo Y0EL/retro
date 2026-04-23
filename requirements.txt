@@ -1,0 +1,50 @@
+# RETRO Pipeline — Dependencies
+# First loop: Groq + LangGraph + local tools (no Docker required)
+
+# ===== LLM & Agent Framework =====
+langgraph>=0.2.0
+langchain-groq>=0.2.0
+langchain-core>=0.3.0
+groq>=0.9.0
+instructor>=1.3.0
+
+# ===== Web Crawling =====
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+curl-cffi>=0.7.0
+lxml>=5.2.0
+
+# ===== NLP & Language Detection =====
+spacy>=3.7.0
+# After install: python -m spacy download xx_ent_wiki_sm
+lingua-language-detector>=2.0.0
+
+# ===== Data Validation & Quality =====
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+tenacity>=8.3.0
+
+# ===== Storage =====
+SQLModel>=0.0.19
+dnspython>=2.6.0
+tldextract>=5.1.0
+
+# ===== Graph Analysis =====
+networkx>=3.3.0
+
+# ===== PDF Generation =====
+weasyprint>=62.0
+jinja2>=3.1.4
+# Fallback PDF (if WeasyPrint fails on Windows):
+fpdf2>=2.7.0
+
+# ===== Data Processing =====
+polars>=1.0.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+
+# ===== Logging & Observability =====
+structlog>=24.1.0
+
+# ===== Utilities =====
+python-dotenv>=1.0.0

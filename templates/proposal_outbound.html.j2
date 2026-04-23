@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Proposal Kerja Sama — {{ target_company }}</title>
+  <link rel="stylesheet" href="proposal.css">
+</head>
+<body class="{{ theme }}">
+
+<!-- ═══════════════════════════════════════
+     HALAMAN COVER
+     ═══════════════════════════════════════ -->
+<div class="cover">
+  <div class="cover-logo">RETRO · B2B Intelligence</div>
+
+  <div>
+    <div class="cover-title">Proposal Kerja Sama Strategis</div>
+    <div class="cover-subtitle">Kepada Yth. {{ target_company }}</div>
+    <div class="cover-subtitle" style="font-size:11pt; margin-top:6mm; opacity:0.75;">
+      Diajukan oleh: <strong>{{ author }}</strong>
+    </div>
+  </div>
+
+  <div class="cover-meta">
+    <span>{{ date }}</span>
+    <span>DOKUMEN RAHASIA</span>
+    <span>Dibuat oleh RETRO Pipeline</span>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     DAFTAR ISI
+     ═══════════════════════════════════════ -->
+<div class="toc">
+  <div class="confidential">— Dokumen Rahasia &amp; Terbatas —</div>
+  <h2>Daftar Isi</h2>
+
+  {% set chapters = [
+    ("1", "Executive Summary"),
+    ("2", "Latar Belakang Perusahaan Kami"),
+    ("3", "Profil " ~ target_company),
+    ("4", "Analisis Peluang Kolaborasi"),
+    ("5", "Nilai &amp; Manfaat yang Ditawarkan"),
+    ("6", "Timeline Implementasi"),
+    ("7", "Langkah Selanjutnya"),
+    ("A", "Apendiks — Data Teknis"),
+  ] %}
+
+  {% for num, title in chapters %}
+  <div class="toc-item">
+    <span class="toc-num">{{ num }}</span>
+    <span>{{ title }}</span>
+    <span class="toc-dots"></span>
+    <span class="toc-page">{{ loop.index + 1 }}</span>
+  </div>
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 1: EXECUTIVE SUMMARY
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>1. Executive Summary</h1>
+  <div class="callout">
+    {{ sections.executive_summary | default("—") }}
+  </div>
+
+  {% if profile %}
+  <div class="card" style="margin-top:6mm;">
+    <div class="card-title">Snapshot: {{ target_company }}</div>
+    <div class="card-grid">
+      <div>
+        <div class="card-label">Industri</div>
+        <div class="card-value">{{ profile.industry | default("—") }}</div>
+      </div>
+      <div>
+        <div class="card-label">Skala Perusahaan</div>
+        <div class="card-value">{{ profile.company_size | default("—") | title }}</div>
+      </div>
+      <div>
+        <div class="card-label">Kematangan Digital</div>
+        <div class="card-value">{{ profile.tech_maturity | default("—") | replace("_", " ") | title }}</div>
+      </div>
+      <div>
+        <div class="card-label">Bahasa Konten</div>
+        <div class="card-value">{{ profile.language_detected | default("—") | upper }}</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 2: LATAR BELAKANG
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>2. Latar Belakang Perusahaan Kami</h1>
+  {% for para in (sections.background_our_company | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 3: PROFIL TARGET
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>3. Profil {{ target_company }}</h1>
+
+  {% if profile %}
+  <div class="card">
+    <div class="card-title">{{ profile.company_name | default(target_company) }}</div>
+    <div class="card-grid">
+      <div>
+        <div class="card-label">Domain</div>
+        <div class="card-value">{{ profile.domain | default("—") }}</div>
+      </div>
+      <div>
+        <div class="card-label">Target Pelanggan</div>
+        <div class="card-value">{{ profile.target_customers | default("—") }}</div>
+      </div>
+    </div>
+
+    {% if profile.products_services %}
+    <div style="margin-top:4mm;">
+      <div class="card-label">Produk / Layanan Utama</div>
+      <div style="margin-top:2mm;">
+        {% for ps in profile.products_services %}
+          <span class="tag">{{ ps }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% if profile.red_flags %}
+    <div style="margin-top:4mm;">
+      <div class="card-label">Catatan Risiko</div>
+      <div style="margin-top:2mm;">
+        {% for rf in profile.red_flags %}
+          <span class="tag danger">{{ rf }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div style="margin-top:4mm;">
+      <div class="card-label">Confidence Score</div>
+      <div class="confidence-bar">
+        <div class="confidence-fill" style="width:{{ (profile.confidence_score | default(0)) * 100 }}%;"></div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% for para in (sections.target_company_profile | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 4: ANALISIS KOLABORASI
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>4. Analisis Peluang Kolaborasi</h1>
+
+  {% if profile and profile.collaboration_potential %}
+  <div class="card" style="margin-bottom:5mm;">
+    <div class="card-title">Potensi Kolaborasi Teridentifikasi</div>
+    <ul>
+      {% for cp in profile.collaboration_potential %}
+        <li>{{ cp }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% for para in (sections.collaboration_analysis | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 5: NILAI YANG DITAWARKAN
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>5. Nilai &amp; Manfaat yang Ditawarkan</h1>
+  {% for para in (sections.proposed_value | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 6: TIMELINE
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>6. Timeline Implementasi</h1>
+  {% for para in (sections.implementation_timeline | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     BAB 7: LANGKAH SELANJUTNYA
+     ═══════════════════════════════════════ -->
+<div class="chapter">
+  <h1>7. Langkah Selanjutnya</h1>
+  {% for para in (sections.next_steps | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+
+  {% if sections.email_subject %}
+  <div class="callout" style="margin-top:6mm;">
+    <strong>Saran Subject Email:</strong> {{ sections.email_subject }}<br>
+    {% if sections.email_body_preview %}
+    <hr style="margin:3mm 0;">
+    <em>Preview:</em> {{ sections.email_body_preview }}
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+
+<!-- ═══════════════════════════════════════
+     APENDIKS
+     ═══════════════════════════════════════ -->
+<div class="appendix">
+  <h1>Apendiks A — Data Teknis &amp; Referensi</h1>
+  {% for para in (sections.appendix_data | default("") | string).split('\n') %}
+    {% if para.strip() %}<p>{{ para }}</p>{% endif %}
+  {% endfor %}
+
+  <hr>
+  <p style="font-size:8.5pt; color:var(--text-muted); margin-top:4mm;">
+    Dokumen ini dibuat secara otomatis oleh <strong>RETRO Pipeline</strong> pada {{ generated_at }}.
+    Seluruh data bersumber dari informasi publik yang tersedia di internet.
+    Keakuratan informasi bergantung pada kualitas data yang dapat diakses saat pipeline dijalankan.
+  </p>
+</div>
+
+</body>
+</html>

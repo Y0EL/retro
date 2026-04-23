@@ -1,0 +1,385 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   RETRO Proposal CSS — Light & Dark Themes
+   Controlled via <body class="light"> or <body class="dark">
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Base reset ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+@page {
+  size: A4;
+  margin: 20mm 18mm 22mm 20mm;
+  @bottom-right {
+    content: counter(page) " / " counter(pages);
+    font-size: 9pt;
+    color: var(--text-muted);
+  }
+}
+
+/* ── CSS Variables: Light theme (default) ──────────────────────────────── */
+body.light, body {
+  --bg:           #ffffff;
+  --bg-alt:       #f5f7fa;
+  --bg-card:      #eef2fb;
+  --accent:       #0047AB;
+  --accent-light: #dce8ff;
+  --text:         #1a1a2e;
+  --text-muted:   #555577;
+  --border:       #c8d5ea;
+  --cover-bg:     #0047AB;
+  --cover-text:   #ffffff;
+  --toc-link:     #0047AB;
+  --tag-bg:       #dce8ff;
+  --tag-text:     #0047AB;
+  --danger:       #cc0000;
+  --success:      #007a33;
+}
+
+/* ── CSS Variables: Dark theme ─────────────────────────────────────────── */
+body.dark {
+  --bg:           #1a1a2e;
+  --bg-alt:       #16213e;
+  --bg-card:      #0f3460;
+  --accent:       #00d4ff;
+  --accent-light: #003355;
+  --text:         #e8eaf6;
+  --text-muted:   #9099bb;
+  --border:       #1e4070;
+  --cover-bg:     #0f3460;
+  --cover-text:   #00d4ff;
+  --toc-link:     #00d4ff;
+  --tag-bg:       #003355;
+  --tag-text:     #00d4ff;
+  --danger:       #ff6b6b;
+  --success:      #69db7c;
+}
+
+/* ── Base typography ────────────────────────────────────────────────────── */
+body {
+  font-family: "Segoe UI", Arial, Helvetica, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.7;
+  color: var(--text);
+  background: var(--bg);
+}
+
+/* ── Cover page ─────────────────────────────────────────────────────────── */
+.cover {
+  page-break-after: always;
+  background: var(--cover-bg);
+  color: var(--cover-text);
+  min-height: 270mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 30mm 20mm 20mm;
+  border-radius: 0;
+}
+
+.cover-logo {
+  font-size: 11pt;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  opacity: 0.75;
+  margin-bottom: 40mm;
+}
+
+.cover-title {
+  font-size: 28pt;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 6mm;
+}
+
+.cover-subtitle {
+  font-size: 14pt;
+  opacity: 0.85;
+  margin-bottom: 4mm;
+}
+
+.cover-meta {
+  font-size: 10pt;
+  opacity: 0.65;
+  margin-top: auto;
+  border-top: 1px solid rgba(255,255,255,0.25);
+  padding-top: 6mm;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── Table of Contents ──────────────────────────────────────────────────── */
+.toc {
+  page-break-after: always;
+  padding: 10mm 0;
+}
+
+.toc h2 {
+  font-size: 18pt;
+  color: var(--accent);
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 3mm;
+  margin-bottom: 8mm;
+}
+
+.toc-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 3mm 0;
+  border-bottom: 1px dotted var(--border);
+  color: var(--toc-link);
+  font-size: 10.5pt;
+}
+
+.toc-item .toc-num {
+  color: var(--text-muted);
+  font-size: 9pt;
+  margin-right: 4mm;
+  flex-shrink: 0;
+}
+
+.toc-item .toc-dots {
+  flex: 1;
+  border-bottom: 1px dotted var(--border);
+  margin: 0 4mm;
+}
+
+.toc-item .toc-page {
+  color: var(--text-muted);
+  font-size: 9pt;
+}
+
+/* ── Chapter / Section ──────────────────────────────────────────────────── */
+.chapter {
+  page-break-before: always;
+}
+
+.chapter:first-of-type {
+  page-break-before: avoid;
+}
+
+h1 {
+  font-size: 20pt;
+  color: var(--accent);
+  border-left: 5px solid var(--accent);
+  padding-left: 5mm;
+  margin: 8mm 0 5mm;
+  page-break-after: avoid;
+}
+
+h2 {
+  font-size: 14pt;
+  color: var(--accent);
+  margin: 7mm 0 3mm;
+  page-break-after: avoid;
+}
+
+h3 {
+  font-size: 11.5pt;
+  color: var(--text);
+  font-weight: 600;
+  margin: 5mm 0 2mm;
+  page-break-after: avoid;
+}
+
+p {
+  margin-bottom: 3.5mm;
+  text-align: justify;
+}
+
+ul, ol {
+  margin: 2mm 0 4mm 8mm;
+}
+
+li {
+  margin-bottom: 1.5mm;
+}
+
+/* ── Info card / profile card ───────────────────────────────────────────── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5mm 6mm;
+  margin: 4mm 0;
+  page-break-inside: avoid;
+}
+
+.card-title {
+  font-size: 11pt;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 3mm;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2mm 6mm;
+  font-size: 9.5pt;
+}
+
+.card-label {
+  color: var(--text-muted);
+  font-size: 8.5pt;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.card-value {
+  font-weight: 600;
+}
+
+/* ── Tags ───────────────────────────────────────────────────────────────── */
+.tag {
+  display: inline-block;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  font-size: 8pt;
+  padding: 1mm 3mm;
+  border-radius: 2px;
+  margin: 1mm 1mm 1mm 0;
+  font-weight: 600;
+}
+
+.tag.danger {
+  background: #ffe0e0;
+  color: var(--danger);
+}
+
+.tag.success {
+  background: #e0ffe8;
+  color: var(--success);
+}
+
+/* ── Table ──────────────────────────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9.5pt;
+  margin: 4mm 0;
+  page-break-inside: avoid;
+}
+
+th {
+  background: var(--accent);
+  color: white;
+  padding: 3mm 4mm;
+  text-align: left;
+  font-weight: 600;
+}
+
+td {
+  padding: 2.5mm 4mm;
+  border-bottom: 1px solid var(--border);
+}
+
+tr:nth-child(even) td {
+  background: var(--bg-alt);
+}
+
+/* ── Highlight / callout box ────────────────────────────────────────────── */
+.callout {
+  background: var(--accent-light);
+  border-left: 4px solid var(--accent);
+  padding: 4mm 5mm;
+  margin: 4mm 0;
+  font-size: 10pt;
+  border-radius: 0 4px 4px 0;
+  page-break-inside: avoid;
+}
+
+/* ── Stats row (pipeline stats) ─────────────────────────────────────────── */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4mm;
+  margin: 5mm 0;
+}
+
+.stat-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4mm;
+  text-align: center;
+  page-break-inside: avoid;
+}
+
+.stat-number {
+  font-size: 18pt;
+  font-weight: 700;
+  color: var(--accent);
+  display: block;
+}
+
+.stat-label {
+  font-size: 8pt;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Confidence bar ─────────────────────────────────────────────────────── */
+.confidence-bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 2mm;
+}
+
+.confidence-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+}
+
+/* ── Footer line ────────────────────────────────────────────────────────── */
+.doc-footer {
+  position: running(footer);
+  font-size: 8pt;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  padding-top: 2mm;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── Appendix ───────────────────────────────────────────────────────────── */
+.appendix {
+  page-break-before: always;
+}
+
+.appendix h1 {
+  font-size: 16pt;
+}
+
+pre {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  padding: 3mm 4mm;
+  font-size: 8pt;
+  font-family: "Courier New", Courier, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-radius: 3px;
+  margin: 3mm 0;
+}
+
+/* ── Divider ────────────────────────────────────────────────────────────── */
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 5mm 0;
+}
+
+/* ── Confidential stamp ─────────────────────────────────────────────────── */
+.confidential {
+  text-align: center;
+  font-size: 8pt;
+  color: var(--text-muted);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin: 2mm 0 6mm;
+}

@@ -1,0 +1,557 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Graph Database & Relationship Mapping
+# File: 16_graph_database.yaml
+# Purpose: Tools untuk memetakan dan menganalisis relasi antar entitas bisnis.
+#          Vector similarity (Qdrant) bagus untuk "company yang mirip",
+#          tapi graph database jauh lebih powerful untuk "company yang terhubung".
+#
+# RETRO GRAPH USE CASES:
+#   - "Company mana yang hadir di expo yang sama 2 tahun berturut-turut?"
+#   - "Siapa investor PT X? Apakah ada shared investor dengan company Y?"
+#   - "CEO company target juga jadi board member di perusahaan lain?"
+#   - "Subsidiary mana saja yang dimiliki konglomerat ini?"
+#   - "Community detection: cluster company yang sering kolaborasi"
+#
+# STACK YANG DIREKOMENDASIKAN:
+#   NetworkX  = analisis awal, prototyping, di-memory graph (tidak perlu DB)
+#   Neo4j     = production graph database, persistent, query dengan Cypher
+#   Kedua bisa digunakan bersama: NetworkX untuk exploratory analysis,
+#   Neo4j untuk production storage dan complex traversal queries.
+
+tools:
+
+  - id: neo4j
+    name: "Neo4j"
+    category: "Graph Database"
+    description: >
+      Neo4j adalah graph database terpopuler di dunia. Data disimpan sebagai nodes
+      (entitas: Company, Person, Expo, Industry) dan relationships (edges: ATTENDED,
+      INVESTED_IN, SUBSIDIARY_OF, COMPETES_WITH). Query menggunakan Cypher, bahasa
+      deklaratif mirip SQL tapi untuk graph. Python driver resmi tersedia.
+      Community Edition: gratis, self-hosted. Neo4j Aura: cloud managed, free tier 200K nodes.
+      Di RETRO, Neo4j memungkinkan discovery berbasis relasi yang tidak mungkin dilakukan
+      dengan relational DB atau vector DB: "perusahaan mana yang 2 hop dari target kita
+      melalui shared expo dan shared investor?"
+    specific_function: >
+      Peta relasi bisnis antar company yang ditemukan RETRO. Setiap company yang
+      di-crawl menjadi node. Relasi: attended (expo), invested_by, subsidiary_of,
+      competes_with, mentioned_with (co-occurrence dalam berita). Query Cypher
+      memungkinkan traversal untuk discovery opportunities yang tidak terlihat
+      dari flat data.
+    language: "Python"
+    pricing: "Community Edition gratis (self-hosted). Aura Free: 200K nodes, 400K relationships."
+    last_updated: "2025"
+    url: "https://github.com/neo4j/neo4j-python-driver"
+
+    retro:
+      phase: "Phase 2 dan Phase 3 — Data Enrichment dan Synthesis"
+      role: >
+        Graph layer di atas relational DB RETRO. Setiap company yang di-profile
+        juga dimasukkan ke Neo4j dengan relasi expo-nya. Synthesis Agent bisa
+        query Neo4j untuk menemukan "second-degree connections" — company yang
+        tidak ketemu langsung di expo, tapi terhubung melalui shared event atau
+        shared industry player. Ini membuat rekomendasi kolaborasi lebih nuanced.
+      when_to_use: >
+        Gunakan Neo4j ketika:
+        1. Butuh traversal relasi (siapa yang terhubung dengan siapa)
+        2. Ada data relasional yang kompleks (expo -> company -> person -> investor)
+        3. Butuh community detection (cluster company serupa)
+        Untuk MVP awal, bisa gunakan NetworkX dulu (in-memory, tidak perlu Docker).
+        Upgrade ke Neo4j ketika data > 10K nodes atau butuh persistence.
+      priority: "medium (powerful tapi tidak wajib untuk MVP)"
+      output_goes_to: "Query results masuk ke Synthesis Agent context, bukan disimpan ulang"
+
+    setup:
+      install: |
+        pip install neo4j
+        # Docker untuk self-hosted:
+        docker run \
+          --name neo4j-retro \
+          -p 7474:7474 \
+          -p 7687:7687 \
+          -e NEO4J_AUTH=neo4j/retro_password_2024 \
+          -v $(pwd)/neo4j_data:/data \
+          neo4j:5-community
+
+        # Akses Neo4j Browser: http://localhost:7474
+        # Bolt URL: bolt://localhost:7687
+      requirements:
+        - "neo4j>=5.0.0 (Python driver)"
+        - "Neo4j server 5.x (Docker atau native)"
+        - "RAM minimal 512MB untuk Neo4j server"
+      env_vars:
+        - name: NEO4J_URI
+          description: "Bolt URI, e.g., bolt://localhost:7687 atau neo4j+s://xxxx.databases.neo4j.io"
+        - name: NEO4J_USER
+          description: "Username, default: neo4j"
+        - name: NEO4J_PASSWORD
+          description: "Password Neo4j"
+
+    usage:
+      basic_example: |
+        from neo4j import GraphDatabase
+        import os
+
+        driver = GraphDatabase.driver(
+            os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+            auth=(
+                os.environ.get("NEO4J_USER", "neo4j"),
+                os.environ.get("NEO4J_PASSWORD", "password")
+            )
+        )
+
+        with driver.session() as session:
+            # Insert company dan expo, buat relasi ATTENDED
+            session.run("""
+                MERGE (c:Company {name: $company_name, domain: $domain, industry: $industry})
+                MERGE (e:Expo {name: $expo_name, year: $year, location: $location})
+                MERGE (c)-[:ATTENDED {booth_number: $booth}]->(e)
+            """,
+                company_name="PT Telkom Indonesia",
+                domain="telkom.co.id",
+                industry="telekomunikasi",
+                expo_name="Indo Comtech 2024",
+                year=2024,
+                location="Jakarta",
+                booth="A12"
+            )
+
+            # Query: company mana yang hadir di expo yang sama dengan target?
+            result = session.run("""
+                MATCH (target:Company {name: $name})-[:ATTENDED]->(e:Expo)<-[:ATTENDED]-(peer:Company)
+                WHERE target <> peer
+                RETURN peer.name AS company, peer.industry AS industry,
+                       count(e) AS shared_expos,
+                       collect(e.name) AS expo_names
+                ORDER BY shared_expos DESC
+                LIMIT 10
+            """, name="PT Telkom Indonesia")
+
+            for record in result:
+                print(f"{record['company']} | shared expos: {record['shared_expos']}")
+                print(f"  Expos: {', '.join(record['expo_names'])}")
+
+        driver.close()
+
+      retro_example: |
+        from neo4j import GraphDatabase
+        from typing import Optional, List
+        import os
+
+        class RetroGraphDB:
+            """
+            Graph database manager untuk RETRO relationship mapping.
+            """
+
+            def __init__(self):
+                self.driver = GraphDatabase.driver(
+                    os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+                    auth=(
+                        os.environ.get("NEO4J_USER", "neo4j"),
+                        os.environ.get("NEO4J_PASSWORD", "")
+                    ),
+                    max_connection_lifetime=300,
+                    max_connection_pool_size=10,
+                )
+
+            def close(self):
+                self.driver.close()
+
+            def upsert_company_node(self, company_data: dict) -> None:
+                """Tambah atau update company node di graph."""
+                with self.driver.session() as session:
+                    session.run("""
+                        MERGE (c:Company {domain: $domain})
+                        ON CREATE SET
+                            c.name = $name,
+                            c.industry = $industry,
+                            c.size = $size,
+                            c.tech_maturity = $tech_maturity,
+                            c.created_at = datetime()
+                        ON MATCH SET
+                            c.name = $name,
+                            c.industry = $industry,
+                            c.updated_at = datetime()
+                    """,
+                        domain=company_data.get("domain", ""),
+                        name=company_data["company_name"],
+                        industry=company_data.get("industry", "unknown"),
+                        size=company_data.get("company_size", "unknown"),
+                        tech_maturity=company_data.get("tech_maturity", "unknown")
+                    )
+
+            def link_company_to_expo(
+                self,
+                company_domain: str,
+                expo_name: str,
+                expo_year: int,
+                expo_location: str = ""
+            ) -> None:
+                """Buat relasi Company-[:ATTENDED]->Expo."""
+                with self.driver.session() as session:
+                    session.run("""
+                        MATCH (c:Company {domain: $domain})
+                        MERGE (e:Expo {name: $expo_name, year: $year})
+                        ON CREATE SET e.location = $location, e.created_at = datetime()
+                        MERGE (c)-[:ATTENDED {year: $year}]->(e)
+                    """,
+                        domain=company_domain,
+                        expo_name=expo_name,
+                        year=expo_year,
+                        location=expo_location
+                    )
+
+            def find_expo_peers(
+                self,
+                company_domain: str,
+                min_shared_expos: int = 1
+            ) -> List[dict]:
+                """
+                Temukan company yang hadir di expo yang sama.
+                Makin banyak shared expo, makin relevan sebagai peer/partner.
+                """
+                with self.driver.session() as session:
+                    result = session.run("""
+                        MATCH (target:Company {domain: $domain})-[:ATTENDED]->(e:Expo)<-[:ATTENDED]-(peer:Company)
+                        WHERE target <> peer
+                        WITH peer, count(e) AS shared_count, collect(e.name) AS shared_expos
+                        WHERE shared_count >= $min_shared
+                        RETURN peer.name AS company_name,
+                               peer.domain AS domain,
+                               peer.industry AS industry,
+                               shared_count,
+                               shared_expos
+                        ORDER BY shared_count DESC
+                        LIMIT 20
+                    """,
+                        domain=company_domain,
+                        min_shared=min_shared_expos
+                    )
+                    return [dict(r) for r in result]
+
+            def find_collaboration_network(
+                self,
+                company_domain: str,
+                max_hops: int = 2
+            ) -> List[dict]:
+                """
+                Temukan company dalam jaringan 1-2 hop dari target.
+                Berguna untuk menemukan indirect connections (warm intro potential).
+                """
+                with self.driver.session() as session:
+                    result = session.run(f"""
+                        MATCH path = (target:Company {{domain: $domain}})-[:ATTENDED*1..{max_hops}]-(peer:Company)
+                        WHERE target <> peer
+                        WITH DISTINCT peer,
+                             min(length(path)) AS distance
+                        RETURN peer.name AS company_name,
+                               peer.domain AS domain,
+                               peer.industry AS industry,
+                               distance
+                        ORDER BY distance ASC, peer.name ASC
+                        LIMIT 50
+                    """, domain=company_domain)
+                    return [dict(r) for r in result]
+
+            def detect_industry_clusters(self) -> List[dict]:
+                """
+                Community detection sederhana: group company berdasarkan industry
+                dan shared expo participation.
+                """
+                with self.driver.session() as session:
+                    result = session.run("""
+                        MATCH (c:Company)-[:ATTENDED]->(e:Expo)
+                        WITH c.industry AS industry,
+                             collect(DISTINCT c.name) AS companies,
+                             count(DISTINCT e) AS expo_count,
+                             count(DISTINCT c) AS company_count
+                        WHERE company_count >= 2
+                        RETURN industry, company_count, expo_count,
+                               companies[0..5] AS sample_companies
+                        ORDER BY company_count DESC
+                    """)
+                    return [dict(r) for r in result]
+
+        # Contoh penggunaan di RETRO pipeline
+        graph_db = RetroGraphDB()
+
+        # Setelah profiling batch company
+        companies_batch = [
+            {"company_name": "PT Telkom Indonesia", "domain": "telkom.co.id", "industry": "telekomunikasi"},
+            {"company_name": "PT Indosat Ooredoo", "domain": "indosatooredoo.com", "industry": "telekomunikasi"},
+        ]
+
+        for company in companies_batch:
+            graph_db.upsert_company_node(company)
+            graph_db.link_company_to_expo(
+                company_domain=company["domain"],
+                expo_name="Indo Comtech 2024",
+                expo_year=2024,
+                expo_location="Jakarta Convention Center"
+            )
+
+        # Query: siapa saja peer dari Telkom di expo yang sama?
+        peers = graph_db.find_expo_peers("telkom.co.id", min_shared_expos=1)
+        for peer in peers:
+            print(f"{peer['company_name']} | shared expos: {peer['shared_count']}")
+
+        graph_db.close()
+
+      expected_output: |
+        # find_expo_peers("telkom.co.id"):
+        [
+          {"company_name": "PT Indosat Ooredoo", "domain": "indosatooredoo.com",
+           "industry": "telekomunikasi", "shared_count": 3,
+           "shared_expos": ["Indo Comtech 2024", "APICTA 2023", "Telco Summit 2023"]},
+          {"company_name": "PT XL Axiata", "domain": "xl.co.id",
+           "industry": "telekomunikasi", "shared_count": 2,
+           "shared_expos": ["Indo Comtech 2024", "APICTA 2023"]}
+        ]
+
+    notes: >
+      Neo4j Cypher MERGE adalah idempotent — aman untuk dijalankan berkali-kali
+      dengan data yang sama tanpa duplikasi. Index wajib untuk performa:
+      CREATE INDEX company_domain_idx FOR (c:Company) ON (c.domain).
+      Buat index saat setup pertama kali di Neo4j Browser:
+      CREATE CONSTRAINT company_domain_unique FOR (c:Company) REQUIRE c.domain IS UNIQUE.
+
+    pitfalls:
+      - issue: "Query lambat pada graph besar tanpa index"
+        fix: "Buat index pada semua property yang sering di-MATCH: CREATE INDEX FOR (c:Company) ON (c.domain)"
+      - issue: "Neo4j Community Edition tidak support clustering"
+        fix: "Untuk production dengan high availability, gunakan Neo4j Enterprise atau migrasi ke Memgraph (gratis, compatible Cypher)"
+      - issue: "Driver connection pool exhausted"
+        fix: "Gunakan context manager (with driver.session()) dan close driver di application shutdown. Satu driver instance per application."
+      - issue: "MERGE tidak update property yang sudah ada"
+        fix: "Gunakan ON MATCH SET untuk update, ON CREATE SET untuk insert. Jangan gunakan MERGE tanpa keduanya."
+
+  - id: networkx
+    name: "NetworkX"
+    category: "In-Memory Graph Analysis"
+    description: >
+      NetworkX adalah Python library untuk analisis graph dan network. Bekerja
+      entirely in-memory — tidak perlu database server. Cocok untuk graph kecil-medium
+      (<100K nodes) seperti network perusahaan dari beberapa expo. Mendukung:
+      community detection, centrality measures (siapa yang paling "central" di network),
+      shortest path, PageRank, dan visualisasi dengan matplotlib.
+      Alternatif lightweight sebelum commit ke Neo4j.
+    specific_function: >
+      Exploratory graph analysis untuk data expo RETRO. Buat company-expo bipartite
+      graph, identifikasi company yang paling connected (high degree centrality),
+      temukan community clusters, visualisasi network untuk insight awal.
+      Juga berguna untuk PageRank analysis: company dengan lebih banyak "links"
+      ke company lain = lebih penting di ecosystem.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://networkx.org/"
+
+    retro:
+      phase: "Phase 3 — Synthesis dan exploratory analysis"
+      role: >
+        Lightweight graph analysis sebelum commit ke Neo4j. Gunakan NetworkX untuk
+        quick exploration: siapa yang paling connected di expo batch ini?
+        Output NetworkX bisa menjadi feature tambahan untuk Synthesis Agent:
+        "company ini sangat central di ecosystem expo Indonesia — prioritaskan."
+      when_to_use: >
+        Gunakan NetworkX untuk:
+        1. Prototyping sebelum setup Neo4j
+        2. One-off analysis pada batch data tertentu
+        3. Visualisasi network untuk report/dashboard
+        4. Graph yang cukup kecil untuk in-memory (< 50K nodes)
+        Upgrade ke Neo4j jika butuh persistence atau query yang complex.
+      priority: "medium (prototipe dan analisis, bukan production pipeline)"
+      output_goes_to: "Analysis results ke Synthesis Agent context atau report PDF"
+
+    setup:
+      install: |
+        pip install networkx
+        # Untuk visualisasi:
+        pip install networkx matplotlib
+        # Untuk community detection (Louvain algorithm):
+        pip install python-louvain
+      requirements:
+        - "Python 3.8+"
+        - "numpy (dependency NetworkX)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import networkx as nx
+        import matplotlib.pyplot as plt
+
+        # Buat bipartite graph: Company <-> Expo
+        G = nx.Graph()
+
+        # Data expo attendance
+        attendances = [
+            ("PT Telkom", "Indo Comtech 2024"),
+            ("PT Indosat", "Indo Comtech 2024"),
+            ("PT XL Axiata", "Indo Comtech 2024"),
+            ("PT Telkom", "APICTA 2023"),
+            ("PT Indosat", "APICTA 2023"),
+            ("PT Smartfren", "APICTA 2023"),
+        ]
+
+        for company, expo in attendances:
+            G.add_node(company, node_type="company")
+            G.add_node(expo, node_type="expo")
+            G.add_edge(company, expo)
+
+        # Degree centrality: company dengan koneksi terbanyak
+        centrality = nx.degree_centrality(G)
+        company_centrality = {
+            node: score for node, score in centrality.items()
+            if G.nodes[node].get("node_type") == "company"
+        }
+        print("Most connected companies:")
+        for company, score in sorted(company_centrality.items(), key=lambda x: -x[1]):
+            print(f"  {company}: {score:.3f}")
+
+        # Output:
+        # PT Telkom: 0.400 (hadir di 2 expo)
+        # PT Indosat: 0.400
+        # PT XL Axiata: 0.200 (hadir di 1 expo)
+
+      retro_example: |
+        import networkx as nx
+        from typing import List, Dict, Tuple
+        import json
+
+        def build_company_expo_graph(attendances: List[Dict]) -> nx.Graph:
+            """
+            Buat bipartite graph dari data expo attendance.
+            attendances: list of {"company_domain": str, "company_name": str, "expo_name": str, "year": int}
+            """
+            G = nx.Graph()
+
+            for att in attendances:
+                company_id = att["company_domain"]
+                expo_id = f"{att['expo_name']}_{att['year']}"
+
+                G.add_node(company_id,
+                    node_type="company",
+                    label=att.get("company_name", company_id),
+                    industry=att.get("industry", "unknown")
+                )
+                G.add_node(expo_id,
+                    node_type="expo",
+                    label=att["expo_name"],
+                    year=att.get("year")
+                )
+                G.add_edge(company_id, expo_id)
+
+            return G
+
+        def analyze_company_network(G: nx.Graph) -> Dict:
+            """
+            Hitung metrics untuk semua company nodes.
+            """
+            company_nodes = [n for n, d in G.nodes(data=True) if d.get("node_type") == "company"]
+
+            # Degree centrality: berapa banyak expo yang dihadiri
+            degree_centrality = nx.degree_centrality(G)
+
+            # Company yang hadir di banyak expo = lebih penting di ecosystem
+            company_scores = []
+            for company in company_nodes:
+                expo_neighbors = [n for n in G.neighbors(company)
+                                  if G.nodes[n].get("node_type") == "expo"]
+                company_scores.append({
+                    "company_id": company,
+                    "company_name": G.nodes[company].get("label", company),
+                    "industry": G.nodes[company].get("industry"),
+                    "expo_count": len(expo_neighbors),
+                    "expos_attended": expo_neighbors,
+                    "centrality_score": round(degree_centrality[company], 4),
+                })
+
+            # Sort by expo count
+            company_scores.sort(key=lambda x: x["expo_count"], reverse=True)
+
+            return {
+                "total_companies": len(company_nodes),
+                "total_expos": len(G) - len(company_nodes),
+                "total_edges": G.number_of_edges(),
+                "top_companies": company_scores[:10],
+                "average_expo_per_company": sum(s["expo_count"] for s in company_scores) / len(company_scores) if company_scores else 0,
+            }
+
+        def find_shared_expo_peers(
+            G: nx.Graph,
+            company_id: str,
+            min_shared: int = 1
+        ) -> List[Dict]:
+            """
+            Temukan company yang berbagi minimal N expo dengan target.
+            Mirip dengan Neo4j query tapi in-memory.
+            """
+            target_expos = set(n for n in G.neighbors(company_id)
+                               if G.nodes[n].get("node_type") == "expo")
+
+            peers = []
+            for node, data in G.nodes(data=True):
+                if data.get("node_type") != "company" or node == company_id:
+                    continue
+
+                peer_expos = set(n for n in G.neighbors(node)
+                                 if G.nodes[n].get("node_type") == "expo")
+
+                shared = target_expos & peer_expos
+                if len(shared) >= min_shared:
+                    peers.append({
+                        "company_id": node,
+                        "company_name": data.get("label", node),
+                        "industry": data.get("industry"),
+                        "shared_expos": list(shared),
+                        "shared_count": len(shared),
+                    })
+
+            return sorted(peers, key=lambda x: x["shared_count"], reverse=True)
+
+        # Contoh penggunaan di RETRO
+        attendances = [
+            {"company_domain": "telkom.co.id", "company_name": "PT Telkom", "expo_name": "Indo Comtech", "year": 2024, "industry": "telco"},
+            {"company_domain": "indosat.com", "company_name": "PT Indosat", "expo_name": "Indo Comtech", "year": 2024, "industry": "telco"},
+            {"company_domain": "telkom.co.id", "company_name": "PT Telkom", "expo_name": "APICTA", "year": 2023, "industry": "telco"},
+            {"company_domain": "indosat.com", "company_name": "PT Indosat", "expo_name": "APICTA", "year": 2023, "industry": "telco"},
+        ]
+
+        G = build_company_expo_graph(attendances)
+        analysis = analyze_company_network(G)
+        print(json.dumps(analysis, indent=2))
+
+        peers = find_shared_expo_peers(G, "telkom.co.id", min_shared=1)
+        for peer in peers:
+            print(f"{peer['company_name']}: {peer['shared_count']} shared expos")
+
+      expected_output: |
+        # analyze_company_network():
+        {
+          "total_companies": 2,
+          "total_expos": 2,
+          "total_edges": 4,
+          "top_companies": [
+            {"company_name": "PT Telkom", "expo_count": 2, "centrality_score": 0.667},
+            {"company_name": "PT Indosat", "expo_count": 2, "centrality_score": 0.667}
+          ]
+        }
+
+        # find_shared_expo_peers("telkom.co.id"):
+        [{"company_name": "PT Indosat", "shared_count": 2, "shared_expos": ["Indo Comtech_2024", "APICTA_2023"]}]
+
+    notes: >
+      NetworkX tidak persisten — data hilang saat process restart. Untuk production,
+      serialize graph ke file dengan nx.write_gexf(G, "graph.gexf") atau
+      nx.node_link_data(G) untuk JSON. Load kembali dengan nx.read_gexf() atau
+      nx.node_link_graph(data). Alternatif: simpan adjacency list ke PostgreSQL
+      dan reconstruct NetworkX graph saat dibutuhkan.
+
+    pitfalls:
+      - issue: "NetworkX lambat untuk graph > 100K nodes"
+        fix: "Untuk graph besar, switch ke graph-tool (C++ backend) atau migrasi ke Neo4j. NetworkX optimal untuk < 50K nodes."
+      - issue: "Graph tidak persisten antara runs"
+        fix: "Serialize ke file: import pickle; pickle.dump(G, open('graph.pkl', 'wb')). Atau gunakan nx.write_graphml(G, 'graph.graphml')"
+      - issue: "Memory error untuk graph besar"
+        fix: "Gunakan nx.DiGraph() untuk directed graph (lebih memory efficient). Atau gunakan igraph library sebagai alternatif yang lebih memory efficient."

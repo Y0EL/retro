@@ -1,0 +1,1630 @@
+stage: "03 - PDF Pipeline"
+stage_description: >
+  Tools untuk download, scan virus, parsing PDF (text + tabel + gambar),
+  OCR untuk scanned PDF, dan struktur output siap dibaca LLM.
+  Stage ini adalah jalur masuk untuk semua dokumen PDF (katalog, whitepaper,
+  brosur) yang ditemukan dari crawling domain company.
+retro_phase: "Phase 2: The Secure Data Pipeline"
+retro_role: >
+  SEMUA PDF yang ditemukan dari Phase 1 WAJIB melewati stage ini.
+  Urutan wajib: Download -> VirusTotal Scan -> OCR/Parse -> Format ke Markdown.
+  Output akhir adalah teks Markdown bersih yang siap dikirim ke Context Agent.
+  TIDAK ADA PDF yang boleh dibaca LLM dalam format asli (raw PDF bytes).
+execution_mode: "NON-LLM, berjalan otomatis. VirusTotal adalah GATE yang tidak bisa diskip."
+output_destination: "staging/company_pdfs/{domain}/{filename}.md dan metadata di PostgreSQL"
+
+security_rule: >
+  WAJIB: Setiap file PDF HARUS melalui VirusTotal scan sebelum dibuka.
+  Jika scan positif (virus terdeteksi): hapus file, blacklist domain, catat di log.
+  Jika scan negatif (clean): lanjut ke OCR/parsing.
+  Tidak ada pengecualian untuk rule ini.
+
+tools:
+
+  - id: pymupdf_fitz
+    name: "PyMuPDF (fitz)"
+    category: "PDF Text Extraction"
+    description: >
+      High-performance PDF library. Terbaik untuk digital PDF (PDF yang
+      dibuat dari komputer, bukan scan). Output bersih dan sangat cepat
+      (0.12 detik per halaman). Basis dari pymupdf4llm.
+    specific_function: >
+      Ekstrak text dengan layout awareness, koordinat bbox, metadata.
+      Cocok untuk pipeline skala besar. Juga bisa render halaman ke
+      gambar untuk OCR pipeline.
+    language: "Python"
+    pricing: "Gratis & open source (AGPL)"
+    last_updated: "2025"
+    url: "https://github.com/pymupdf/PyMuPDF"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        Primary PDF text extractor untuk PDF digital (bukan scan).
+        Digunakan setelah VirusTotal scan confirm file aman.
+        Jauh lebih cepat dari pdfminer dan lebih akurat dari pypdf
+        untuk dokumen dengan layout kompleks.
+      when_to_use: >
+        Gunakan untuk semua PDF yang terdeteksi sebagai digital PDF
+        (bukan scan). Deteksi dengan cek apakah page.get_text() mengembalikan
+        teks bermakna. Jika kosong atau sangat sedikit, gunakan OCR pipeline
+        (Surya atau EasyOCR).
+      priority: "primary"
+      output_goes_to: "staging teks sebelum dikirim ke pymupdf4llm formatter"
+
+    setup:
+      install: "pip install pymupdf"
+      requirements:
+        - "Python 3.8+"
+        - "No external binary dependencies"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import fitz  # PyMuPDF
+
+        pdf_path = "staging/pdfs/catalog.pdf"
+        doc = fitz.open(pdf_path)
+
+        print(f"Pages: {doc.page_count}")
+        print(f"Metadata: {doc.metadata}")
+
+        # Ekstrak teks dari semua halaman
+        full_text = ""
+        for page_num, page in enumerate(doc):
+            text = page.get_text("text")
+            full_text += f"\n--- Page {page_num + 1} ---\n{text}"
+
+        doc.close()
+        print(f"Total characters: {len(full_text)}")
+        print(full_text[:500])
+
+      retro_example: |
+        import fitz
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        def retro_detect_pdf_type(pdf_path: str) -> str:
+            """
+            Deteksi apakah PDF adalah digital atau scan.
+            Return: 'digital' atau 'scanned'
+            """
+            doc = fitz.open(pdf_path)
+            total_chars = 0
+            sample_pages = min(5, doc.page_count)
+
+            for i in range(sample_pages):
+                page = doc[i]
+                text = page.get_text("text").strip()
+                total_chars += len(text)
+
+            doc.close()
+            avg_chars_per_page = total_chars / sample_pages
+            return "digital" if avg_chars_per_page > 100 else "scanned"
+
+        def retro_extract_digital_pdf(pdf_path: str, company_domain: str) -> dict:
+            """
+            Ekstrak teks dari PDF digital menggunakan PyMuPDF.
+            Digunakan SETELAH VirusTotal scan confirm file aman.
+            """
+            doc = fitz.open(pdf_path)
+            pages_data = []
+            all_text = []
+            images_found = []
+
+            for page_num, page in enumerate(doc):
+                # Ekstrak teks dengan layout awareness
+                text = page.get_text("text")
+
+                # Ekstrak teks dengan blocks (lebih structured)
+                blocks = page.get_text("dict")["blocks"]
+                text_blocks = [
+                    b["lines"] for b in blocks
+                    if b.get("type") == 0  # type 0 = text block
+                ]
+
+                # Cek apakah ada gambar di halaman ini
+                img_list = page.get_images()
+                if img_list:
+                    images_found.append({
+                        "page": page_num + 1,
+                        "image_count": len(img_list)
+                    })
+
+                pages_data.append({
+                    "page_num": page_num + 1,
+                    "text": text.strip(),
+                    "char_count": len(text.strip()),
+                    "has_images": len(img_list) > 0
+                })
+                all_text.append(f"## Halaman {page_num + 1}\n\n{text.strip()}")
+
+            doc.close()
+
+            combined_text = "\n\n".join(all_text)
+            total_chars = sum(p["char_count"] for p in pages_data)
+            non_empty_pages = sum(1 for p in pages_data if p["char_count"] > 50)
+
+            return {
+                "company_domain": company_domain,
+                "pdf_path": str(pdf_path),
+                "pdf_type": "digital",
+                "page_count": len(pages_data),
+                "non_empty_pages": non_empty_pages,
+                "total_characters": total_chars,
+                "total_words": len(combined_text.split()),
+                "images_found_on_pages": images_found,
+                "combined_text": combined_text,
+                "extraction_method": "pymupdf",
+                "extracted_at": datetime.utcnow().isoformat()
+            }
+
+        # Contoh penggunaan dalam pipeline
+        pdf_file = "staging/pdfs/abctech_co_id/catalog-2024.pdf"
+        pdf_type = retro_detect_pdf_type(pdf_file)
+        print(f"PDF type detected: {pdf_type}")
+
+        if pdf_type == "digital":
+            result = retro_extract_digital_pdf(pdf_file, "abctech.co.id")
+            print(f"Pages: {result['page_count']}, Words: {result['total_words']}")
+            output_path = f"staging/pdf_text/abctech_co_id_catalog.json"
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+        else:
+            print("Scanned PDF detected. Routing to OCR pipeline (Surya OCR).")
+
+      expected_output: |
+        PDF type detected: digital
+
+        staging/pdf_text/abctech_co_id_catalog.json:
+        {
+          "company_domain": "abctech.co.id",
+          "pdf_path": "staging/pdfs/abctech_co_id/catalog-2024.pdf",
+          "pdf_type": "digital",
+          "page_count": 48,
+          "non_empty_pages": 45,
+          "total_characters": 94823,
+          "total_words": 15847,
+          "images_found_on_pages": [
+            {"page": 3, "image_count": 4},
+            {"page": 7, "image_count": 2}
+          ],
+          "combined_text": "## Halaman 1\n\nABC Technology Product Catalog 2024\n...",
+          "extraction_method": "pymupdf"
+        }
+
+    notes:
+      - "fitz adalah nama module import dari PyMuPDF, bukan nama package."
+      - "get_text('text') lebih cepat. get_text('dict') untuk layout analysis."
+      - "Deteksi PDF type wajib dilakukan sebelum memilih metode extraction."
+      - "AGPL license: jika deploy sebagai service publik, perlu disclose source code."
+    pitfalls:
+      - "Password-protected PDF akan throw exception. Tangkap dan skip, catat di log."
+      - "Corrupted PDF juga throw exception. Selalu wrap dalam try/except."
+      - "Beberapa PDF digital memiliki text layer yang invisible atau berupa gambar embedded."
+
+  - id: pymupdf4llm
+    name: "pymupdf4llm"
+    category: "PDF Text Extraction"
+    description: >
+      Extension PyMuPDF khusus output untuk LLM. Menghasilkan Markdown
+      bersih dengan heading preservation, tabel, dan struktur dokumen.
+      Output siap masuk ke LLM tanpa post-processing manual.
+    specific_function: >
+      Konversi PDF ke Markdown terstruktur siap masuk LLM/RAG tanpa
+      post-processing manual. Heading levels, tabel, dan bullet points
+      dipertahankan dalam format Markdown yang benar.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/pymupdf/RAG"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        PRIMARY PDF-to-Markdown converter untuk pipeline RETRO. Mengubah
+        PDF digital menjadi Markdown yang bersih dan terstruktur, siap
+        dikirim ke Context Agent. Ini adalah langkah terakhir sebelum
+        teks masuk ke LLM layer.
+      when_to_use: >
+        Gunakan SELALU untuk konversi final PDF digital ke Markdown.
+        Gunakan setelah PyMuPDF konfirmasi PDF adalah digital (bukan scan).
+        Untuk scanned PDF, gunakan Surya OCR terlebih dahulu lalu
+        format hasilnya ke Markdown secara manual.
+      priority: "primary"
+      output_goes_to: "staging/company_pdfs/{domain}/{filename}.md langsung"
+
+    setup:
+      install: "pip install pymupdf4llm"
+      requirements:
+        - "pymupdf terinstall (dependency otomatis)"
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import pymupdf4llm
+        from pathlib import Path
+
+        # Konversi PDF ke Markdown
+        pdf_path = "catalog.pdf"
+        md_text = pymupdf4llm.to_markdown(pdf_path)
+
+        print(f"Markdown length: {len(md_text)} chars")
+        print(md_text[:500])
+
+        # Simpan ke file
+        Path("catalog.md").write_text(md_text, encoding="utf-8")
+
+      retro_example: |
+        import pymupdf4llm
+        import pymupdf as fitz
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        def retro_pdf_to_markdown(
+            pdf_path: str,
+            company_domain: str,
+            max_pages: int = None,
+            chunk_size: int = 2000
+        ) -> dict:
+            """
+            Konversi PDF ke Markdown bersih untuk Context Agent.
+
+            Untuk PDF 1000+ halaman, kita chunk menjadi bagian-bagian
+            yang bisa diproses Context Agent secara sequential.
+
+            max_pages: None = semua halaman. Set angka untuk limit.
+            chunk_size: jumlah words per chunk untuk Context Agent.
+            """
+            pdf_path = Path(pdf_path)
+
+            try:
+                # Cek page count dulu
+                doc = fitz.open(str(pdf_path))
+                total_pages = doc.page_count
+                doc.close()
+
+                print(f"[pymupdf4llm] Processing {pdf_path.name}: {total_pages} pages")
+
+                # Untuk PDF sangat besar, ambil sample halaman
+                if max_pages and total_pages > max_pages:
+                    print(f"[pymupdf4llm] Large PDF detected. Sampling {max_pages}/{total_pages} pages")
+                    # Ambil halaman pertama, tengah, dan akhir
+                    pages_to_extract = list(range(0, min(10, total_pages)))  # 10 halaman pertama
+                    pages_to_extract += list(range(total_pages//2 - 5, total_pages//2 + 5))  # Tengah
+                    pages_to_extract += list(range(max(0, total_pages - 10), total_pages))  # Akhir
+                    pages_to_extract = sorted(set(pages_to_extract))
+                else:
+                    pages_to_extract = None  # Semua halaman
+
+                # Konversi ke Markdown
+                md_text = pymupdf4llm.to_markdown(
+                    str(pdf_path),
+                    pages=pages_to_extract
+                )
+
+                # Chunk teks untuk Context Agent
+                words = md_text.split()
+                chunks = []
+                for i in range(0, len(words), chunk_size):
+                    chunk = " ".join(words[i:i+chunk_size])
+                    chunks.append({
+                        "chunk_index": len(chunks),
+                        "word_count": len(chunk.split()),
+                        "text": chunk
+                    })
+
+                result = {
+                    "company_domain": company_domain,
+                    "pdf_filename": pdf_path.name,
+                    "pdf_path": str(pdf_path),
+                    "total_pages": total_pages,
+                    "pages_extracted": len(pages_to_extract) if pages_to_extract else total_pages,
+                    "full_markdown": md_text,
+                    "total_words": len(words),
+                    "total_chunks": len(chunks),
+                    "chunks": chunks,
+                    "extraction_method": "pymupdf4llm",
+                    "extracted_at": datetime.utcnow().isoformat()
+                }
+
+                # Simpan Markdown ke file
+                md_output = Path(f"staging/pdf_markdown/{company_domain.replace('.', '_')}_{pdf_path.stem}.md")
+                md_output.parent.mkdir(parents=True, exist_ok=True)
+                md_output.write_text(md_text, encoding="utf-8")
+                print(f"[pymupdf4llm] Saved: {md_output} ({len(words)} words, {len(chunks)} chunks)")
+
+                return result
+
+            except Exception as e:
+                return {
+                    "company_domain": company_domain,
+                    "pdf_filename": pdf_path.name,
+                    "error": str(e),
+                    "extraction_method": "pymupdf4llm",
+                    "status": "failed"
+                }
+
+        # Contoh penggunaan
+        result = retro_pdf_to_markdown(
+            pdf_path="staging/pdfs/abctech_co_id/catalog-2024.pdf",
+            company_domain="abctech.co.id",
+            max_pages=100,  # Limit untuk PDF besar
+            chunk_size=2000  # 2000 words per chunk untuk Context Agent
+        )
+
+        print(f"Total words: {result['total_words']}")
+        print(f"Total chunks: {result['total_chunks']}")
+        print("\nSample Markdown output:")
+        print(result['full_markdown'][:800])
+
+      expected_output: |
+        [pymupdf4llm] Processing catalog-2024.pdf: 248 pages
+        [pymupdf4llm] Saved: staging/pdf_markdown/abctech_co_id_catalog-2024.md (41823 words, 21 chunks)
+        Total words: 41823
+        Total chunks: 21
+
+        Sample Markdown output:
+        # ABC Technology Product Catalog 2024
+
+        ## Company Overview
+
+        ABC Technology adalah perusahaan teknologi yang berdiri sejak 2015,
+        berfokus pada solusi **Internet of Things (IoT)** untuk industri manufaktur.
+
+        ---
+
+        ## Product Line
+
+        ### 1. IoT Gateway Pro
+        **Model:** GT-PRO-2024
+        **Price:** Contact for pricing
+
+        | Feature | Specification |
+        |---------|---------------|
+        | CPU | ARM Cortex-A53 |
+        | RAM | 2GB LPDDR4 |
+        | Connectivity | 4G LTE, WiFi 6, Ethernet |
+
+        ### 2. Industrial Sensor Suite
+        ...
+
+    notes:
+      - "pymupdf4llm mempertahankan heading levels, tabel, dan bullet points dalam Markdown."
+      - "Untuk PDF > 100 halaman, gunakan sampling strategy untuk menghemat token Context Agent."
+      - "chunk_size=2000 words adalah trade-off yang baik antara context richness dan token cost."
+      - "Simpan selalu Markdown ke file untuk audit trail dan re-processing jika perlu."
+    pitfalls:
+      - "PDF dengan layout 2-kolom kadang menghasilkan teks yang tercampur. Periksa output."
+      - "Tabel yang sangat kompleks (merged cells) mungkin tidak ter-convert sempurna."
+      - "Jika PDF sudah punya text layer tapi ada gambar dengan teks di dalamnya, gambar tidak di-OCR oleh pymupdf4llm."
+
+  - id: virustotal_api
+    name: "VirusTotal API"
+    category: "Security Scanning"
+    description: >
+      API VirusTotal untuk scan file/URL dengan 70+ antivirus engine.
+      Digunakan untuk memastikan keamanan file PDF sebelum diproses
+      pipeline. Layanan cloud yang paling comprehensive untuk file scanning.
+    specific_function: >
+      Upload PDF, scan dengan 70+ engine, cek apakah aman sebelum
+      OCR dan ekstraksi. WAJIB di pipeline RETRO. Tidak ada pengecualian.
+    language: "REST API / Python"
+    pricing: "Free: 4 lookups/menit, 500/hari. API key gratis."
+    last_updated: "2025"
+    url: "https://developers.virustotal.com/"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline (SECURITY GATE)"
+      role: >
+        CRITICAL SECURITY GATE. Wajib dipanggil sebelum membuka file PDF
+        apapun. Jika ada satu engine saja yang mendeteksi ancaman, file
+        HARUS dihapus dan domain di-blacklist. Ini melindungi pipeline
+        dari malware yang bisa menyebar via PDF yang terinfeksi.
+      when_to_use: >
+        Panggil SETIAP KALI ada file baru yang akan dibuka. Tidak ada
+        pengecualian. Simpan hash SHA-256 file di database untuk
+        menghindari scan ulang file yang sama. Jika hash sudah ada dan
+        pernah di-scan sebagai clean, boleh skip rescan (cache 30 hari).
+      priority: "CRITICAL - MANDATORY"
+      output_goes_to: "security_scan_log table. Jika positif: quarantine folder + domain blacklist."
+
+    setup:
+      install: "pip install requests vt-py"
+      requirements:
+        - "API key gratis dari virustotal.com (daftar dengan email)"
+      env_vars:
+        - name: "VIRUSTOTAL_API_KEY"
+          description: "Daftar di https://www.virustotal.com/gui/join-us untuk key gratis"
+
+    usage:
+      basic_example: |
+        import vt
+        import os
+
+        client = vt.Client(os.environ["VIRUSTOTAL_API_KEY"])
+
+        # Upload dan scan file
+        with open("suspicious.pdf", "rb") as f:
+            analysis = client.scan_file(f)
+
+        print(f"Analysis ID: {analysis.id}")
+
+        # Tunggu hasil (bisa butuh beberapa menit)
+        import time
+        while True:
+            analysis = client.get_object(f"/analyses/{analysis.id}")
+            if analysis.status == "completed":
+                break
+            time.sleep(30)
+
+        stats = analysis.stats
+        print(f"Malicious: {stats['malicious']}")
+        print(f"Suspicious: {stats['suspicious']}")
+        print(f"Undetected: {stats['undetected']}")
+
+        client.close()
+
+      retro_example: |
+        import vt
+        import os
+        import hashlib
+        import json
+        import shutil
+        from pathlib import Path
+        from datetime import datetime, timedelta
+        import time
+        import psycopg2
+
+        VT_CLIENT = vt.Client(os.environ["VIRUSTOTAL_API_KEY"])
+
+        def get_file_sha256(filepath: str) -> str:
+            """Calculate SHA256 hash untuk file."""
+            sha256 = hashlib.sha256()
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+
+        def check_scan_cache(file_hash: str, db_conn) -> dict | None:
+            """
+            Cek apakah file sudah pernah di-scan dalam 30 hari terakhir.
+            Return: cached result atau None jika belum pernah.
+            """
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            with db_conn.cursor() as cur:
+                cur.execute("""
+                    SELECT is_clean, malicious_count, scan_result
+                    FROM security_scan_log
+                    WHERE file_hash = %s AND scanned_at > %s
+                    ORDER BY scanned_at DESC LIMIT 1
+                """, (file_hash, cutoff))
+                row = cur.fetchone()
+                if row:
+                    return {"is_clean": row[0], "malicious_count": row[1], "cached": True}
+            return None
+
+        def retro_virustotal_scan(filepath: str, company_domain: str, db_conn=None) -> dict:
+            """
+            Scan file PDF dengan VirusTotal.
+            WAJIB dipanggil sebelum membuka file PDF apapun.
+
+            Return:
+            - is_clean: True jika aman, False jika terdeteksi ancaman
+            - action: 'proceed', 'quarantine', atau 'error'
+            """
+            filepath = Path(filepath)
+            if not filepath.exists():
+                return {"is_clean": False, "action": "error", "error": "File not found"}
+
+            # Calculate hash untuk caching
+            file_hash = get_file_sha256(str(filepath))
+            print(f"[VirusTotal] Scanning: {filepath.name} (SHA256: {file_hash[:16]}...)")
+
+            # Cek cache
+            if db_conn:
+                cached = check_scan_cache(file_hash, db_conn)
+                if cached:
+                    print(f"[VirusTotal] Cache hit: {'CLEAN' if cached['is_clean'] else 'THREAT'}")
+                    return {**cached, "action": "proceed" if cached["is_clean"] else "quarantine"}
+
+            try:
+                # Upload dan scan
+                with open(filepath, "rb") as f:
+                    analysis = VT_CLIENT.scan_file(f)
+
+                # Poll untuk hasil (max 5 menit)
+                max_wait = 300
+                waited = 0
+                while waited < max_wait:
+                    analysis = VT_CLIENT.get_object(f"/analyses/{analysis.id}")
+                    if analysis.status == "completed":
+                        break
+                    time.sleep(15)
+                    waited += 15
+                    print(f"[VirusTotal] Waiting for result... ({waited}s)")
+
+                if analysis.status != "completed":
+                    return {"is_clean": None, "action": "error", "error": "Scan timeout"}
+
+                stats = analysis.stats
+                malicious = stats.get("malicious", 0)
+                suspicious = stats.get("suspicious", 0)
+                is_clean = (malicious == 0)
+
+                scan_result = {
+                    "file_hash": file_hash,
+                    "filename": filepath.name,
+                    "company_domain": company_domain,
+                    "is_clean": is_clean,
+                    "malicious_count": malicious,
+                    "suspicious_count": suspicious,
+                    "undetected_count": stats.get("undetected", 0),
+                    "total_engines": sum(stats.values()),
+                    "scanned_at": datetime.utcnow().isoformat(),
+                    "action": "proceed" if is_clean else "quarantine"
+                }
+
+                # Log ke database
+                if db_conn:
+                    with db_conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO security_scan_log
+                            (file_hash, filename, company_domain, is_clean,
+                             malicious_count, scan_result, scanned_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """, (file_hash, filepath.name, company_domain, is_clean,
+                              malicious, json.dumps(scan_result), datetime.utcnow()))
+                    db_conn.commit()
+
+                # Handle hasil
+                if not is_clean:
+                    print(f"[VirusTotal] THREAT DETECTED: {malicious} engines flagged {filepath.name}")
+                    # Pindah ke quarantine
+                    quarantine_path = Path("staging/quarantine") / filepath.name
+                    quarantine_path.parent.mkdir(exist_ok=True)
+                    shutil.move(str(filepath), str(quarantine_path))
+                    print(f"[VirusTotal] File quarantined: {quarantine_path}")
+
+                    # Blacklist domain
+                    if db_conn:
+                        with db_conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO domain_blacklist (domain, reason, blacklisted_at)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (domain) DO NOTHING
+                            """, (company_domain, f"VirusTotal: {malicious} engines positive", datetime.utcnow()))
+                        db_conn.commit()
+                else:
+                    print(f"[VirusTotal] CLEAN: {filepath.name} - Proceeding to OCR/parsing")
+
+                return scan_result
+
+            except Exception as e:
+                print(f"[VirusTotal] Error: {e}")
+                return {"is_clean": None, "action": "error", "error": str(e)}
+
+        # Contoh penggunaan dalam pipeline
+        result = retro_virustotal_scan(
+            filepath="staging/pdfs/abctech_co_id/catalog-2024.pdf",
+            company_domain="abctech.co.id"
+        )
+
+        if result["action"] == "proceed":
+            print("Safe to proceed to PDF parsing")
+        elif result["action"] == "quarantine":
+            print(f"FILE QUARANTINED. {result['malicious_count']} threats detected.")
+        else:
+            print(f"Scan error: {result.get('error')}")
+
+      expected_output: |
+        SKENARIO 1 - File aman:
+        [VirusTotal] Scanning: catalog-2024.pdf (SHA256: a1b2c3d4e5f6...)
+        [VirusTotal] Waiting for result... (15s)
+        [VirusTotal] CLEAN: catalog-2024.pdf - Proceeding to OCR/parsing
+        Safe to proceed to PDF parsing
+
+        {
+          "file_hash": "a1b2c3d4...",
+          "filename": "catalog-2024.pdf",
+          "company_domain": "abctech.co.id",
+          "is_clean": true,
+          "malicious_count": 0,
+          "suspicious_count": 0,
+          "undetected_count": 68,
+          "total_engines": 72,
+          "action": "proceed"
+        }
+
+        SKENARIO 2 - File berbahaya:
+        [VirusTotal] THREAT DETECTED: 3 engines flagged malicious-catalog.pdf
+        [VirusTotal] File quarantined: staging/quarantine/malicious-catalog.pdf
+        FILE QUARANTINED. 3 threats detected.
+
+    notes:
+      - "Free tier: 4 lookups per menit, 500 per hari. Cukup untuk pipeline harian 50 company."
+      - "Cache SHA256 hash di DB untuk menghindari rescan file yang sama."
+      - "Scan bisa butuh 2-5 menit. Jangan set timeout terlalu pendek."
+      - "Satu engine positif BISA false positive. Threshold reasonable: malicious >= 2."
+    pitfalls:
+      - "Jangan kirim file > 32MB ke free tier. Ada size limit."
+      - "Rate limit 4/menit artinya untuk 50 PDF, butuh minimal 12-13 menit. Jadwalkan dengan baik."
+      - "Domain Indonesia yang kecil mungkin belum pernah di-scan. Hash lookup akan selalu miss."
+
+  - id: clamav
+    name: "ClamAV (python-clamd)"
+    category: "Security Scanning"
+    description: >
+      Antivirus open-source self-hosted. Scan file secara lokal tanpa
+      mengirim data ke cloud. Alternatif offline untuk VirusTotal.
+      Berguna untuk data yang sangat sensitif atau untuk pre-screening.
+    specific_function: >
+      Scan PDF lokal sebelum diproses. Deploy on-premise, cocok untuk
+      data sensitif. Tidak perlu koneksi internet. Jauh lebih cepat
+      dari VirusTotal karena tidak ada round-trip ke cloud.
+    language: "Python / C"
+    pricing: "Gratis & open source (self-host)"
+    last_updated: "2025"
+    url: "https://github.com/vrtadmin/python-clamd"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline (SECONDARY SECURITY GATE)"
+      role: >
+        Offline security gate. Digunakan sebagai pre-screening SEBELUM
+        mengirim file ke VirusTotal, atau sebagai fallback jika VirusTotal
+        API down atau quota habis. ClamAV jauh lebih cepat (milidetik vs
+        menit) tapi coverage-nya jauh lebih sedikit dari VirusTotal.
+      when_to_use: >
+        Gunakan ClamAV sebagai first-line defense yang cepat. Jika ClamAV
+        sudah positif, langsung quarantine tanpa perlu VirusTotal. Jika
+        ClamAV clean, lanjut ke VirusTotal untuk konfirmasi lebih comprehensive.
+      priority: "secondary (fallback atau pre-screening)"
+      output_goes_to: "security_scan_log table"
+
+    setup:
+      install: |
+        # Install ClamAV daemon (Ubuntu/Debian):
+        sudo apt-get install clamav clamav-daemon
+        sudo systemctl start clamav-daemon
+        sudo freshclam  # Update virus database
+
+        # Python client:
+        pip install python-clamd
+      requirements:
+        - "ClamAV daemon berjalan di sistem (clamd)"
+        - "Database virus terupdate (jalankan freshclam)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import clamd
+
+        # Connect ke ClamAV daemon
+        cd = clamd.ClamdUnixSocket()  # Linux
+        # cd = clamd.ClamdNetworkSocket()  # Windows/network
+
+        # Scan file
+        result = cd.scan("staging/pdfs/catalog.pdf")
+        print(result)
+        # Output: {'staging/pdfs/catalog.pdf': ('OK', None)} jika clean
+        # Output: {'staging/pdfs/catalog.pdf': ('FOUND', 'Eicar-Test-Signature')} jika virus
+
+        # Cek status
+        print(cd.ping())  # PONG jika daemon aktif
+
+      retro_example: |
+        import clamd
+        import os
+        from pathlib import Path
+        from datetime import datetime
+
+        def retro_clamav_prescan(filepath: str, company_domain: str) -> dict:
+            """
+            Pre-scan file dengan ClamAV sebelum ke VirusTotal.
+            Lebih cepat (ms) tapi less comprehensive.
+            Return: dict dengan scan result.
+            """
+            try:
+                cd = clamd.ClamdUnixSocket()
+                cd.ping()  # Verify daemon aktif
+            except Exception:
+                print("[ClamAV] Daemon not running. Skipping ClamAV, going directly to VirusTotal.")
+                return {"status": "skipped", "reason": "daemon_not_available"}
+
+            filepath = str(Path(filepath).absolute())
+            try:
+                result = cd.scan(filepath)
+                file_result = result.get(filepath, ("ERROR", "No result"))
+                status, threat_name = file_result
+
+                is_clean = (status == "OK")
+                return {
+                    "filepath": filepath,
+                    "company_domain": company_domain,
+                    "clamav_status": status,
+                    "threat_name": threat_name if not is_clean else None,
+                    "is_clean": is_clean,
+                    "action": "proceed_to_virustotal" if is_clean else "quarantine_immediately",
+                    "scanned_at": datetime.utcnow().isoformat(),
+                    "scanner": "clamav"
+                }
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        result = retro_clamav_prescan("staging/pdfs/catalog.pdf", "abctech.co.id")
+        print(result)
+        if result["action"] == "proceed_to_virustotal":
+            print("ClamAV clean. Sending to VirusTotal for comprehensive scan.")
+        elif result["action"] == "quarantine_immediately":
+            print(f"THREAT DETECTED BY CLAMAV: {result['threat_name']}. File quarantined.")
+
+      expected_output: |
+        SKENARIO 1 - File aman:
+        {
+          "clamav_status": "OK",
+          "threat_name": null,
+          "is_clean": true,
+          "action": "proceed_to_virustotal"
+        }
+        ClamAV clean. Sending to VirusTotal for comprehensive scan.
+
+        SKENARIO 2 - File terinfeksi:
+        {
+          "clamav_status": "FOUND",
+          "threat_name": "PDF.Malware.Agent",
+          "is_clean": false,
+          "action": "quarantine_immediately"
+        }
+        THREAT DETECTED BY CLAMAV: PDF.Malware.Agent. File quarantined.
+
+    notes:
+      - "Jalankan freshclam secara rutin (daily) untuk update virus database."
+      - "ClamAV signature-based, tidak sebaik heuristic detection VirusTotal."
+      - "Gunakan ClamdUnixSocket di Linux/Mac, ClamdNetworkSocket di Windows."
+    pitfalls:
+      - "ClamAV daemon harus sudah jalan sebelum pipeline dijalankan. Cek dengan: systemctl status clamav-daemon"
+      - "False positive rate ClamAV lebih tinggi dari VirusTotal. Jangan langsung blacklist tanpa cross-check."
+
+  - id: surya_ocr
+    name: "Surya OCR"
+    category: "OCR (Scanned PDF / Image)"
+    description: >
+      OCR toolkit modern yang mendukung 90+ bahasa. Line-level detection,
+      layout analysis, table recognition. Lebih akurat dari Tesseract
+      terutama untuk dokumen Asia dan dokumen dengan layout kompleks.
+    specific_function: >
+      OCR akurasi tinggi untuk scanned PDF, foto dokumen, dan gambar
+      yang mengandung teks. Support layout analysis dan tabel. Jalankan
+      lokal tanpa cloud dependency.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/VikParuchuri/surya"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        PRIMARY OCR engine untuk scanned PDF dan gambar. Digunakan ketika
+        PyMuPDF mendeteksi PDF sebagai 'scanned' (bukan digital). Surya
+        lebih akurat dari Tesseract untuk dokumen Indonesia/Inggris campuran
+        dan dokumen dengan tabel dan gambar.
+      when_to_use: >
+        Gunakan ketika pdf_type == 'scanned' (deteksi dari retro_detect_pdf_type()).
+        Surya membutuhkan GPU untuk kecepatan optimal, tapi bisa jalan di CPU
+        (lebih lambat). Prioritaskan Surya atas Tesseract untuk akurasi.
+      priority: "primary (untuk scanned PDF)"
+      output_goes_to: "staging/pdf_text/{domain}_ocr.json"
+
+    setup:
+      install: |
+        pip install surya-ocr
+        # Untuk GPU support (optional tapi recommended):
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+      requirements:
+        - "Python 3.9+"
+        - "RAM minimal 8GB"
+        - "GPU: optional tapi mempercepat 10x (NVIDIA dengan CUDA)"
+        - "VRAM minimal 4GB jika pakai GPU"
+      env_vars:
+        - name: "RECOGNITION_BATCH_SIZE"
+          description: "Set ke 32 untuk GPU, 4 untuk CPU (default otomatis)"
+
+    usage:
+      basic_example: |
+        from surya.ocr import run_ocr
+        from surya.model.detection.model import load_model as load_det_model
+        from surya.model.detection.processor import load_processor as load_det_processor
+        from surya.model.recognition.model import load_model as load_rec_model
+        from surya.model.recognition.processor import load_processor as load_rec_processor
+        from PIL import Image
+
+        # Load models (sekali saja, lalu reuse)
+        det_processor, det_model = load_det_processor(), load_det_model()
+        rec_model, rec_processor = load_rec_model(), load_rec_processor()
+
+        # OCR satu gambar
+        image = Image.open("scanned_page.png")
+        langs = ["en", "id"]  # Bahasa yang diharapkan
+        predictions = run_ocr([image], [langs], det_model, det_processor, rec_model, rec_processor)
+
+        for pred in predictions:
+            for line in pred.text_lines:
+                print(f"Text: {line.text} | Confidence: {line.confidence:.2f}")
+
+      retro_example: |
+        from surya.ocr import run_ocr
+        from surya.model.detection.model import load_model as load_det_model
+        from surya.model.detection.processor import load_processor as load_det_processor
+        from surya.model.recognition.model import load_model as load_rec_model
+        from surya.model.recognition.processor import load_processor as load_rec_processor
+        from PIL import Image
+        import fitz  # PyMuPDF untuk convert PDF ke images
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        # Global model cache - load sekali, reuse berkali-kali
+        _SURYA_MODELS = None
+
+        def get_surya_models():
+            global _SURYA_MODELS
+            if _SURYA_MODELS is None:
+                print("[Surya] Loading OCR models (first time)...")
+                det_processor = load_det_processor()
+                det_model = load_det_model()
+                rec_model = load_rec_model()
+                rec_processor = load_rec_processor()
+                _SURYA_MODELS = (det_processor, det_model, rec_model, rec_processor)
+                print("[Surya] Models loaded and cached.")
+            return _SURYA_MODELS
+
+        def retro_ocr_scanned_pdf(
+            pdf_path: str,
+            company_domain: str,
+            langs: list = None,
+            confidence_threshold: float = 0.7
+        ) -> dict:
+            """
+            OCR scanned PDF menggunakan Surya.
+            Convert PDF pages ke images, lalu OCR setiap halaman.
+
+            langs: list bahasa yang diharapkan, default ['en', 'id']
+            confidence_threshold: minimum confidence untuk menyertakan teks
+            """
+            if langs is None:
+                langs = ["en", "id"]
+
+            pdf_path = Path(pdf_path)
+            det_processor, det_model, rec_model, rec_processor = get_surya_models()
+
+            # Convert PDF pages ke images via PyMuPDF
+            doc = fitz.open(str(pdf_path))
+            total_pages = doc.page_count
+            print(f"[Surya] Converting {total_pages} pages to images for OCR...")
+
+            all_pages_text = []
+            images = []
+
+            for page_num, page in enumerate(doc):
+                # Render halaman ke image dengan resolusi tinggi
+                mat = fitz.Matrix(2, 2)  # 2x scale = 144 DPI (dari 72 DPI default)
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+
+            doc.close()
+
+            # OCR semua halaman dalam batch
+            langs_list = [langs] * len(images)  # Sama untuk semua halaman
+            print(f"[Surya] Running OCR on {len(images)} pages...")
+            predictions = run_ocr(
+                images,
+                langs_list,
+                det_model,
+                det_processor,
+                rec_model,
+                rec_processor
+            )
+
+            for page_num, pred in enumerate(predictions):
+                page_text_lines = []
+                for line in pred.text_lines:
+                    if line.confidence >= confidence_threshold:
+                        page_text_lines.append(line.text)
+
+                page_text = "\n".join(page_text_lines)
+                all_pages_text.append({
+                    "page_num": page_num + 1,
+                    "text": page_text,
+                    "line_count": len(page_text_lines),
+                    "word_count": len(page_text.split())
+                })
+
+            # Gabungkan semua teks
+            combined = "\n\n".join(
+                f"## Halaman {p['page_num']} (OCR)\n\n{p['text']}"
+                for p in all_pages_text
+                if p["word_count"] > 5
+            )
+
+            total_words = sum(p["word_count"] for p in all_pages_text)
+            print(f"[Surya] OCR complete: {total_pages} pages, {total_words} words extracted")
+
+            result = {
+                "company_domain": company_domain,
+                "pdf_filename": pdf_path.name,
+                "pdf_type": "scanned",
+                "page_count": total_pages,
+                "combined_text": combined,
+                "total_words": total_words,
+                "pages_detail": all_pages_text,
+                "ocr_method": "surya",
+                "ocr_languages": langs,
+                "confidence_threshold": confidence_threshold,
+                "extracted_at": datetime.utcnow().isoformat()
+            }
+
+            # Simpan ke file
+            output = Path(f"staging/pdf_text/{company_domain.replace('.', '_')}_{pdf_path.stem}_ocr.json")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with open(output, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+
+            return result
+
+        # Contoh penggunaan
+        result = retro_ocr_scanned_pdf(
+            pdf_path="staging/pdfs/abctech_co_id/brochure-scan.pdf",
+            company_domain="abctech.co.id",
+            langs=["en", "id"],
+            confidence_threshold=0.7
+        )
+        print(f"OCR: {result['total_words']} words from {result['page_count']} pages")
+        print(result['combined_text'][:500])
+
+      expected_output: |
+        [Surya] Loading OCR models (first time)...
+        [Surya] Models loaded and cached.
+        [Surya] Converting 24 pages to images for OCR...
+        [Surya] Running OCR on 24 pages...
+        [Surya] OCR complete: 24 pages, 8234 words extracted
+
+        OCR: 8234 words from 24 pages
+
+        ## Halaman 1 (OCR)
+
+        ABC TECHNOLOGY
+        Solusi IoT untuk Industri Masa Depan
+
+        Tentang Kami
+        ABC Technology didirikan pada tahun 2015 dengan visi...
+
+    notes:
+      - "Load model sekali dan cache sebagai global variable. Loading butuh 20-30 detik."
+      - "Matrix(2,2) = 144 DPI. Lebih tinggi DPI lebih akurat OCR tapi lebih lambat."
+      - "confidence_threshold=0.7 adalah trade-off yang baik. Turunkan ke 0.5 jika banyak teks hilang."
+      - "Surya jauh lebih akurat untuk dokumen Indonesia dibanding Tesseract."
+    pitfalls:
+      - "Model Surya butuh download saat pertama kali (~1GB). Pastikan storage cukup."
+      - "Tanpa GPU, OCR 24 halaman bisa butuh 5-10 menit. Dengan GPU: 30-60 detik."
+      - "Gambar yang terlalu gelap atau blur akan menghasilkan OCR tidak akurat."
+
+  - id: marker
+    name: "marker"
+    category: "OCR (Scanned PDF / Image)"
+    description: >
+      Konversi PDF ke Markdown dengan presisi tinggi. Berbasis Surya OCR.
+      Support tabel dan math formula. Alternative pipeline all-in-one
+      dari PDF langsung ke Markdown siap LLM.
+    specific_function: >
+      PDF ke Markdown berkualitas tinggi untuk LLM. Handle tabel, heading,
+      dan math formula. Bisa digunakan sebagai alternatif pymupdf4llm
+      yang juga support scanned PDF.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/VikParuchuri/marker"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        All-in-one PDF-to-Markdown converter yang menggabungkan OCR dan
+        formatting dalam satu step. Alternatif untuk pipeline yang ingin
+        satu tool untuk semua jenis PDF (digital dan scanned).
+      when_to_use: >
+        Gunakan sebagai alternatif ketika ingin satu pipeline untuk semua
+        jenis PDF. Marker lebih lambat dari pymupdf4llm untuk PDF digital
+        tapi bisa handle scanned PDF sekaligus. Pertimbangkan tradeoff
+        antara kecepatan (pymupdf4llm) vs universalitas (marker).
+      priority: "secondary (alternative ke pymupdf4llm)"
+      output_goes_to: "staging/pdf_markdown/"
+
+    setup:
+      install: "pip install marker-pdf"
+      requirements:
+        - "Python 3.9+"
+        - "GPU recommended"
+        - "VRAM minimal 8GB untuk performa optimal"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from marker.convert import convert_single_pdf
+        from marker.models import load_all_models
+
+        # Load models (sekali saja)
+        models = load_all_models()
+
+        # Konversi PDF ke Markdown
+        full_text, images, metadata = convert_single_pdf(
+            "catalog.pdf",
+            models
+        )
+
+        print(f"Pages: {metadata['pages']}")
+        print(f"Languages: {metadata['languages']}")
+        print(full_text[:500])
+
+      retro_example: |
+        from marker.convert import convert_single_pdf
+        from marker.models import load_all_models
+        from pathlib import Path
+        from datetime import datetime
+        import json
+
+        _MARKER_MODELS = None
+
+        def get_marker_models():
+            global _MARKER_MODELS
+            if _MARKER_MODELS is None:
+                print("[marker] Loading models...")
+                _MARKER_MODELS = load_all_models()
+                print("[marker] Models ready.")
+            return _MARKER_MODELS
+
+        def retro_marker_convert(pdf_path: str, company_domain: str) -> dict:
+            """
+            Konversi PDF ke Markdown menggunakan marker.
+            Support both digital dan scanned PDF.
+            """
+            models = get_marker_models()
+            pdf_path = Path(pdf_path)
+
+            try:
+                full_text, images, metadata = convert_single_pdf(
+                    str(pdf_path),
+                    models,
+                    langs=["English", "Indonesian"]
+                )
+
+                # Simpan Markdown
+                output_md = Path(f"staging/pdf_markdown/{company_domain.replace('.', '_')}_{pdf_path.stem}.md")
+                output_md.parent.mkdir(parents=True, exist_ok=True)
+                output_md.write_text(full_text, encoding="utf-8")
+
+                return {
+                    "company_domain": company_domain,
+                    "pdf_filename": pdf_path.name,
+                    "markdown_path": str(output_md),
+                    "page_count": metadata.get("pages", 0),
+                    "languages_detected": metadata.get("languages", []),
+                    "total_words": len(full_text.split()),
+                    "extraction_method": "marker",
+                    "extracted_at": datetime.utcnow().isoformat(),
+                    "status": "success"
+                }
+            except Exception as e:
+                return {"status": "failed", "error": str(e)}
+
+        result = retro_marker_convert("staging/pdfs/abctech_co_id/brochure.pdf", "abctech.co.id")
+        print(f"Converted: {result['page_count']} pages, {result['total_words']} words")
+
+      expected_output: |
+        [marker] Loading models...
+        [marker] Models ready.
+        Converted: 32 pages, 12847 words
+
+        Output Markdown sample:
+        # ABC Technology Product Catalog
+
+        ## Industrial IoT Solutions
+
+        | Product | Model | Price |
+        |---------|-------|-------|
+        | IoT Gateway | GT-2024 | Contact |
+        | Sensor Suite | SS-PRO | Contact |
+
+    notes:
+      - "marker lebih lambat dari pymupdf4llm untuk digital PDF tapi hasilnya lebih baik untuk layout kompleks."
+      - "Images dari PDF disimpan terpisah. Useful untuk katalog dengan banyak foto produk."
+    pitfalls:
+      - "Model marker butuh download ~2GB saat pertama kali."
+      - "Untuk PDF > 100 halaman di CPU, bisa butuh 30+ menit."
+
+  - id: pdfplumber
+    name: "pdfplumber"
+    category: "PDF Text Extraction"
+    description: >
+      Library Python untuk ekstrak text dan tabel dari PDF. Sangat baik
+      untuk tabel kompleks dengan border, kolom, dan merged cell.
+    specific_function: >
+      Ekstrak tabel dari PDF dengan presisi tinggi. Deteksi border, kolom,
+      merged cell. Output sebagai list of lists yang bisa dikonversi ke
+      DataFrame pandas.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/jsvine/pdfplumber"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        Specialized table extractor. Digunakan ketika PDF katalog perusahaan
+        berisi tabel spesifikasi produk atau daftar harga yang perlu
+        diekstrak secara terstruktur. Lebih akurat dari PyMuPDF untuk tabel.
+      when_to_use: >
+        Gunakan setelah PyMuPDF/pymupdf4llm selesai, jika masih ada tabel
+        yang tidak ter-extract dengan baik. Atau gunakan sebagai additional
+        pass khusus untuk halaman yang terdeteksi mengandung tabel penting.
+      priority: "secondary (specialized table extraction)"
+      output_goes_to: "staging/pdf_tables/{domain}/"
+
+    setup:
+      install: "pip install pdfplumber"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import pdfplumber
+        import pandas as pd
+
+        with pdfplumber.open("catalog.pdf") as pdf:
+            for i, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                for j, table in enumerate(tables):
+                    if table:
+                        df = pd.DataFrame(table[1:], columns=table[0])
+                        print(f"Page {i+1}, Table {j+1}:")
+                        print(df.head())
+                        print("---")
+
+      retro_example: |
+        import pdfplumber
+        import pandas as pd
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        def retro_extract_pdf_tables(pdf_path: str, company_domain: str) -> dict:
+            """
+            Ekstrak semua tabel dari PDF.
+            Berguna untuk tabel spesifikasi produk, daftar harga, dll.
+            """
+            tables_found = []
+            pdf_path = Path(pdf_path)
+
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    try:
+                        tables = page.extract_tables({
+                            "vertical_strategy": "lines",
+                            "horizontal_strategy": "lines",
+                            "snap_tolerance": 3
+                        })
+
+                        for table_idx, table in enumerate(tables):
+                            if not table or len(table) < 2:
+                                continue
+
+                            # Filter baris kosong
+                            cleaned = [
+                                [str(cell).strip() if cell else "" for cell in row]
+                                for row in table
+                                if any(cell for cell in row)
+                            ]
+
+                            if len(cleaned) < 2:
+                                continue
+
+                            # Convert ke dict untuk JSON serializable
+                            headers = cleaned[0]
+                            rows = cleaned[1:]
+
+                            tables_found.append({
+                                "page": page_num + 1,
+                                "table_index": table_idx,
+                                "headers": headers,
+                                "rows": rows,
+                                "row_count": len(rows),
+                                "col_count": len(headers)
+                            })
+
+                    except Exception as e:
+                        print(f"[pdfplumber] Error on page {page_num + 1}: {e}")
+
+            result = {
+                "company_domain": company_domain,
+                "pdf_filename": pdf_path.name,
+                "tables_found": len(tables_found),
+                "tables": tables_found,
+                "extracted_at": datetime.utcnow().isoformat()
+            }
+
+            print(f"[pdfplumber] Found {len(tables_found)} tables in {pdf_path.name}")
+            output = Path(f"staging/pdf_tables/{company_domain.replace('.', '_')}_{pdf_path.stem}_tables.json")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with open(output, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+
+            return result
+
+        result = retro_extract_pdf_tables("staging/pdfs/abctech_co_id/catalog.pdf", "abctech.co.id")
+
+      expected_output: |
+        [pdfplumber] Found 8 tables in catalog.pdf
+
+        Table example:
+        {
+          "page": 12,
+          "table_index": 0,
+          "headers": ["Model", "CPU", "RAM", "Connectivity", "Price"],
+          "rows": [
+            ["GT-PRO-2024", "ARM Cortex-A53", "2GB", "4G LTE + WiFi 6", "Contact"],
+            ["GT-LITE-2024", "ARM Cortex-A35", "512MB", "WiFi 5", "Contact"]
+          ],
+          "row_count": 2,
+          "col_count": 5
+        }
+
+    notes:
+      - "Strategy 'lines' lebih akurat untuk tabel dengan border. 'text' untuk tabel tanpa border."
+      - "snap_tolerance=3 membantu untuk tabel yang alignment-nya sedikit off."
+      - "Untuk tabel tanpa border, gunakan strategy 'text' atau coba kedua strategy."
+    pitfalls:
+      - "Tabel yang sangat kompleks (multi-level header, merged cells) mungkin tidak ter-extract sempurna."
+      - "Jangan gunakan pdfplumber untuk scanned PDF. Hasilnya akan kosong."
+
+  - id: tesseract_pytesseract
+    name: "Tesseract OCR (pytesseract)"
+    category: "OCR (Scanned PDF / Image)"
+    description: >
+      OCR engine open-source terpopuler dari Google. Support 100+ bahasa.
+      Python wrapper via pytesseract. Fallback yang reliable ketika
+      Surya tidak tersedia atau terlalu lambat untuk use case sederhana.
+    specific_function: >
+      OCR gambar dan scanned PDF. Ekstrak text dari foto dokumen.
+      Bisa digunakan langsung dari command line atau via Python wrapper.
+    language: "Python / C"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/tesseract-ocr/tesseract"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        Fallback OCR engine ketika Surya tidak tersedia. Lebih lambat
+        dan kurang akurat dari Surya untuk dokumen campuran Indonesia-Inggris,
+        tapi lebih ringan dan tidak butuh GPU sama sekali.
+      when_to_use: >
+        Gunakan Tesseract hanya jika Surya gagal atau tidak tersedia (misalnya
+        di server tanpa GPU dan RAM terbatas). Untuk akurasi terbaik, selalu
+        prioritaskan Surya. Tesseract cocok untuk gambar sederhana dengan
+        teks satu bahasa yang bersih.
+      priority: "fallback (setelah Surya)"
+      output_goes_to: "staging/pdf_text/{domain}_ocr.json"
+
+    setup:
+      install: |
+        # Install Tesseract binary (Ubuntu/Debian):
+        sudo apt-get install tesseract-ocr
+        sudo apt-get install tesseract-ocr-ind  # Bahasa Indonesia
+
+        # Python wrapper:
+        pip install pytesseract Pillow
+      requirements:
+        - "Tesseract binary installed di sistem"
+        - "Language data untuk Indonesia: tesseract-ocr-ind"
+      env_vars:
+        - name: "TESSDATA_PREFIX"
+          description: "Path ke tessdata directory, umumnya /usr/share/tesseract-ocr/5/"
+
+    usage:
+      basic_example: |
+        import pytesseract
+        from PIL import Image
+        import fitz  # PyMuPDF untuk convert PDF ke image
+
+        # OCR dari gambar langsung
+        image = Image.open("scanned_page.png")
+        text = pytesseract.image_to_string(image, lang="eng+ind")  # Inggris + Indonesia
+        print(text[:300])
+
+        # OCR dengan confidence data
+        data = pytesseract.image_to_data(image, lang="eng+ind", output_type=pytesseract.Output.DICT)
+        print(f"Words found: {len([w for w in data['text'] if w.strip()])}")
+
+      retro_example: |
+        import pytesseract
+        from PIL import Image, ImageEnhance, ImageFilter
+        import fitz
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
+            """
+            Pre-processing gambar untuk meningkatkan akurasi OCR.
+            """
+            # Convert ke grayscale
+            image = image.convert("L")
+            # Tingkatkan contrast
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(2.0)
+            # Sharpen
+            image = image.filter(ImageFilter.SHARPEN)
+            return image
+
+        def retro_tesseract_ocr(pdf_path: str, company_domain: str) -> dict:
+            """
+            OCR scanned PDF menggunakan Tesseract.
+            Fallback jika Surya tidak tersedia.
+            """
+            pdf_path = Path(pdf_path)
+            doc = fitz.open(str(pdf_path))
+            all_text = []
+
+            print(f"[Tesseract] OCR-ing {doc.page_count} pages...")
+
+            for page_num, page in enumerate(doc):
+                mat = fitz.Matrix(2.5, 2.5)  # High DPI untuk akurasi
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                img = preprocess_image_for_ocr(img)
+
+                # OCR dengan config custom
+                custom_config = r"--oem 3 --psm 6"  # oem 3 = LSTM neural net, psm 6 = block of text
+                text = pytesseract.image_to_string(img, lang="eng+ind", config=custom_config)
+
+                if text.strip():
+                    all_text.append({
+                        "page_num": page_num + 1,
+                        "text": text.strip(),
+                        "word_count": len(text.split())
+                    })
+
+            doc.close()
+            combined = "\n\n".join(
+                f"## Halaman {p['page_num']}\n\n{p['text']}"
+                for p in all_text
+            )
+
+            print(f"[Tesseract] Done: {len(all_text)} pages with text")
+            return {
+                "company_domain": company_domain,
+                "combined_text": combined,
+                "total_words": sum(p["word_count"] for p in all_text),
+                "ocr_method": "tesseract",
+                "extracted_at": datetime.utcnow().isoformat()
+            }
+
+        result = retro_tesseract_ocr("staging/pdfs/company/brochure.pdf", "company.co.id")
+        print(f"Words extracted: {result['total_words']}")
+
+      expected_output: |
+        [Tesseract] OCR-ing 16 pages...
+        [Tesseract] Done: 15 pages with text
+        Words extracted: 5847
+
+    notes:
+      - "lang='eng+ind' untuk dokumen campuran Inggris-Indonesia."
+      - "oem 3 (LSTM) lebih akurat dari oem 1. Gunakan selalu oem 3."
+      - "psm 6 untuk block of text standar. psm 4 untuk satu kolom, psm 1 untuk auto."
+      - "Pre-processing gambar (grayscale, contrast, sharpen) meningkatkan akurasi 20-40%."
+    pitfalls:
+      - "Tesseract butuh binary di PATH. Pastikan terinstall di sistem dan tesseract --version berhasil."
+      - "Dokumen dengan layout 2-kolom menghasilkan teks yang bercampur. Gunakan psm 2 untuk ini."
+      - "Tesseract lebih lambat dari Surya dan akurasinya lebih rendah untuk font non-standar."
+
+  - id: pdf2image
+    name: "pdf2image"
+    category: "Image Extraction & Metadata"
+    description: >
+      Konversi halaman PDF ke gambar PIL/Pillow menggunakan poppler backend.
+      Utility penting dalam pipeline OCR untuk convert PDF ke format gambar
+      sebelum diproses oleh OCR engine.
+    specific_function: >
+      Render halaman PDF menjadi gambar untuk diproses lebih lanjut atau
+      ditampilkan. Output: list of PIL Image objects.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2024"
+    url: "https://github.com/Belval/pdf2image"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        PDF-to-Image converter sebagai alternatif dari PyMuPDF untuk
+        konversi. Digunakan dalam pipeline OCR ketika membutuhkan gambar
+        berkualitas tinggi dari halaman PDF untuk EasyOCR atau Tesseract.
+      when_to_use: >
+        Gunakan jika PyMuPDF tidak tersedia atau jika perlu format gambar
+        yang lebih kompatibel dengan tools tertentu. Untuk pipeline standar
+        RETRO, PyMuPDF sudah cukup untuk konversi PDF ke image.
+      priority: "secondary utility"
+      output_goes_to: "Temporary images untuk OCR pipeline"
+
+    setup:
+      install: |
+        # Install poppler (backend):
+        # Ubuntu: sudo apt-get install poppler-utils
+        # Windows: Download dari https://github.com/oschwartz10612/poppler-windows
+
+        pip install pdf2image Pillow
+      requirements:
+        - "poppler-utils installed di sistem"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from pdf2image import convert_from_path
+        from pathlib import Path
+
+        # Convert semua halaman ke images
+        images = convert_from_path(
+            "catalog.pdf",
+            dpi=200,          # 200 DPI untuk OCR, 300 untuk kualitas lebih baik
+            fmt="jpeg",
+            thread_count=4    # Parallel conversion
+        )
+
+        print(f"Pages converted: {len(images)}")
+        for i, img in enumerate(images):
+            img.save(f"output/page_{i+1:03d}.jpg", "JPEG", quality=95)
+            print(f"Saved page {i+1}: {img.size}")
+
+      retro_example: |
+        from pdf2image import convert_from_path
+        from pathlib import Path
+
+        def retro_pdf_to_images(pdf_path: str, dpi: int = 200) -> list:
+            """
+            Convert PDF ke list images untuk OCR pipeline.
+            Return: list of PIL Image objects.
+            """
+            images = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                thread_count=2,
+                grayscale=True  # Grayscale lebih baik untuk OCR
+            )
+            print(f"[pdf2image] Converted {len(images)} pages at {dpi} DPI")
+            return images
+
+        images = retro_pdf_to_images("scanned.pdf", dpi=200)
+        # Langsung pass ke Tesseract atau EasyOCR
+        import pytesseract
+        for i, img in enumerate(images):
+            text = pytesseract.image_to_string(img, lang="eng+ind")
+            print(f"Page {i+1}: {len(text)} chars")
+
+      expected_output: |
+        [pdf2image] Converted 24 pages at 200 DPI
+        Page 1: 1847 chars
+        Page 2: 2103 chars
+        ...
+
+    notes:
+      - "dpi=200 cukup untuk OCR. dpi=300 untuk kualitas arsip tapi file lebih besar."
+      - "grayscale=True menghemat memory dan sedikit mempercepat OCR."
+      - "thread_count untuk parallel page conversion. Set ke jumlah CPU cores."
+    pitfalls:
+      - "poppler HARUS terinstall di sistem. Error 'poppler not found' = poppler belum diinstall."
+      - "PDF besar dengan banyak halaman bisa menghabiskan RAM jika semua diload sekaligus. Convert per batch."
+
+  - id: pillow_pil
+    name: "Pillow (PIL)"
+    category: "Image Extraction & Metadata"
+    description: >
+      Library manipulasi gambar Python standar. Pre-processing untuk OCR.
+      Digunakan untuk crop, resize, enhance contrast gambar sebelum OCR.
+    specific_function: >
+      Crop, resize, enhance contrast gambar sebelum OCR untuk akurasi
+      lebih tinggi. Juga untuk extract dan simpan gambar dari halaman PDF.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/python-pillow/Pillow"
+
+    retro:
+      phase: "Phase 2 - Secure Data Pipeline"
+      role: >
+        Image preprocessing utility. Digunakan sebelum OCR untuk
+        meningkatkan kualitas gambar yang akan di-OCR, sehingga
+        akurasi OCR lebih tinggi.
+      when_to_use: >
+        Selalu gunakan untuk pre-processing gambar sebelum Tesseract.
+        Untuk Surya, pre-processing biasanya tidak diperlukan karena
+        model neural network lebih robust terhadap kualitas gambar.
+      priority: "primary utility dalam OCR pipeline"
+      output_goes_to: "Temporary processed images untuk OCR"
+
+    setup:
+      install: "pip install Pillow"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from PIL import Image, ImageEnhance, ImageFilter
+
+        img = Image.open("scanned_page.jpg")
+
+        # Pre-processing untuk OCR
+        img = img.convert("L")                      # Grayscale
+        img = ImageEnhance.Contrast(img).enhance(2) # Tingkatkan contrast
+        img = ImageEnhance.Sharpness(img).enhance(2)# Sharpen
+        img = img.filter(ImageFilter.SHARPEN)       # Extra sharpen
+
+        img.save("processed_page.jpg")
+        print(f"Processed: {img.size}, mode: {img.mode}")
+
+      retro_example: |
+        from PIL import Image, ImageEnhance, ImageFilter
+        import numpy as np
+
+        def retro_preprocess_for_ocr(image: Image.Image, target_dpi: int = 200) -> Image.Image:
+            """
+            Standard pre-processing pipeline untuk gambar sebelum OCR.
+            Meningkatkan akurasi Tesseract secara signifikan.
+            """
+            # Convert ke grayscale
+            if image.mode != "L":
+                image = image.convert("L")
+
+            # Resize jika DPI terlalu rendah
+            w, h = image.size
+            if min(w, h) < 1000:  # Image terlalu kecil
+                scale = 1000 / min(w, h)
+                image = image.resize(
+                    (int(w * scale), int(h * scale)),
+                    Image.LANCZOS
+                )
+
+            # Tingkatkan contrast
+            image = ImageEnhance.Contrast(image).enhance(1.8)
+            # Tingkatkan brightness sedikit
+            image = ImageEnhance.Brightness(image).enhance(1.1)
+            # Sharpen
+            image = image.filter(ImageFilter.SHARPEN)
+
+            return image
+
+        # Penggunaan dalam pipeline OCR
+        raw_image = Image.open("raw_scan.jpg")
+        processed = retro_preprocess_for_ocr(raw_image)
+        import pytesseract
+        text = pytesseract.image_to_string(processed, lang="eng+ind")
+        print(f"OCR result ({len(text.split())} words):\n{text[:200]}")
+
+      expected_output: |
+        OCR result (847 words):
+        ABC Technology
+        Product Catalog 2024
+
+        IoT Gateway Pro
+        Model: GT-PRO-2024
+        ...
+
+    notes:
+      - "Grayscale conversion selalu dilakukan pertama sebelum enhancement lain."
+      - "Contrast enhancement 1.5-2.0 adalah range yang baik. Lebih dari 2.5 bisa merusak teks."
+      - "LANCZOS adalah resampling filter terbaik untuk upscaling."
+    pitfalls:
+      - "Terlalu banyak pre-processing bisa merusak teks yang tipis. Test dengan beberapa sample dulu."
+      - "Gambar yang terlalu gelap perlu brightness enhancement sebelum contrast."

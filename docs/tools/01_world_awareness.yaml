@@ -1,0 +1,1847 @@
+stage: "01 - World Awareness"
+stage_description: >
+  Sumber data untuk memahami apa yang sedang terjadi di dunia.
+  Berita global, event industri, tren pasar, dan social signals
+  yang menjadi trigger harian pipeline RETRO. Semua tool di stage
+  ini berjalan NON-LLM (pure code) dan output-nya masuk ke staging
+  area sebelum diproses oleh Context Agent.
+retro_phase: "Phase 1: The Discovery Engine"
+retro_role: >
+  Memberikan world context kepada sistem sebelum crawling domain dimulai.
+  Output stage ini digunakan untuk: (1) mendeteksi expo dan pameran yang
+  relevan, (2) menemukan vendor baru yang muncul di berita, (3) memahami
+  tren industri untuk konteks synthesis agent.
+execution_mode: "NON-LLM, berjalan otomatis via scheduler"
+output_destination: "PostgreSQL tabel raw_world_events, kemudian dikompilasi ke staging area"
+
+tools:
+
+  - id: gdelt_project
+    name: "GDELT Project"
+    category: "News & Event Database Global"
+    description: >
+      Database kejadian dunia real-time dari monitor 100+ bahasa,
+      update setiap 15 menit. Didukung Google Jigsaw. Data sejak 1979.
+      Salah satu sumber data terbesar di dunia yang tersedia gratis.
+    specific_function: >
+      Query event, tema, entitas, emosi, artikel berita global setiap 15
+      menit. Cocok untuk trigger harian deteksi expo, pameran, dan vendor
+      baru yang muncul di dunia nyata.
+    language: "Python / REST API"
+    pricing: "Gratis sepenuhnya. Tanpa API key."
+    last_updated: "2025 (aktif)"
+    url: "https://www.gdeltproject.org/"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        First-pass global scanner. Setiap siklus pipeline RETRO, GDELT
+        adalah sumber pertama yang diquery untuk mendapatkan gambaran
+        'apa yang sedang terjadi di dunia bisnis dan industri hari ini.'
+        Hasilnya menjadi seed untuk pencarian expo dan vendor domain.
+      when_to_use: >
+        Panggil di awal setiap siklus pipeline. Gunakan untuk mendeteksi
+        expo baru, konferensi industri, dan peluncuran produk vendor yang
+        belum ada di database. Jangan gunakan untuk verifikasi data company
+        yang sudah ada, gunakan Qdrant untuk itu.
+      priority: "primary"
+      output_goes_to: "raw_world_events table di PostgreSQL"
+
+    setup:
+      install: "pip install requests pandas"
+      requirements:
+        - "Python 3.8+"
+        - "Koneksi internet aktif"
+        - "Tidak perlu API key sama sekali"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import requests
+        import pandas as pd
+        from datetime import datetime
+
+        def query_gdelt(keyword: str, hours_back: int = 24) -> list:
+            """Query GDELT Doc API untuk artikel berita."""
+            url = "https://api.gdeltproject.org/api/v2/doc/doc"
+            params = {
+                "query": keyword,
+                "mode": "artlist",
+                "maxrecords": 250,
+                "format": "json",
+                "timespan": f"{hours_back}H",
+                "sort": "datedesc"
+            }
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("articles", [])
+
+        articles = query_gdelt("manufacturing expo trade show")
+        print(f"Total: {len(articles)} articles")
+        for a in articles[:3]:
+            print(a["title"], "|", a["domain"])
+
+      retro_example: |
+        import requests
+        import json
+        import hashlib
+        from datetime import datetime
+        import psycopg2
+
+        EXPO_KEYWORDS = [
+            "manufacturing expo trade show 2025",
+            "industrial exhibition B2B vendor",
+            "pameran industri Indonesia 2025",
+            "business summit conference Asia",
+            "technology expo supplier showcase",
+            "government procurement tender announcement",
+        ]
+
+        def retro_gdelt_scan(
+            keywords: list,
+            hours_back: int = 24,
+            db_conn=None
+        ) -> list:
+            """
+            Scan GDELT untuk semua keyword expo/pameran RETRO.
+            Deduplication via URL hash sebelum insert ke DB.
+            Return: list artikel unik yang belum ada di database.
+            """
+            all_articles = []
+            seen_hashes = set()
+
+            for keyword in keywords:
+                params = {
+                    "query": f"{keyword}",
+                    "mode": "artlist",
+                    "maxrecords": 100,
+                    "format": "json",
+                    "timespan": f"{hours_back}H",
+                    "sort": "datedesc",
+                    "sourcelang": "english OR indonesian OR malay"
+                }
+                try:
+                    resp = requests.get(
+                        "https://api.gdeltproject.org/api/v2/doc/doc",
+                        params=params,
+                        timeout=30
+                    )
+                    articles = resp.json().get("articles", [])
+
+                    for article in articles:
+                        article_url = article.get("url", "")
+                        url_hash = hashlib.md5(article_url.encode()).hexdigest()
+
+                        if url_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(url_hash)
+
+                        all_articles.append({
+                            "source": "gdelt",
+                            "url_hash": url_hash,
+                            "keyword_trigger": keyword,
+                            "title": article.get("title", ""),
+                            "url": article_url,
+                            "domain": article.get("domain", ""),
+                            "published_at": article.get("seendate", ""),
+                            "language": article.get("language", ""),
+                            "source_country": article.get("sourcecountry", ""),
+                            "scraped_at": datetime.utcnow().isoformat()
+                        })
+
+                except requests.RequestException as e:
+                    print(f"[GDELT] Error for '{keyword}': {e}")
+                    continue
+
+            print(f"[GDELT] Found {len(all_articles)} unique articles")
+            return all_articles
+
+        # Jalankan dan simpan ke staging
+        results = retro_gdelt_scan(EXPO_KEYWORDS, hours_back=24)
+
+        with open("staging/gdelt_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [GDELT] Found 187 unique articles
+
+        staging/gdelt_raw.json (contoh entry):
+        {
+          "source": "gdelt",
+          "url_hash": "a1b2c3d4e5f6...",
+          "keyword_trigger": "manufacturing expo Indonesia 2025",
+          "title": "Indo Manufacturing Expo 2025 Opens With 500+ Vendors",
+          "url": "https://industry-news.com/article/12345",
+          "domain": "industry-news.com",
+          "published_at": "20250423120000",
+          "language": "English",
+          "source_country": "Indonesia",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Update interval 15 menit. Timespan minimum efektif adalah '15M'."
+      - "Field 'domain' sudah tersedia, tidak perlu parse URL sendiri."
+      - "Gunakan filter 'sourcelang' untuk bahasa tertentu: 'english OR indonesian'."
+      - "maxrecords maksimal 250 per request. Gunakan multiple keywords untuk volume lebih besar."
+      - "Data historis tersedia sejak 1979, berguna untuk Historical Context Retrieval di Phase 3."
+    pitfalls:
+      - "Jangan query lebih dari 1 request per detik untuk menghindari soft-blocking."
+      - "Hasil duplikat sangat mungkin terjadi antar keyword. Wajib dedup via URL hash sebelum simpan."
+      - "Timespan '24H' berarti 24 jam terakhir, bukan 1 hari kalender."
+
+  - id: gdelt_doc_api_python
+    name: "GDELT 2.0 Doc API (Python Client)"
+    category: "News & Event Database Global"
+    description: >
+      Python client untuk GDELT 2.0 Doc API. Menyediakan interface yang
+      lebih Pythonic dibandingkan raw requests. Query artikel berita dari
+      database GDELT secara programatik dengan filtering yang lebih mudah.
+    specific_function: >
+      Fetch artikel berita global berdasarkan keyword, tema, tanggal,
+      bahasa, negara. Output JSON. Lebih mudah digunakan daripada raw API.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2024"
+    url: "https://github.com/linwoodc3/gdelt2HeaderRows"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: "Alternative GDELT client dengan filtering yang lebih mudah"
+      when_to_use: >
+        Gunakan sebagai alternatif dari raw GDELT API jika ingin interface
+        yang lebih Pythonic. Untuk RETRO, lebih disarankan menggunakan raw
+        requests langsung karena lebih fleksibel dan tidak bergantung pada
+        library tambahan.
+      priority: "optional"
+      output_goes_to: "Staging area, sama dengan GDELT Project"
+
+    setup:
+      install: "pip install gdeltdoc"
+      requirements:
+        - "Python 3.7+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from gdeltdoc import GdeltDoc, Filters
+
+        gd = GdeltDoc()
+
+        # Filter untuk artikel expo/pameran
+        filters = Filters(
+            keyword="manufacturing expo trade show",
+            timespan="1d",
+            num_records=100,
+            language="English"
+        )
+
+        articles = gd.article_search(filters)
+        print(articles.head())
+        print(articles.columns.tolist())
+
+      retro_example: |
+        from gdeltdoc import GdeltDoc, Filters
+        from datetime import datetime
+        import pandas as pd
+
+        def gdelt_client_scan(keyword: str, timespan: str = "1d") -> pd.DataFrame:
+            """
+            Gunakan gdeltdoc client untuk fetch artikel.
+            Return: DataFrame dengan kolom standar RETRO.
+            """
+            gd = GdeltDoc()
+            filters = Filters(
+                keyword=keyword,
+                timespan=timespan,
+                num_records=250
+            )
+            df = gd.article_search(filters)
+            if df.empty:
+                return pd.DataFrame()
+
+            df["source"] = "gdelt_client"
+            df["keyword_trigger"] = keyword
+            df["scraped_at"] = datetime.utcnow().isoformat()
+            df = df.rename(columns={
+                "seendate": "published_at",
+                "sourcecountry": "source_country"
+            })
+            return df[["source", "keyword_trigger", "title", "url",
+                       "domain", "published_at", "language",
+                       "source_country", "scraped_at"]]
+
+        result = gdelt_client_scan("industrial exhibition B2B vendor")
+        print(f"Found: {len(result)} articles")
+        result.to_json("staging/gdelt_client.json", orient="records", force_ascii=False)
+
+      expected_output: |
+        Found: 89 articles
+
+        DataFrame preview:
+           source             keyword_trigger                          title
+        0  gdelt_client  industrial exhibition B2B...   B2B Expo Opens in Jakarta
+        1  gdelt_client  industrial exhibition B2B...   Vendor Summit 2025 Results
+        ...
+
+    notes:
+      - "gdeltdoc menggunakan GDELT API yang sama, jadi data identik dengan direct requests."
+      - "Output langsung berupa DataFrame pandas, lebih mudah diolah."
+    pitfalls:
+      - "Library ini kurang aktif diupdate. Gunakan direct requests jika ada perubahan API."
+
+  - id: gnews_api
+    name: "GNews API"
+    category: "News & Event Database Global"
+    description: >
+      API berita global dengan 60.000+ sumber berita. Free tier memberikan
+      100 request per hari, cukup untuk cron harian pipeline RETRO.
+      Response terstruktur JSON yang mudah diparsing.
+    specific_function: >
+      Fetch headline terbaru per keyword, kategori, negara. JSON response.
+      Filter per bahasa dan tanggal publikasi.
+    language: "REST API / Python"
+    pricing: "Free tier: 100 req/hari tanpa kartu kredit"
+    last_updated: "2025"
+    url: "https://gnews.io/"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Secondary news source untuk memastikan coverage yang lebih luas
+        dari GDELT. Berguna untuk berita bisnis yang lebih curated dan
+        terstruktur, terutama untuk keyword spesifik industri.
+      when_to_use: >
+        Gunakan setelah GDELT untuk mendapatkan artikel yang lebih curated.
+        GNews lebih baik untuk berita mainstream business, sementara GDELT
+        lebih baik untuk event detection.
+      priority: "primary"
+      output_goes_to: "raw_world_events table di PostgreSQL"
+
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "API key dari gnews.io (daftar gratis)"
+      env_vars:
+        - name: "GNEWS_API_KEY"
+          description: "Daftar di https://gnews.io/ untuk mendapatkan API key gratis"
+
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        GNEWS_KEY = os.environ["GNEWS_API_KEY"]
+
+        def gnews_search(keyword: str, max_results: int = 10) -> list:
+            url = "https://gnews.io/api/v4/search"
+            params = {
+                "q": keyword,
+                "lang": "en",
+                "country": "any",
+                "max": max_results,
+                "apikey": GNEWS_KEY
+            }
+            resp = requests.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            return resp.json().get("articles", [])
+
+        articles = gnews_search("industrial expo vendor showcase")
+        for a in articles:
+            print(a["title"])
+            print(a["url"])
+            print(a["source"]["name"])
+            print("---")
+
+      retro_example: |
+        import requests
+        import os
+        import json
+        import hashlib
+        from datetime import datetime
+
+        GNEWS_KEY = os.environ["GNEWS_API_KEY"]
+
+        GNEWS_QUERIES = [
+            "trade show expo 2025 vendor",
+            "industrial exhibition supplier",
+            "government procurement tender technology",
+            "startup showcase B2B innovation",
+            "manufacturing summit conference Asia"
+        ]
+
+        def retro_gnews_scan(queries: list, lang: str = "en") -> list:
+            """
+            Scan GNews untuk semua query RETRO.
+            Deduplication via URL hash.
+            """
+            results = []
+            seen = set()
+
+            for query in queries:
+                params = {
+                    "q": query,
+                    "lang": lang,
+                    "country": "any",
+                    "max": 10,  # free tier limit per request
+                    "apikey": GNEWS_KEY,
+                    "sortby": "publishedAt"
+                }
+                try:
+                    resp = requests.get(
+                        "https://gnews.io/api/v4/search",
+                        params=params,
+                        timeout=20
+                    )
+                    articles = resp.json().get("articles", [])
+                    for article in articles:
+                        url = article.get("url", "")
+                        h = hashlib.md5(url.encode()).hexdigest()
+                        if h in seen:
+                            continue
+                        seen.add(h)
+                        results.append({
+                            "source": "gnews",
+                            "url_hash": h,
+                            "keyword_trigger": query,
+                            "title": article.get("title", ""),
+                            "description": article.get("description", ""),
+                            "url": url,
+                            "domain": article.get("source", {}).get("url", ""),
+                            "published_at": article.get("publishedAt", ""),
+                            "scraped_at": datetime.utcnow().isoformat()
+                        })
+                except Exception as e:
+                    print(f"[GNews] Error: {e}")
+
+            print(f"[GNews] Found {len(results)} unique articles")
+            return results
+
+        results = retro_gnews_scan(GNEWS_QUERIES)
+        with open("staging/gnews_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [GNews] Found 43 unique articles
+
+        Contoh entry:
+        {
+          "source": "gnews",
+          "url_hash": "b2c3d4e5...",
+          "keyword_trigger": "trade show expo 2025 vendor",
+          "title": "Global Manufacturing Expo 2025 Draws Record Attendance",
+          "description": "More than 2,000 vendors gathered at...",
+          "url": "https://manufacturing-news.com/expo-2025",
+          "domain": "https://manufacturing-news.com",
+          "published_at": "2025-04-23T10:30:00Z",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Free tier: 100 requests per hari. Dengan 5 keyword, sudah habis 50 request."
+      - "Gunakan 'max': 10 per request untuk menghemat quota free tier."
+      - "Field 'source.url' adalah domain website, bukan URL artikel."
+      - "publishedAt dalam format ISO 8601 UTC."
+    pitfalls:
+      - "Free tier hanya 100 req/hari. Jika pipeline run lebih dari sekali sehari, hitung quota dengan cermat."
+      - "Tidak ada deduplication bawaan. Wajib implementasi sendiri via URL hash."
+
+  - id: newsapi_org
+    name: "NewsAPI.org"
+    category: "News & Event Database Global"
+    description: >
+      Agregator berita dari 80.000+ sumber. Populer untuk developer.
+      Free tier memberikan 1000 request per hari dan akses ke artikel
+      hingga 1 bulan ke belakang.
+    specific_function: >
+      Cari berita berdasarkan keyword, sumber, tanggal, bahasa.
+      Endpoint /everything untuk artikel spesifik dan /top-headlines
+      untuk berita terkini.
+    language: "REST API / Python"
+    pricing: "Free tier developer tersedia. Komersial butuh upgrade."
+    last_updated: "2025"
+    url: "https://newsapi.org/"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Tertiary news source dengan coverage sangat luas. Berguna untuk
+        mencari artikel tentang perusahaan spesifik yang sudah dideteksi
+        oleh GDELT atau GNews, untuk memperkaya konteks company profiling.
+      when_to_use: >
+        Gunakan untuk deep-search artikel tentang company atau produk
+        spesifik setelah domain ditemukan. Juga berguna untuk validasi
+        apakah sebuah company pernah diliput media.
+      priority: "primary"
+      output_goes_to: "raw_world_events table"
+
+    setup:
+      install: "pip install newsapi-python"
+      requirements:
+        - "API key dari newsapi.org (daftar gratis untuk developer)"
+      env_vars:
+        - name: "NEWSAPI_KEY"
+          description: "Daftar di https://newsapi.org/register untuk key gratis"
+
+    usage:
+      basic_example: |
+        from newsapi import NewsApiClient
+        import os
+
+        newsapi = NewsApiClient(api_key=os.environ["NEWSAPI_KEY"])
+
+        # Cari semua artikel tentang topik
+        articles = newsapi.get_everything(
+            q="manufacturing expo Indonesia",
+            language="en",
+            sort_by="publishedAt",
+            page_size=100
+        )
+        print(f"Total: {articles['totalResults']} articles")
+        for a in articles["articles"][:3]:
+            print(a["title"])
+            print(a["url"])
+
+      retro_example: |
+        from newsapi import NewsApiClient
+        import os
+        import json
+        import hashlib
+        from datetime import datetime, timedelta
+
+        newsapi = NewsApiClient(api_key=os.environ["NEWSAPI_KEY"])
+
+        def retro_newsapi_company_search(company_name: str, domain: str) -> list:
+            """
+            Cari artikel tentang company spesifik yang sudah ditemukan.
+            Digunakan untuk memperkaya context sebelum LLM profiling.
+            """
+            results = []
+            seen = set()
+
+            queries = [
+                f'"{company_name}"',
+                f'"{company_name}" product launch',
+                f'"{company_name}" partnership'
+            ]
+
+            for q in queries:
+                try:
+                    resp = newsapi.get_everything(
+                        q=q,
+                        language="en",
+                        sort_by="relevancy",
+                        page_size=20,
+                        from_param=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+                    )
+                    for article in resp.get("articles", []):
+                        url = article.get("url", "")
+                        h = hashlib.md5(url.encode()).hexdigest()
+                        if h in seen:
+                            continue
+                        seen.add(h)
+                        results.append({
+                            "source": "newsapi",
+                            "company_name": company_name,
+                            "company_domain": domain,
+                            "query": q,
+                            "title": article.get("title", ""),
+                            "description": article.get("description", ""),
+                            "content_snippet": article.get("content", "")[:500],
+                            "url": url,
+                            "published_at": article.get("publishedAt", ""),
+                            "news_source": article.get("source", {}).get("name", ""),
+                            "scraped_at": datetime.utcnow().isoformat()
+                        })
+                except Exception as e:
+                    print(f"[NewsAPI] Error: {e}")
+
+            print(f"[NewsAPI] Found {len(results)} articles for '{company_name}'")
+            return results
+
+        # Contoh: setelah crawl menemukan perusahaan PT ABC Tech
+        articles = retro_newsapi_company_search("PT ABC Technology", "abctech.co.id")
+
+      expected_output: |
+        [NewsAPI] Found 12 articles for 'PT ABC Technology'
+
+        Entry contoh:
+        {
+          "source": "newsapi",
+          "company_name": "PT ABC Technology",
+          "company_domain": "abctech.co.id",
+          "query": "\"PT ABC Technology\" product launch",
+          "title": "ABC Technology Launches New IoT Platform for Industry 4.0",
+          "description": "Indonesian tech company ABC Technology has...",
+          "content_snippet": "ABC Technology, a leading provider of...",
+          "url": "https://tech-news.com/abc-iot-platform",
+          "published_at": "2025-03-15T08:00:00Z",
+          "news_source": "TechNews Indonesia",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Free tier dibatasi artikel maksimal 1 bulan ke belakang dan 100 hasil per query."
+      - "Gunakan quotes dalam query untuk exact match nama perusahaan."
+      - "Field 'content' di free tier dipotong di 200 karakter. Untuk full text gunakan newspaper4k."
+    pitfalls:
+      - "Free tier tidak bisa akses artikel lebih dari 30 hari. Untuk historical context, gunakan Common Crawl."
+      - "Rate limit bisa kena jika query terlalu cepat. Tambahkan time.sleep(0.5) antar request."
+
+  - id: feedparser
+    name: "feedparser"
+    category: "RSS & Feed Aggregation"
+    description: >
+      Library Python standar untuk parse semua format RSS/Atom feed.
+      Zero external dependencies, reliable, dan support hampir semua
+      format feed yang ada.
+    specific_function: >
+      Parse RSS/Atom feed dari Reuters, AP, Bloomberg, BBC, dan sumber
+      industri lainnya. Ekstrak judul, tanggal, URL, deskripsi dari
+      ratusan feed secara otomatis.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/kurtmckee/feedparser"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Feed aggregator untuk announcement resmi dari asosiasi industri,
+        organizer expo, dan media bisnis spesifik. Lebih reliable dari
+        scraping karena menggunakan data terstruktur dari sumber resmi.
+      when_to_use: >
+        Gunakan untuk mengikuti RSS feed dari asosiasi industri (KADIN,
+        Kemenperin, BUMN), organizer pameran resmi, dan media bisnis
+        yang relevan. Feed diparsing setiap siklus scheduler.
+      priority: "primary"
+      output_goes_to: "raw_world_events table"
+
+    setup:
+      install: "pip install feedparser"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import feedparser
+
+        # Parse satu feed
+        feed = feedparser.parse("https://news.google.com/rss/search?q=expo+pameran+industri")
+
+        print(f"Feed title: {feed.feed.title}")
+        print(f"Total entries: {len(feed.entries)}")
+
+        for entry in feed.entries[:5]:
+            print(f"Title: {entry.title}")
+            print(f"Link:  {entry.link}")
+            print(f"Date:  {entry.get('published', 'N/A')}")
+            print("---")
+
+      retro_example: |
+        import feedparser
+        import json
+        import hashlib
+        from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Daftar RSS feed yang relevan untuk RETRO
+        INDUSTRY_FEEDS = [
+            # Asosiasi & Pemerintah Indonesia
+            "https://www.kemenperin.go.id/rss",
+            "https://www.kadin.id/feed",
+            # Expo organizers
+            "https://www.pamerind.com/rss.xml",
+            "https://www.inapa.net/rss",
+            # Media bisnis global
+            "https://feeds.feedburner.com/IndustrialDistribution",
+            "https://www.manufacturing.net/rss.xml",
+            # Google News custom queries
+            "https://news.google.com/rss/search?q=trade+show+expo+2025&hl=en",
+            "https://news.google.com/rss/search?q=pameran+industri+Indonesia&hl=id",
+            "https://news.google.com/rss/search?q=expo+vendor+showcase+B2B&hl=en",
+        ]
+
+        def parse_single_feed(feed_url: str) -> list:
+            """Parse satu RSS feed dan return list artikel."""
+            try:
+                feed = feedparser.parse(feed_url)
+                articles = []
+                for entry in feed.entries:
+                    url = entry.get("link", "")
+                    if not url:
+                        continue
+                    articles.append({
+                        "source": "rss_feed",
+                        "feed_url": feed_url,
+                        "feed_title": feed.feed.get("title", ""),
+                        "url_hash": hashlib.md5(url.encode()).hexdigest(),
+                        "title": entry.get("title", ""),
+                        "summary": entry.get("summary", "")[:500],
+                        "url": url,
+                        "published_at": entry.get("published", ""),
+                        "scraped_at": datetime.utcnow().isoformat()
+                    })
+                return articles
+            except Exception as e:
+                print(f"[feedparser] Error on {feed_url}: {e}")
+                return []
+
+        def retro_feed_scan(feed_urls: list, max_workers: int = 5) -> list:
+            """
+            Parse semua RSS feed secara paralel.
+            Return: list artikel unik dari semua feed.
+            """
+            all_articles = []
+            seen_hashes = set()
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(parse_single_feed, url): url for url in feed_urls}
+                for future in as_completed(futures):
+                    articles = future.result()
+                    for article in articles:
+                        h = article["url_hash"]
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            all_articles.append(article)
+
+            print(f"[feedparser] Total unique articles: {len(all_articles)}")
+            return all_articles
+
+        results = retro_feed_scan(INDUSTRY_FEEDS)
+        with open("staging/rss_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [feedparser] Total unique articles: 234
+
+        Entry contoh:
+        {
+          "source": "rss_feed",
+          "feed_url": "https://news.google.com/rss/search?q=trade+show+expo+2025",
+          "feed_title": "trade show expo 2025 - Google News",
+          "url_hash": "c3d4e5f6...",
+          "title": "Manufacturing Expo 2025: Over 1,000 Vendors Expected",
+          "summary": "The annual Manufacturing Expo scheduled for June 2025...",
+          "url": "https://industry-weekly.com/expo-2025-preview",
+          "published_at": "Wed, 23 Apr 2025 08:30:00 GMT",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "feedparser otomatis handle encoding, malformed XML, dan berbagai format RSS/Atom."
+      - "Gunakan ThreadPoolExecutor untuk parse banyak feed secara paralel."
+      - "Feed Google News bisa digunakan tanpa API key dengan format URL RSS-nya."
+      - "entry.get('published', '') kadang kosong. Selalu gunakan .get() dengan default."
+    pitfalls:
+      - "Beberapa feed hanya berisi summary, bukan full text. Gunakan newspaper4k untuk fetch full article."
+      - "Feed yang menggunakan HTTPS self-signed certificate akan gagal. Tangkap dengan try/except."
+      - "Jangan parse feed yang sama lebih dari sekali per jam untuk menghindari blacklisting."
+
+  - id: newspaper4k
+    name: "newspaper3k / newspaper4k"
+    category: "RSS & Feed Aggregation"
+    description: >
+      Library scraping artikel berita dari URL. Ekstrak full text,
+      penulis, tanggal, gambar secara otomatis tanpa perlu menulis CSS
+      selector. newspaper4k adalah versi aktif yang terus diupdate.
+    specific_function: >
+      Beri URL berita, dapat full text, judul, metadata, summary otomatis.
+      Mendukung 30+ bahasa termasuk Bahasa Indonesia.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025 (newspaper4k aktif)"
+    url: "https://github.com/codelucas/newspaper"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Full text extractor untuk artikel berita yang ditemukan oleh
+        GDELT, GNews, atau RSS feed. Mengubah URL artikel menjadi teks
+        penuh yang bisa dimasukkan ke staging area untuk context enrichment.
+      when_to_use: >
+        Gunakan setelah URL artikel berhasil dikumpulkan dari sumber berita.
+        Panggil newspaper4k untuk mengambil full text artikel sebelum
+        disimpan ke staging. Jangan gunakan untuk halaman company website,
+        gunakan Crawl4AI untuk itu.
+      priority: "primary"
+      output_goes_to: "Staging area sebagai enriched article text"
+
+    setup:
+      install: "pip install newspaper4k"
+      requirements:
+        - "Python 3.8+"
+        - "pip install lxml_html_clean (dependency tambahan)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from newspaper import Article
+
+        url = "https://example-news.com/expo-2025-article"
+        article = Article(url)
+        article.download()
+        article.parse()
+
+        print(f"Title: {article.title}")
+        print(f"Authors: {article.authors}")
+        print(f"Published: {article.publish_date}")
+        print(f"Text (first 300 chars):\n{article.text[:300]}")
+
+        # NLP untuk summary (opsional)
+        article.nlp()
+        print(f"Keywords: {article.keywords}")
+        print(f"Summary: {article.summary}")
+
+      retro_example: |
+        from newspaper import Article
+        from newspaper.article import ArticleException
+        import json
+        import hashlib
+        from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        def fetch_article_fulltext(article_dict: dict) -> dict:
+            """
+            Ambil full text dari URL artikel yang ditemukan di staging.
+            Return: article_dict yang sudah diperkaya dengan full text.
+            """
+            url = article_dict.get("url", "")
+            if not url:
+                return article_dict
+
+            try:
+                article = Article(url, language="id" if ".co.id" in url else "en")
+                article.download()
+                article.parse()
+
+                article_dict.update({
+                    "full_text": article.text,
+                    "full_text_length": len(article.text),
+                    "authors": article.authors,
+                    "publish_date": str(article.publish_date) if article.publish_date else None,
+                    "top_image": article.top_image,
+                    "text_fetched": True,
+                    "text_fetched_at": datetime.utcnow().isoformat()
+                })
+
+                # NLP ringan untuk keyword extraction
+                article.nlp()
+                article_dict["auto_keywords"] = article.keywords[:10]
+                article_dict["auto_summary"] = article.summary
+
+            except ArticleException as e:
+                article_dict["text_fetched"] = False
+                article_dict["fetch_error"] = str(e)
+            except Exception as e:
+                article_dict["text_fetched"] = False
+                article_dict["fetch_error"] = str(e)
+
+            return article_dict
+
+        def retro_enrich_articles(articles: list, max_workers: int = 5) -> list:
+            """
+            Ambil full text dari semua artikel secara paralel.
+            Batasi ke artikel yang belum ada full text-nya.
+            """
+            to_fetch = [a for a in articles if not a.get("full_text")]
+            print(f"[newspaper4k] Fetching full text for {len(to_fetch)} articles...")
+
+            enriched = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(fetch_article_fulltext, a): a for a in to_fetch}
+                for future in as_completed(futures):
+                    enriched.append(future.result())
+                    time.sleep(0.5)  # rate limiting sopan
+
+            success = sum(1 for a in enriched if a.get("text_fetched"))
+            print(f"[newspaper4k] Successfully fetched: {success}/{len(to_fetch)}")
+            return enriched
+
+        # Load hasil dari GDELT/GNews staging
+        with open("staging/gdelt_raw.json") as f:
+            articles = json.load(f)
+
+        enriched = retro_enrich_articles(articles[:20])  # Batch 20 dulu
+
+        with open("staging/articles_enriched.json", "w", encoding="utf-8") as f:
+            json.dump(enriched, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [newspaper4k] Fetching full text for 20 articles...
+        [newspaper4k] Successfully fetched: 17/20
+
+        Entry setelah enrichment:
+        {
+          "source": "gdelt",
+          "title": "Indo Manufacturing Expo 2025 Opens With 500+ Vendors",
+          "url": "https://industry-news.com/expo-2025",
+          "full_text": "JAKARTA - The annual Indo Manufacturing Expo 2025 officially opened its doors today with more than 500 vendors from 23 countries showcasing their latest products...",
+          "full_text_length": 2847,
+          "authors": ["Budi Santoso"],
+          "publish_date": "2025-04-23 08:00:00",
+          "auto_keywords": ["expo", "vendor", "manufacturing", "Jakarta", "industrial"],
+          "auto_summary": "The Indo Manufacturing Expo 2025 attracted record attendance...",
+          "text_fetched": true,
+          "text_fetched_at": "2025-04-23T12:05:00"
+        }
+
+    notes:
+      - "newspaper4k (bukan newspaper3k) adalah versi yang aktif diupdate per 2025."
+      - "Gunakan language='id' untuk artikel Bahasa Indonesia agar NLP lebih akurat."
+      - "Beberapa website menggunakan JavaScript rendering. Untuk itu gunakan Playwright."
+      - "Selalu tangkap ArticleException karena banyak URL yang gagal di-parse."
+    pitfalls:
+      - "Jangan fetch lebih dari 10 artikel per detik dari domain yang sama (rate limiting)."
+      - "Paywalled article akan mengembalikan teks pendek atau error. Simpan metadata-nya tetap."
+      - "Artikel dalam iframe atau format khusus tidak akan ter-parse dengan baik."
+
+  - id: trendspyg
+    name: "trendspyg"
+    category: "Trend Monitoring"
+    description: >
+      Pengganti aktif pytrends yang sudah diarchive sejak April 2025.
+      Fetch Google Trends data real-time dengan 188K+ konfigurasi.
+      Tidak butuh API key karena menggunakan Google Trends langsung.
+    specific_function: >
+      Ambil trending searches real-time, interest over time, interest by
+      region, related queries dari Google Trends. Berguna untuk memahami
+      apakah topik tertentu sedang naik atau turun di masyarakat.
+    language: "Python"
+    pricing: "Gratis & open source. Tanpa API key resmi."
+    last_updated: "2025 (aktif)"
+    url: "https://github.com/flack0x/trendspyg"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Trend validator. Setelah menemukan keyword atau industri dari
+        GDELT/GNews, gunakan trendspyg untuk memvalidasi apakah keyword
+        tersebut sedang trending atau justru menurun. Ini membantu
+        Synthesis Agent memprioritaskan peluang yang relevan dengan tren.
+      when_to_use: >
+        Gunakan untuk validasi tren setelah keyword expo atau industri
+        ditemukan. Jika suatu industri trennya menurun, tandai sebagai
+        konteks penting untuk Synthesis Agent dalam menilai potensi
+        kolaborasi produk baru.
+      priority: "primary"
+      output_goes_to: "Staging area sebagai trend_context enrichment"
+
+    setup:
+      install: "pip install trendspyg"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from trendspyg import TrendReq
+        import pandas as pd
+
+        pytrends = TrendReq(hl="id-ID", tz=420)  # timezone WIB
+
+        # Interest over time untuk keyword industri
+        pytrends.build_payload(
+            kw_list=["expo manufaktur", "pameran industri", "vendor B2B"],
+            timeframe="today 3-m",
+            geo="ID"  # Indonesia
+        )
+
+        interest_df = pytrends.interest_over_time()
+        print(interest_df.tail(10))
+
+        # Related queries
+        related = pytrends.related_queries()
+        print(related["expo manufaktur"]["top"])
+
+      retro_example: |
+        from trendspyg import TrendReq
+        import json
+        import time
+        from datetime import datetime
+
+        def retro_trend_analysis(keywords: list, geo: str = "ID") -> dict:
+            """
+            Analisis tren untuk list keyword industri.
+            Return: dict dengan interest score dan tren naik/turun.
+            """
+            pytrends = TrendReq(hl="en-US", tz=420)
+            results = {}
+
+            # Process 5 keyword sekaligus (limit Google Trends)
+            for i in range(0, len(keywords), 5):
+                batch = keywords[i:i+5]
+                try:
+                    pytrends.build_payload(
+                        kw_list=batch,
+                        timeframe="today 12-m",
+                        geo=geo
+                    )
+                    interest = pytrends.interest_over_time()
+
+                    for kw in batch:
+                        if kw in interest.columns:
+                            series = interest[kw]
+                            recent_avg = series.tail(4).mean()  # 4 minggu terakhir
+                            historical_avg = series.mean()
+                            trend_direction = "rising" if recent_avg > historical_avg else "declining"
+
+                            results[kw] = {
+                                "current_interest": int(recent_avg),
+                                "historical_avg": int(historical_avg),
+                                "trend_direction": trend_direction,
+                                "peak_value": int(series.max()),
+                                "geo": geo,
+                                "analyzed_at": datetime.utcnow().isoformat()
+                            }
+                    time.sleep(2)  # Hindari rate limiting Google
+                except Exception as e:
+                    print(f"[trendspyg] Error for batch {batch}: {e}")
+                    time.sleep(5)
+
+            return results
+
+        INDUSTRY_KEYWORDS = [
+            "industrial automation",
+            "IoT manufacturing Indonesia",
+            "green energy vendor",
+            "digital transformation B2B",
+            "government technology procurement"
+        ]
+
+        trends = retro_trend_analysis(INDUSTRY_KEYWORDS, geo="ID")
+
+        print(json.dumps(trends, indent=2))
+        with open("staging/trend_context.json", "w") as f:
+            json.dump(trends, f, indent=2)
+
+      expected_output: |
+        {
+          "industrial automation": {
+            "current_interest": 72,
+            "historical_avg": 58,
+            "trend_direction": "rising",
+            "peak_value": 100,
+            "geo": "ID",
+            "analyzed_at": "2025-04-23T12:00:00"
+          },
+          "IoT manufacturing Indonesia": {
+            "current_interest": 45,
+            "historical_avg": 50,
+            "trend_direction": "declining",
+            "peak_value": 89,
+            "geo": "ID",
+            "analyzed_at": "2025-04-23T12:00:00"
+          }
+        }
+
+    notes:
+      - "trendspyg adalah pengganti pytrends yang deprecated. API-nya kompatibel dengan pytrends."
+      - "Google Trends menggunakan skala 0-100 (relative), bukan angka absolut."
+      - "Maksimal 5 keyword per request. Untuk lebih dari 5, loop dengan time.sleep(2)."
+      - "geo='ID' untuk Indonesia, '' untuk global, 'US' untuk Amerika."
+    pitfalls:
+      - "Google bisa block IP jika terlalu banyak request. Tambahkan time.sleep(2-5) antar batch."
+      - "Data Google Trends bersifat relative, bukan absolute. 100 = peak, bukan angka absolut."
+      - "Gunakan VPN atau rotate IP jika sering kena block."
+
+  - id: reddit_praw
+    name: "Reddit PRAW"
+    category: "Trend Monitoring"
+    description: >
+      Python Reddit API Wrapper. Library resmi untuk mengakses Reddit API.
+      Gratis dengan API key yang mudah didapat. Berguna untuk memantau
+      diskusi komunitas tentang industri dan produk tertentu.
+    specific_function: >
+      Monitor subreddit untuk topik yang sedang trending di komunitas
+      bisnis, tech, startup. Temukan vendor baru yang dibicarakan komunitas
+      sebelum muncul di media mainstream.
+    language: "Python"
+    pricing: "Gratis. API key mudah didapat dari reddit.com/prefs/apps."
+    last_updated: "2025"
+    url: "https://github.com/praw-dev/praw"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Community signal detector. Reddit seringkali membicarakan vendor
+        atau produk baru sebelum media mainstream. Gunakan untuk menangkap
+        sinyal awal dari komunitas bisnis dan teknologi.
+      when_to_use: >
+        Scan subreddit industri sekali per hari untuk menemukan diskusi
+        tentang expo, vendor baru, atau produk inovatif. Hasilnya digunakan
+        sebagai sinyal tambahan untuk Synthesis Agent.
+      priority: "secondary"
+      output_goes_to: "raw_world_events table dengan source='reddit'"
+
+    setup:
+      install: "pip install praw"
+      requirements:
+        - "Reddit account"
+        - "App credentials dari reddit.com/prefs/apps (pilih 'script')"
+      env_vars:
+        - name: "REDDIT_CLIENT_ID"
+          description: "Dari reddit.com/prefs/apps > your app"
+        - name: "REDDIT_CLIENT_SECRET"
+          description: "Secret key dari Reddit app"
+        - name: "REDDIT_USER_AGENT"
+          description: "Format: 'RETRO:v1.0 (by /u/username)'"
+
+    usage:
+      basic_example: |
+        import praw
+        import os
+
+        reddit = praw.Reddit(
+            client_id=os.environ["REDDIT_CLIENT_ID"],
+            client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+            user_agent=os.environ["REDDIT_USER_AGENT"]
+        )
+
+        # Search posts di subreddit industri
+        subreddit = reddit.subreddit("manufacturing+industrialengineering+B2B")
+
+        for post in subreddit.search("expo trade show vendor 2025", limit=20):
+            print(f"Title: {post.title}")
+            print(f"Score: {post.score}")
+            print(f"URL: {post.url}")
+            print(f"Comments: {post.num_comments}")
+            print("---")
+
+      retro_example: |
+        import praw
+        import os
+        import json
+        import hashlib
+        from datetime import datetime
+
+        reddit = praw.Reddit(
+            client_id=os.environ["REDDIT_CLIENT_ID"],
+            client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+            user_agent="RETRO:v1.0 (business intelligence pipeline)"
+        )
+
+        SUBREDDITS = [
+            "manufacturing",
+            "B2B",
+            "IndustrialEngineering",
+            "startups",
+            "indonesia",
+            "Entrepreneur",
+            "smallbusiness"
+        ]
+
+        SEARCH_QUERIES = [
+            "expo trade show vendor 2025",
+            "industrial exhibition supplier",
+            "government tender procurement",
+            "new product launch B2B"
+        ]
+
+        def retro_reddit_scan(subreddits: list, queries: list, limit: int = 25) -> list:
+            """
+            Scan Reddit untuk diskusi tentang expo dan vendor baru.
+            Return: list post unik yang relevan.
+            """
+            results = []
+            seen = set()
+
+            combined = "+".join(subreddits)
+            sub = reddit.subreddit(combined)
+
+            for query in queries:
+                try:
+                    for post in sub.search(query, sort="new", time_filter="week", limit=limit):
+                        post_id = post.id
+                        if post_id in seen:
+                            continue
+                        seen.add(post_id)
+
+                        results.append({
+                            "source": "reddit",
+                            "post_id": post_id,
+                            "query_trigger": query,
+                            "title": post.title,
+                            "selftext": post.selftext[:1000] if post.selftext else "",
+                            "url": f"https://reddit.com{post.permalink}",
+                            "external_url": post.url if not post.is_self else None,
+                            "subreddit": post.subreddit.display_name,
+                            "score": post.score,
+                            "num_comments": post.num_comments,
+                            "author": str(post.author),
+                            "created_at": datetime.utcfromtimestamp(post.created_utc).isoformat(),
+                            "scraped_at": datetime.utcnow().isoformat()
+                        })
+                except Exception as e:
+                    print(f"[Reddit] Error: {e}")
+
+            print(f"[Reddit] Found {len(results)} unique posts")
+            return results
+
+        results = retro_reddit_scan(SUBREDDITS, SEARCH_QUERIES)
+        with open("staging/reddit_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [Reddit] Found 67 unique posts
+
+        Entry contoh:
+        {
+          "source": "reddit",
+          "post_id": "abc123",
+          "query_trigger": "expo trade show vendor 2025",
+          "title": "Attended Indo Manufacturing Expo 2025 - Here's What I Saw",
+          "selftext": "Just got back from the expo. Saw some amazing new vendors...",
+          "url": "https://reddit.com/r/manufacturing/comments/abc123",
+          "external_url": null,
+          "subreddit": "manufacturing",
+          "score": 342,
+          "num_comments": 47,
+          "author": "manufacturer_guy",
+          "created_at": "2025-04-22T14:30:00",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Buat Reddit app di reddit.com/prefs/apps. Pilih type 'script' untuk personal use."
+      - "Rate limit: 60 requests per menit. PRAW menangani ini otomatis."
+      - "Post dengan score tinggi dan banyak komentar lebih relevan sebagai sinyal."
+      - "Subreddit bisa digabung dengan '+': 'manufacturing+B2B+startups'."
+    pitfalls:
+      - "Akun Reddit harus aktif dan berumur > 30 hari untuk mendapat API access penuh."
+      - "Deleted posts mengembalikan '[deleted]' sebagai author dan '[removed]' sebagai text."
+      - "Hindari scraping profil user untuk menghindari pelanggaran ToS."
+
+  - id: wikidata_sparql
+    name: "Wikidata SPARQL"
+    category: "Trend Monitoring"
+    description: >
+      Query Wikidata secara gratis untuk data terstruktur tentang events,
+      organisasi, perusahaan, dan lokasi. Database pengetahuan terbuka
+      terbesar di dunia dengan SPARQL query interface.
+    specific_function: >
+      Cari entitas, event, company, lokasi dari database pengetahuan
+      Wikidata via SPARQL endpoint. Tidak perlu API key, gratis penuh.
+    language: "SPARQL / REST"
+    pricing: "Gratis sepenuhnya"
+    last_updated: "2025"
+    url: "https://www.wikidata.org/wiki/Wikidata:SPARQL_query_service"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Historical expo data retriever. Wikidata berisi data terstruktur
+        tentang expo dan pameran yang pernah ada, lokasi, peserta, dan
+        tahun pelaksanaan. Berguna untuk Historical Context Retrieval
+        di Phase 3 dan validasi expo yang baru ditemukan.
+      when_to_use: >
+        Gunakan untuk mencari data expo yang sudah terdaftar di Wikidata,
+        mencari informasi perusahaan yang sudah dikenal secara global,
+        dan untuk validasi data yang ditemukan dari sumber lain.
+      priority: "secondary"
+      output_goes_to: "Staging area sebagai historical_context enrichment"
+
+    setup:
+      install: "pip install requests SPARQLWrapper"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from SPARQLWrapper import SPARQLWrapper, JSON
+
+        sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+        sparql.setReturnFormat(JSON)
+
+        # Query: cari semua trade fair / expo yang terdaftar di Wikidata
+        query = """
+        SELECT ?item ?itemLabel ?locationLabel ?startTime WHERE {
+          ?item wdt:P31 wd:Q184937 .  # instance of: trade fair
+          OPTIONAL { ?item wdt:P276 ?location . }
+          OPTIONAL { ?item wdt:P580 ?startTime . }
+          SERVICE wikibase:label {
+            bd:serviceParam wikibase:language "en,id" .
+          }
+        }
+        LIMIT 50
+        """
+        sparql.setQuery(query)
+        results = sparql.query().convert()
+
+        for r in results["results"]["bindings"][:5]:
+            print(r.get("itemLabel", {}).get("value", ""))
+            print(r.get("locationLabel", {}).get("value", ""))
+
+      retro_example: |
+        from SPARQLWrapper import SPARQLWrapper, JSON
+        import json
+        from datetime import datetime
+
+        sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+        sparql.setReturnFormat(JSON)
+        sparql.setTimeout(30)
+
+        def wikidata_search_expo(country_code: str = "ID") -> list:
+            """
+            Cari expo dan pameran di Wikidata untuk negara tertentu.
+            Berguna untuk historical context: expo apa yang pernah ada?
+            """
+            query = f"""
+            SELECT DISTINCT ?item ?itemLabel ?locationLabel ?startTime ?website WHERE {{
+              {{ ?item wdt:P31 wd:Q184937 . }}  # trade fair
+              UNION
+              {{ ?item wdt:P31 wd:Q27968055 . }}  # world exposition
+              UNION
+              {{ ?item wdt:P31 wd:Q1135529 . }}  # exhibition
+              OPTIONAL {{ ?item wdt:P276 ?location . }}
+              OPTIONAL {{ ?item wdt:P580 ?startTime . }}
+              OPTIONAL {{ ?item wdt:P856 ?website . }}
+              FILTER(LANG(?itemLabel) = "en" || LANG(?itemLabel) = "id")
+              SERVICE wikibase:label {{
+                bd:serviceParam wikibase:language "en,id" .
+              }}
+            }}
+            ORDER BY DESC(?startTime)
+            LIMIT 100
+            """
+            try:
+                sparql.setQuery(query)
+                results = sparql.query().convert()
+                expos = []
+                for r in results["results"]["bindings"]:
+                    expos.append({
+                        "source": "wikidata",
+                        "wikidata_id": r.get("item", {}).get("value", "").split("/")[-1],
+                        "name": r.get("itemLabel", {}).get("value", ""),
+                        "location": r.get("locationLabel", {}).get("value", ""),
+                        "start_time": r.get("startTime", {}).get("value", ""),
+                        "website": r.get("website", {}).get("value", ""),
+                        "scraped_at": datetime.utcnow().isoformat()
+                    })
+                return expos
+            except Exception as e:
+                print(f"[Wikidata] SPARQL error: {e}")
+                return []
+
+        expos = wikidata_search_expo()
+        print(f"[Wikidata] Found {len(expos)} expos")
+        with open("staging/wikidata_expos.json", "w", encoding="utf-8") as f:
+            json.dump(expos, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [Wikidata] Found 89 expos
+
+        Entry contoh:
+        {
+          "source": "wikidata",
+          "wikidata_id": "Q123456",
+          "name": "Indo Manufacturing Expo",
+          "location": "Jakarta",
+          "start_time": "2024-09-15T00:00:00Z",
+          "website": "https://indo-mfg-expo.com",
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "SPARQL endpoint gratis tapi ada rate limit. Jangan kirim lebih dari 1 query per detik."
+      - "Gunakan OPTIONAL untuk field yang tidak semua entity punya."
+      - "Timeout 30 detik karena query kompleks bisa lambat."
+      - "Wikidata ID bisa digunakan untuk fetch detail lebih lanjut via Wikidata API."
+    pitfalls:
+      - "SPARQL error tidak selalu jelas pesannya. Validasi query di query.wikidata.org dulu."
+      - "Data Wikidata tidak selalu lengkap. Website dan tanggal sering kosong."
+      - "Gunakan FILTER(LANG()) untuk menghindari duplikat label dalam bahasa berbeda."
+
+  - id: world_bank_api
+    name: "World Bank Open Data API"
+    category: "Trend Monitoring"
+    description: >
+      API resmi World Bank untuk data ekonomi, pembangunan, dan indikator
+      global per negara dan sektor. Data sangat reliable karena bersumber
+      dari institusi internasional resmi.
+    specific_function: >
+      Ambil data ekonomi per negara/sektor sebagai konteks kondisi bisnis
+      global. GDP growth, industrial output, trade data, investasi.
+    language: "REST API"
+    pricing: "Gratis sepenuhnya. Tanpa key."
+    last_updated: "2025"
+    url: "https://datahelpdesk.worldbank.org/knowledgebase/articles/889392"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Economic context provider. Memberikan gambaran kondisi ekonomi
+        negara target kepada Synthesis Agent. Jika ekonomi sektor tertentu
+        sedang tumbuh, peluang kolaborasi di sektor itu lebih menarik.
+      when_to_use: >
+        Jalankan sekali per minggu (bukan harian) karena data World Bank
+        tidak update sesering berita. Gunakan sebagai background context
+        untuk Synthesis Agent ketika mengevaluasi potensi market.
+      priority: "secondary"
+      output_goes_to: "PostgreSQL tabel economic_context"
+
+    setup:
+      install: "pip install wbgapi requests"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import wbgapi as wb
+
+        # Cari GDP growth rate Indonesia
+        data = wb.data.DataFrame("NY.GDP.MKTP.KD.ZG", "IDN", mrv=5)
+        print(data)
+
+        # Cari manufacturing value added
+        mfg = wb.data.DataFrame("NV.IND.MANF.ZS", ["IDN", "MYS", "THA"], mrv=5)
+        print(mfg)
+
+      retro_example: |
+        import wbgapi as wb
+        import json
+        import pandas as pd
+        from datetime import datetime
+
+        # Indikator ekonomi yang relevan untuk konteks RETRO
+        INDICATORS = {
+            "NY.GDP.MKTP.KD.ZG": "gdp_growth_pct",
+            "NV.IND.MANF.ZS": "manufacturing_value_added_pct_gdp",
+            "BX.KLT.DINV.WD.GD.ZS": "fdi_net_inflows_pct_gdp",
+            "NE.EXP.GNFS.ZS": "exports_pct_gdp",
+            "IC.BUS.EASE.XQ": "ease_of_doing_business_rank"
+        }
+
+        TARGET_COUNTRIES = ["IDN", "MYS", "SGP", "THA", "PHL", "VNM"]
+
+        def retro_economic_context(countries: list, indicators: dict) -> dict:
+            """
+            Ambil konteks ekonomi untuk negara target.
+            Data ini membantu Synthesis Agent menilai potensi market.
+            """
+            context = {}
+
+            for indicator_code, indicator_name in indicators.items():
+                try:
+                    df = wb.data.DataFrame(indicator_code, countries, mrv=3)
+                    df = df.fillna(0)
+                    for country in countries:
+                        if country not in context:
+                            context[country] = {"country": country}
+                        if country in df.index:
+                            latest = df.loc[country].dropna()
+                            if not latest.empty:
+                                context[country][indicator_name] = float(latest.iloc[-1])
+                                context[country][f"{indicator_name}_year"] = str(latest.index[-1])
+                except Exception as e:
+                    print(f"[WorldBank] Error for {indicator_code}: {e}")
+
+            for country in context:
+                context[country]["retrieved_at"] = datetime.utcnow().isoformat()
+
+            return context
+
+        econ_data = retro_economic_context(TARGET_COUNTRIES, INDICATORS)
+        print(json.dumps(econ_data, indent=2))
+
+        with open("staging/economic_context.json", "w") as f:
+            json.dump(econ_data, f, indent=2)
+
+      expected_output: |
+        {
+          "IDN": {
+            "country": "IDN",
+            "gdp_growth_pct": 5.05,
+            "gdp_growth_pct_year": "YR2024",
+            "manufacturing_value_added_pct_gdp": 18.2,
+            "fdi_net_inflows_pct_gdp": 2.1,
+            "exports_pct_gdp": 21.5,
+            "retrieved_at": "2025-04-23T12:00:00"
+          },
+          "MYS": {
+            "country": "MYS",
+            "gdp_growth_pct": 4.8,
+            ...
+          }
+        }
+
+    notes:
+      - "Gunakan wbgapi library untuk interface yang lebih mudah dari raw requests."
+      - "Data World Bank update tahunan, bukan real-time. Jalankan maksimal sekali per minggu."
+      - "mrv=3 berarti 3 Most Recent Values. Data terbaru mungkin N-1 atau N-2 tahun."
+    pitfalls:
+      - "Beberapa indikator tidak tersedia untuk semua negara. Selalu handle missing data."
+      - "Data bisa berubah retroaktif (revisi). Simpan timestamp pengambilan data."
+
+  - id: pygooglenews
+    name: "pygooglenews"
+    category: "RSS & Feed Aggregation"
+    description: >
+      Python wrapper untuk Google News RSS. Format query mudah, filter
+      per negara dan bahasa. Tidak butuh API key sama sekali.
+    specific_function: >
+      Query Google News RSS per keyword, topik, headline. Output JSON
+      list artikel dengan title, URL, domain, dan tanggal.
+    language: "Python"
+    pricing: "Gratis & open source. Tanpa API key."
+    last_updated: "2024"
+    url: "https://github.com/kotartemiy/pygooglenews"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Zero-cost news aggregator yang memanfaatkan Google News RSS.
+        Berguna sebagai fallback gratis ketika quota API lain habis.
+      when_to_use: >
+        Gunakan sebagai backup ketika GNews atau NewsAPI quota habis.
+        Atau gunakan sebagai primary untuk query yang sangat spesifik
+        karena Google News lebih baik dalam bahasa lokal.
+      priority: "secondary"
+      output_goes_to: "raw_world_events table"
+
+    setup:
+      install: "pip install pygooglenews"
+      requirements:
+        - "Python 3.7+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from pygooglenews import GoogleNews
+
+        gn = GoogleNews(lang="id", country="ID")
+
+        # Search
+        results = gn.search("expo pameran industri 2025")
+        for entry in results["entries"][:5]:
+            print(entry["title"])
+            print(entry["link"])
+            print(entry["published"])
+
+        # Top stories
+        top = gn.top_news()
+        print(f"Top stories: {len(top['entries'])}")
+
+      retro_example: |
+        from pygooglenews import GoogleNews
+        import json
+        import hashlib
+        from datetime import datetime
+
+        def retro_googlenews_scan(keywords: list, lang: str = "en", country: str = "ID") -> list:
+            gn = GoogleNews(lang=lang, country=country)
+            results = []
+            seen = set()
+
+            for kw in keywords:
+                try:
+                    resp = gn.search(kw)
+                    for entry in resp.get("entries", []):
+                        url = entry.get("link", "")
+                        h = hashlib.md5(url.encode()).hexdigest()
+                        if h in seen:
+                            continue
+                        seen.add(h)
+                        results.append({
+                            "source": "google_news_rss",
+                            "url_hash": h,
+                            "keyword_trigger": kw,
+                            "title": entry.get("title", ""),
+                            "url": url,
+                            "published_at": entry.get("published", ""),
+                            "scraped_at": datetime.utcnow().isoformat()
+                        })
+                except Exception as e:
+                    print(f"[GoogleNews] Error: {e}")
+
+            print(f"[GoogleNews] Found {len(results)} articles")
+            return results
+
+        keywords = ["expo manufaktur Indonesia", "pameran teknologi 2025", "vendor industri"]
+        results = retro_googlenews_scan(keywords)
+        with open("staging/googlenews_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [GoogleNews] Found 78 articles
+
+    notes:
+      - "pygooglenews tidak butuh API key, gratis sepenuhnya."
+      - "lang='id' untuk Bahasa Indonesia, 'en' untuk Inggris."
+      - "Tidak ada rate limit resmi tapi jangan query lebih dari 1 per detik."
+    pitfalls:
+      - "Google bisa block IP jika terlalu banyak request. Gunakan time.sleep(1) antar query."
+      - "URL hasil Google News menggunakan redirect. Parse domain dari URL setelah redirect jika perlu."
+
+  - id: eventregistry
+    name: "EventRegistry"
+    category: "News & Event Database Global"
+    description: >
+      Platform intelligence berita dengan NLP bawaan. Deteksi event,
+      cluster artikel terkait. API Python SDK tersedia.
+    specific_function: >
+      Real-time news monitoring, event clustering, entity detection.
+      Sangat baik untuk mengelompokkan artikel yang membahas event
+      yang sama dari berbagai sumber.
+    language: "Python / REST API"
+    pricing: "Free tier terbatas. Mudah didapat tanpa kartu kredit."
+    last_updated: "2025"
+    url: "https://eventregistry.org/"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Event clustering engine. Bisa mengelompokkan 50 artikel berbeda
+        yang semuanya membahas expo yang sama, lalu memberikan satu
+        ringkasan event tersebut. Berguna untuk menghindari pemrosesan
+        duplikat yang tidak terdeteksi oleh URL hash biasa.
+      when_to_use: >
+        Gunakan untuk clustering artikel yang ditemukan dari berbagai
+        sumber (GDELT, GNews, RSS) yang ternyata membahas event yang sama.
+        Output-nya adalah event-level summary, bukan article-level.
+      priority: "secondary"
+      output_goes_to: "Staging area sebagai clustered_events"
+
+    setup:
+      install: "pip install eventregistry"
+      requirements:
+        - "API key dari eventregistry.org (daftar gratis)"
+      env_vars:
+        - name: "EVENTREGISTRY_KEY"
+          description: "Daftar di https://eventregistry.org/register"
+
+    usage:
+      basic_example: |
+        from eventregistry import EventRegistry, QueryArticlesIter, QueryItems
+
+        er = EventRegistry(apiKey="YOUR_API_KEY")
+
+        # Query artikel tentang expo/pameran
+        q = QueryArticlesIter(
+            keywords=QueryItems.OR(["manufacturing expo", "trade show", "industrial fair"]),
+            lang="eng",
+            sortBy="date",
+            sortByAsc=False
+        )
+
+        for article in q.execQuery(er, sortBy="date", maxItems=20):
+            print(article.get("title", ""))
+            print(article.get("url", ""))
+
+      retro_example: |
+        from eventregistry import EventRegistry, QueryArticlesIter, QueryItems, RequestArticlesInfo
+        import os
+        import json
+        from datetime import datetime, timedelta
+
+        er = EventRegistry(apiKey=os.environ["EVENTREGISTRY_KEY"])
+
+        def retro_eventregistry_scan(keywords: list, days_back: int = 1) -> list:
+            """
+            Scan EventRegistry untuk artikel expo/vendor dengan entity detection.
+            Return: artikel dengan extracted entities (org, location, person).
+            """
+            date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+            q = QueryArticlesIter(
+                keywords=QueryItems.OR(keywords),
+                lang=QueryItems.OR(["eng", "ind"]),
+                dateStart=date_from,
+                sortBy="date",
+                sortByAsc=False
+            )
+
+            results = []
+            for article in q.execQuery(er, sortBy="date", maxItems=100,
+                                       returnInfo=RequestArticlesInfo(
+                                           includeArticleConcepts=True,
+                                           includeArticleCategories=True
+                                       )):
+                results.append({
+                    "source": "eventregistry",
+                    "title": article.get("title", ""),
+                    "url": article.get("url", ""),
+                    "date": article.get("date", ""),
+                    "source_name": article.get("source", {}).get("title", ""),
+                    "entities": [
+                        c.get("label", {}).get("eng", "")
+                        for c in article.get("concepts", [])
+                        if c.get("type") in ["org", "loc"]
+                    ][:10],
+                    "categories": [
+                        cat.get("label", {}).get("eng", "")
+                        for cat in article.get("categories", [])
+                    ][:5],
+                    "scraped_at": datetime.utcnow().isoformat()
+                })
+
+            print(f"[EventRegistry] Found {len(results)} articles")
+            return results
+
+        keywords = ["manufacturing expo", "trade show", "industrial exhibition", "B2B vendor"]
+        results = retro_eventregistry_scan(keywords, days_back=1)
+        with open("staging/eventregistry_raw.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [EventRegistry] Found 89 articles
+
+        Entry contoh:
+        {
+          "source": "eventregistry",
+          "title": "Manufacturing Expo 2025 Sets New Record",
+          "url": "https://mfg-news.com/expo-record",
+          "date": "2025-04-23",
+          "source_name": "Manufacturing News",
+          "entities": ["Indo Manufacturing Expo", "Jakarta", "PT Astra International"],
+          "categories": ["Business", "Manufacturing", "Trade"],
+          "scraped_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Free tier memberikan beberapa ratus request per hari."
+      - "Entity extraction bawaan sangat berguna untuk menemukan nama perusahaan dari artikel."
+      - "Gunakan includeArticleConcepts=True untuk mendapatkan entitas yang sudah ter-extract."
+    pitfalls:
+      - "Free tier cepat habis jika maxItems terlalu besar. Batasi ke 50-100 per query."
+      - "Hasil entity extraction tidak selalu akurat untuk nama perusahaan Indonesia."
+
+  - id: common_crawl
+    name: "Common Crawl"
+    category: "News & Event Database Global"
+    description: >
+      Dataset crawl web non-profit skala petabyte. Bebas digunakan untuk
+      research. Berisi salinan web yang terus diupdate dan tersedia di
+      AWS S3 secara gratis untuk diakses.
+    specific_function: >
+      Akses data crawl web historis dan terkini. Cocok untuk bulk analysis
+      artikel berita dan halaman web tanpa harus crawl sendiri.
+    language: "Python / AWS S3"
+    pricing: "Gratis sepenuhnya"
+    last_updated: "2025 (terus update)"
+    url: "https://commoncrawl.org/"
+
+    retro:
+      phase: "Phase 3 - Knowledge Brain (Historical Context)"
+      role: >
+        Historical web data source. Berguna untuk melihat bagaimana
+        website perusahaan terlihat 1-2 tahun yang lalu. Mendukung
+        Historical Context Retrieval di Phase 3.
+      when_to_use: >
+        Gunakan ketika perlu melihat konten historis sebuah domain yang
+        sekarang mungkin sudah berubah atau tidak aktif. Lebih berguna
+        untuk Phase 3 daripada Phase 1.
+      priority: "optional"
+      output_goes_to: "historical_company_data table"
+
+    setup:
+      install: "pip install boto3 requests warcio"
+      requirements:
+        - "AWS credentials (read-only, gratis untuk akses Common Crawl)"
+      env_vars:
+        - name: "AWS_ACCESS_KEY_ID"
+          description: "AWS key dengan akses S3 read-only"
+        - name: "AWS_SECRET_ACCESS_KEY"
+          description: "AWS secret key"
+
+    usage:
+      basic_example: |
+        import requests
+
+        def search_common_crawl_index(domain: str, crawl_id: str = "CC-MAIN-2024-51") -> list:
+            """
+            Cari URL dari domain tertentu di Common Crawl index.
+            crawl_id: lihat daftar di commoncrawl.org/the-data/get-started/
+            """
+            api_url = f"https://index.commoncrawl.org/{crawl_id}-index"
+            params = {
+                "url": f"{domain}/*",
+                "output": "json",
+                "limit": 50
+            }
+            resp = requests.get(api_url, params=params, timeout=30)
+            results = []
+            for line in resp.text.strip().split("\n"):
+                if line:
+                    import json
+                    results.append(json.loads(line))
+            return results
+
+        results = search_common_crawl_index("abctech.co.id")
+        print(f"Found {len(results)} pages from domain")
+
+      retro_example: |
+        import requests
+        import json
+        from datetime import datetime
+
+        def retro_historical_domain_check(domain: str, years_back: int = 2) -> dict:
+            """
+            Cek apakah domain perusahaan pernah di-crawl Common Crawl.
+            Return: list crawl records dengan timestamp, untuk historical context.
+            """
+            # Common Crawl IDs untuk beberapa tahun terakhir
+            crawl_ids = [
+                "CC-MAIN-2025-13",
+                "CC-MAIN-2024-51",
+                "CC-MAIN-2024-10",
+                "CC-MAIN-2023-50",
+            ]
+
+            history = []
+            for crawl_id in crawl_ids:
+                api_url = f"https://index.commoncrawl.org/{crawl_id}-index"
+                params = {"url": f"{domain}/*", "output": "json", "limit": 10}
+                try:
+                    resp = requests.get(api_url, params=params, timeout=20)
+                    records = [json.loads(l) for l in resp.text.strip().split("\n") if l]
+                    if records:
+                        history.append({
+                            "crawl_id": crawl_id,
+                            "pages_found": len(records),
+                            "sample_urls": [r.get("url") for r in records[:3]],
+                            "timestamps": [r.get("timestamp") for r in records[:3]]
+                        })
+                except Exception as e:
+                    print(f"[CommonCrawl] Error for {crawl_id}: {e}")
+
+            return {
+                "domain": domain,
+                "has_historical_data": len(history) > 0,
+                "crawl_history": history,
+                "checked_at": datetime.utcnow().isoformat()
+            }
+
+        result = retro_historical_domain_check("abctech.co.id")
+        print(json.dumps(result, indent=2))
+
+      expected_output: |
+        {
+          "domain": "abctech.co.id",
+          "has_historical_data": true,
+          "crawl_history": [
+            {
+              "crawl_id": "CC-MAIN-2024-51",
+              "pages_found": 8,
+              "sample_urls": [
+                "abctech.co.id/products",
+                "abctech.co.id/about",
+                "abctech.co.id/catalog-2024.pdf"
+              ],
+              "timestamps": ["20241210120000", "20241210120100", "20241210120200"]
+            }
+          ],
+          "checked_at": "2025-04-23T12:00:00"
+        }
+
+    notes:
+      - "Gunakan Common Crawl Index API untuk mencari tanpa download WARC file."
+      - "Download WARC file sangat besar. Untuk RETRO, cukup gunakan index API saja."
+      - "crawl_id terbaru tersedia di commoncrawl.org/the-data/get-started/"
+    pitfalls:
+      - "Jangan download WARC file untuk satu domain saja. Gunakan index search dulu."
+      - "Domain Indonesia (.co.id, .go.id) mungkin tidak selalu ter-crawl dengan baik."

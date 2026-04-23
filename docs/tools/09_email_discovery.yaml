@@ -1,0 +1,1035 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Email Discovery & Verification
+# File: 09_email_discovery.yaml
+# Purpose: Tools untuk menemukan email kontak perusahaan yang akan dikirim proposal.
+#          RETRO perlu menemukan email decision-maker (CEO, CMO, Business Development)
+#          dari perusahaan target sebelum mengirim proposal kolaborasi.
+#
+# RETRO EMAIL DISCOVERY STRATEGY:
+#   1. Cek website perusahaan untuk contact/about page (gratis, tapi tidak selalu ada)
+#   2. Hunter.io domain search (25 free credits/bulan, paling akurat)
+#   3. Snov.io domain search (150 free credits/bulan, alternatif)
+#   4. theHarvester (OSINT scraping dari LinkedIn, Google, dll)
+#   5. Email pattern guessing + validasi (firstname.lastname@domain.com)
+#   6. Validate semua email sebelum send: email-validator + MX record check
+#
+# LEGAL NOTE:
+#   GDPR dan UU PDP Indonesia berlaku untuk pengumpulan email.
+#   Selalu tambahkan unsubscribe link di email dan hormati opt-out request.
+#   Jangan kirim ke email yang tidak relevan (spam). Fokus pada business email.
+
+tools:
+
+  - id: hunter_io
+    name: "Hunter.io"
+    category: "Email Discovery API"
+    description: >
+      Hunter.io adalah layanan SaaS untuk menemukan email profesional berdasarkan
+      domain perusahaan. API endpoint utama: domain search (temukan semua email
+      terkait domain), email finder (temukan email berdasarkan nama + domain), dan
+      email verifier (validasi apakah email valid dan aktif). Sangat akurat karena
+      database Hunter dibangun dari web crawling dan data publik. Free tier: 25
+      searches/bulan. Paid: mulai $34/bulan untuk 500 searches.
+    specific_function: >
+      Temukan email business decision-maker dari perusahaan target RETRO. Domain search
+      mengembalikan semua email yang ditemukan untuk domain tersebut beserta nama,
+      posisi, dan confidence score. RETRO memilih email dengan posisi tertinggi
+      (CEO, Founder, Business Development, Partnership) dan confidence >= 70%.
+    language: "Python (requests atau hunter library)"
+    pricing: "25 searches/bulan gratis, $34/bulan (500 searches), $104/bulan (2000 searches)"
+    last_updated: "2025"
+    url: "https://hunter.io"
+    retro:
+      phase: "Phase 5 (Email Discovery sebelum Proposal Sending)"
+      role: >
+        Primary email discovery tool. Setelah Synthesis Agent memilih kandidat
+        terbaik, Email Discovery Agent mencari email kontak menggunakan Hunter.io
+        domain search. Hasilnya disimpan ke PostgreSQL company_profiles sebelum
+        Email Agent mengirim proposal.
+      when_to_use: >
+        Gunakan Hunter.io sebagai first-try email discovery untuk setiap company
+        target. Jika Hunter tidak menemukan email (banyak terjadi untuk perusahaan
+        kecil Asia), fallback ke theHarvester atau manual website scraping.
+        Monitor monthly quota (25 gratis) dengan Redis rate limit counter.
+      priority: "primary (email discovery)"
+      output_goes_to: "PostgreSQL company_profiles.contact_email"
+    setup:
+      install: "pip install requests  # Tidak ada official library, gunakan requests"
+      requirements:
+        - "requests>=2.28.0"
+        - "HUNTER_API_KEY dari https://hunter.io/api-keys"
+      env_vars:
+        - name: HUNTER_API_KEY
+          description: "API key dari https://hunter.io/api-keys (gratis register)"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        HUNTER_KEY = os.getenv("HUNTER_API_KEY")
+
+        # Domain search: temukan semua email di domain
+        def hunter_domain_search(domain: str, limit: int = 10) -> dict:
+            url = "https://api.hunter.io/v2/domain-search"
+            params = {
+                "domain":   domain,
+                "api_key":  HUNTER_KEY,
+                "limit":    limit,
+            }
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            return r.json()
+
+        result = hunter_domain_search("sinarlogistik.co.id")
+        for email_data in result["data"]["emails"]:
+            print(f"{email_data['value']} | {email_data.get('position')} | confidence: {email_data['confidence']}")
+
+        # Email finder: temukan email spesifik berdasarkan nama
+        def hunter_email_finder(first_name: str, last_name: str, domain: str) -> dict:
+            url = "https://api.hunter.io/v2/email-finder"
+            params = {
+                "domain":     domain,
+                "first_name": first_name,
+                "last_name":  last_name,
+                "api_key":    HUNTER_KEY,
+            }
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            return r.json()
+
+        # Email verifier
+        def hunter_verify_email(email: str) -> dict:
+            url = "https://api.hunter.io/v2/email-verifier"
+            params = {"email": email, "api_key": HUNTER_KEY}
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            return r.json()
+
+      retro_example: |
+        import requests
+        import os
+        import time
+        from retro.redis_client import check_rate_limit
+
+        HUNTER_KEY = os.getenv("HUNTER_API_KEY")
+
+        # Prioritas posisi untuk email selection
+        PRIORITY_POSITIONS = [
+            "ceo", "co-founder", "founder", "president",
+            "business development", "partnership", "bd",
+            "director", "vp", "vice president",
+            "chief", "head of",
+        ]
+
+        def _is_priority_position(position: str | None) -> int:
+            """Return priority score, higher = more important."""
+            if not position:
+                return 0
+            pos_lower = position.lower()
+            for i, keyword in enumerate(reversed(PRIORITY_POSITIONS)):
+                if keyword in pos_lower:
+                    return len(PRIORITY_POSITIONS) - i
+            return 1  # Ada email tapi posisi tidak dikenali
+
+        def discover_email_hunter(domain: str) -> dict | None:
+            """
+            Cari email terbaik untuk domain perusahaan menggunakan Hunter.io.
+            Return: {"email": "...", "name": "...", "position": "...", "confidence": 90}
+            atau None jika tidak ditemukan.
+            """
+            # Rate limit check
+            is_allowed, count = check_rate_limit("hunter_io", "monthly")
+            if not is_allowed:
+                print(f"[Hunter] Monthly limit reached ({count}/25). Fallback to other methods.")
+                return None
+
+            try:
+                url = "https://api.hunter.io/v2/domain-search"
+                params = {
+                    "domain":  domain,
+                    "api_key": HUNTER_KEY,
+                    "limit":   10,
+                    "type":    "personal",  # Hindari generic info@ dan sales@
+                }
+                r = requests.get(url, params=params, timeout=15)
+
+                if r.status_code == 429:
+                    print(f"[Hunter] Rate limited (HTTP 429)")
+                    return None
+
+                r.raise_for_status()
+                data = r.json()["data"]
+
+                emails = data.get("emails", [])
+                if not emails:
+                    print(f"[Hunter] No emails found for {domain}")
+                    return None
+
+                # Filter confidence >= 70% dan sort by priority
+                valid_emails = [
+                    e for e in emails
+                    if e.get("confidence", 0) >= 70
+                ]
+                if not valid_emails:
+                    # Ambil yang confidence tertinggi meski < 70%
+                    valid_emails = sorted(emails, key=lambda e: e.get("confidence", 0), reverse=True)[:1]
+
+                # Sort by position priority
+                valid_emails.sort(
+                    key=lambda e: _is_priority_position(e.get("position")),
+                    reverse=True,
+                )
+
+                best = valid_emails[0]
+                result = {
+                    "email":      best["value"],
+                    "first_name": best.get("first_name"),
+                    "last_name":  best.get("last_name"),
+                    "position":   best.get("position"),
+                    "confidence": best.get("confidence"),
+                    "source":     "hunter.io",
+                }
+                print(f"[Hunter] Found: {result['email']} ({result['position']}, confidence={result['confidence']}%)")
+                return result
+
+            except requests.exceptions.Timeout:
+                print(f"[Hunter] Timeout for {domain}")
+                return None
+            except requests.exceptions.HTTPError as e:
+                print(f"[Hunter] HTTP error for {domain}: {e}")
+                return None
+
+        def get_monthly_usage() -> dict:
+            """Cek sisa quota Hunter.io bulan ini."""
+            r = requests.get(
+                "https://api.hunter.io/v2/account",
+                params={"api_key": HUNTER_KEY},
+                timeout=10,
+            )
+            data = r.json()["data"]
+            return {
+                "plan":       data["plan_name"],
+                "calls_used": data["calls"]["used"],
+                "calls_left": data["calls"]["available"],
+            }
+
+      expected_output: |
+        [Hunter] Found: budi.santoso@sinarlogistik.co.id (Business Development Manager, confidence=94%)
+
+        {
+          "email":      "budi.santoso@sinarlogistik.co.id",
+          "first_name": "Budi",
+          "last_name":  "Santoso",
+          "position":   "Business Development Manager",
+          "confidence": 94,
+          "source":     "hunter.io"
+        }
+
+        Monthly usage: 18/25 used (7 remaining)
+
+    notes:
+      - "confidence >= 70 adalah threshold yang reasonable. Di bawah 70% email mungkin tidak valid"
+      - "type='personal' di domain-search filter generic emails (info@, support@, dll)"
+      - "Hunter.io paling akurat untuk perusahaan Western dan startup yang aktif di web. Kurang akurat untuk UKM Asia"
+      - "Gunakan email-validator untuk double-check email yang ditemukan Hunter (lihat email-validator section)"
+      - "25 searches/bulan gratis = cukup untuk test dan soft launch RETRO. Untuk production scale, upgrade plan"
+    pitfalls:
+      - "JANGAN kirim email ke confidence < 50%, terlalu tinggi risiko bounce dan merusak domain reputation"
+      - "JANGAN exceed monthly quota tanpa fallback, pastikan Redis rate limit counter aktif"
+      - "Hunter.io tidak selalu menemukan email untuk perusahaan yang tidak punya web presence signifikan"
+
+  - id: snov_io
+    name: "Snov.io"
+    category: "Email Discovery API"
+    description: >
+      Snov.io adalah platform email discovery dan outreach dengan free tier lebih
+      generous dari Hunter.io: 150 credits/bulan gratis (setiap request domain search
+      atau email finder menggunakan credit). Memiliki fitur lebih lengkap dari Hunter:
+      email discovery, email verification, drip campaigns, dan LinkedIn prospect finder.
+      API mudah digunakan. Kurang akurat dari Hunter untuk email Western tapi lebih
+      baik untuk coverage Asia dan startup Asia.
+    specific_function: >
+      Fallback email discovery setelah Hunter.io. 150 credits/bulan gratis memberikan
+      6x lebih banyak quota dari Hunter gratis. RETRO menggunakan Snov.io ketika
+      Hunter tidak menemukan email atau quota Hunter habis.
+    language: "Python (requests)"
+    pricing: "150 credits/bulan gratis, $39/bulan (1000 credits)"
+    last_updated: "2025"
+    url: "https://snov.io"
+    retro:
+      phase: "Phase 5 (Email Discovery) - Fallback setelah Hunter"
+      role: >
+        Secondary email discovery. Digunakan ketika Hunter tidak menemukan email
+        atau monthly quota Hunter habis. 150 credits/bulan gratis = lebih banyak
+        coverage.
+      when_to_use: >
+        Gunakan Snov.io sebagai fallback setelah Hunter.io gagal atau quota habis.
+        Juga berguna untuk coverage yang lebih baik di Asia Tenggara.
+      priority: "secondary (email discovery fallback)"
+      output_goes_to: "PostgreSQL company_profiles.contact_email"
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "requests>=2.28.0"
+        - "SNOV_CLIENT_ID dan SNOV_CLIENT_SECRET dari https://snov.io/api"
+      env_vars:
+        - name: SNOV_CLIENT_ID
+          description: "Client ID dari Snov.io API settings"
+        - name: SNOV_CLIENT_SECRET
+          description: "Client secret dari Snov.io API settings"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        SNOV_CLIENT_ID     = os.getenv("SNOV_CLIENT_ID")
+        SNOV_CLIENT_SECRET = os.getenv("SNOV_CLIENT_SECRET")
+
+        def get_snov_token() -> str:
+            """Get OAuth access token. Valid 1 jam."""
+            r = requests.post(
+                "https://api.snov.io/v1/oauth/access_token",
+                json={
+                    "grant_type":    "client_credentials",
+                    "client_id":     SNOV_CLIENT_ID,
+                    "client_secret": SNOV_CLIENT_SECRET,
+                },
+                timeout=10,
+            )
+            return r.json()["access_token"]
+
+        def snov_domain_search(domain: str, token: str, limit: int = 10) -> list[dict]:
+            r = requests.post(
+                "https://api.snov.io/v2/domain-emails-with-info",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"domain": domain, "type": "personal", "limit": limit},
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json().get("emails", [])
+
+        token = get_snov_token()
+        emails = snov_domain_search("sinarlogistik.co.id", token)
+        for e in emails:
+            print(f"{e['email']} | {e.get('position')} | {e.get('firstName')} {e.get('lastName')}")
+
+      retro_example: |
+        import requests
+        import os
+        import time
+        from retro.redis_client import check_rate_limit, cache_set, cache_get
+
+        SNOV_CLIENT_ID     = os.getenv("SNOV_CLIENT_ID")
+        SNOV_CLIENT_SECRET = os.getenv("SNOV_CLIENT_SECRET")
+        _snov_token        = None
+        _snov_token_expiry = 0
+
+        def get_snov_token() -> str:
+            global _snov_token, _snov_token_expiry
+            if _snov_token and time.time() < _snov_token_expiry:
+                return _snov_token
+
+            r = requests.post(
+                "https://api.snov.io/v1/oauth/access_token",
+                json={
+                    "grant_type":    "client_credentials",
+                    "client_id":     SNOV_CLIENT_ID,
+                    "client_secret": SNOV_CLIENT_SECRET,
+                },
+                timeout=10,
+            )
+            data = r.json()
+            _snov_token        = data["access_token"]
+            _snov_token_expiry = time.time() + data.get("expires_in", 3600) - 60
+            return _snov_token
+
+        def discover_email_snov(domain: str) -> dict | None:
+            """
+            Fallback email discovery menggunakan Snov.io.
+            Digunakan setelah Hunter.io gagal atau quota habis.
+            """
+            is_allowed, count = check_rate_limit("snov_io", "monthly")
+            if not is_allowed:
+                print(f"[Snov] Monthly limit reached ({count}/150). No more fallback.")
+                return None
+
+            try:
+                token = get_snov_token()
+                r = requests.post(
+                    "https://api.snov.io/v2/domain-emails-with-info",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "domain": domain,
+                        "type":   "personal",
+                        "limit":  10,
+                    },
+                    timeout=15,
+                )
+
+                if r.status_code == 401:
+                    # Token expired, refresh
+                    _snov_token = None
+                    token = get_snov_token()
+                    r = requests.post(
+                        "https://api.snov.io/v2/domain-emails-with-info",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"domain": domain, "type": "personal", "limit": 10},
+                        timeout=15,
+                    )
+
+                r.raise_for_status()
+                emails = r.json().get("emails", [])
+
+                if not emails:
+                    return None
+
+                # Sort by seniority
+                priority_titles = ["ceo", "founder", "director", "head", "vp", "partnership", "business development"]
+                def seniority(e):
+                    pos = (e.get("position") or "").lower()
+                    for i, title in enumerate(priority_titles):
+                        if title in pos:
+                            return len(priority_titles) - i
+                    return 0
+
+                best = sorted(emails, key=seniority, reverse=True)[0]
+                return {
+                    "email":      best["email"],
+                    "first_name": best.get("firstName"),
+                    "last_name":  best.get("lastName"),
+                    "position":   best.get("position"),
+                    "confidence": best.get("confidence"),
+                    "source":     "snov.io",
+                }
+
+            except Exception as e:
+                print(f"[Snov] Error for {domain}: {e}")
+                return None
+
+      expected_output: |
+        [Snov] Found: agus.dharma@sinarlogistik.co.id (Partnership Manager, confidence=82)
+        {
+          "email":      "agus.dharma@sinarlogistik.co.id",
+          "first_name": "Agus",
+          "last_name":  "Dharma",
+          "position":   "Partnership Manager",
+          "confidence": 82,
+          "source":     "snov.io"
+        }
+
+    notes:
+      - "Snov.io menggunakan OAuth token (1 jam validity), cache token di memory global"
+      - "150 credits gratis/bulan = 150 domain searches, jauh lebih banyak dari Hunter gratis (25)"
+      - "Snov.io juga memiliki fitur LinkedIn prospecting, berguna untuk supplemental OSINT"
+    pitfalls:
+      - "Token Snov.io expire setelah 1 jam, refresh token jika dapat 401 response"
+      - "JANGAN assume semua email dari Snov.io valid, tetap validate dengan email-validator"
+
+  - id: theharvester
+    name: "theHarvester"
+    category: "OSINT Email Discovery"
+    description: >
+      theHarvester adalah OSINT tool untuk mengumpulkan email addresses, subdomains,
+      IPs, dan URLs dari domain target menggunakan berbagai data sources: Google,
+      Bing, DuckDuckGo, LinkedIn, Hunter, Shodan, dan banyak lagi. Open-source
+      dan gratis. Tidak memerlukan API key untuk basic search (Google, Bing).
+      Untuk LinkedIn dan Hunter integration memerlukan API key. Sangat berguna
+      ketika Hunter dan Snov tidak menemukan email karena scraping langsung dari
+      search engines.
+    specific_function: >
+      OSINT email harvesting gratis sebagai last-resort fallback. Scraping dari
+      Google, Bing, dan DuckDuckGo untuk temukan email yang terdaftar di domain
+      target. Tidak ada monthly limit karena menggunakan public search engines.
+    language: "Python (CLI tool, bisa dipanggil via subprocess)"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://github.com/laramies/theHarvester"
+    retro:
+      phase: "Phase 5 (Email Discovery) - Last-resort fallback"
+      role: >
+        Gratis, no API key, fallback terakhir ketika Hunter dan Snov tidak menemukan
+        email. Cocok untuk perusahaan yang informasi emailnya tersebar di web publik
+        (press releases, konferensi, direktori bisnis).
+      when_to_use: >
+        Gunakan theHarvester sebagai fallback setelah Hunter dan Snov gagal,
+        dan hanya untuk domain target yang memiliki web presence signifikan.
+        Hindari untuk perusahaan kecil tanpa website yang baik.
+      priority: "fallback (free OSINT)"
+      output_goes_to: "Email validation queue"
+    setup:
+      install: |
+        pip install theHarvester
+        # Atau install dari source
+        git clone https://github.com/laramies/theHarvester.git
+        cd theHarvester && pip install -r requirements.txt
+      requirements:
+        - "theHarvester>=4.4.0"
+        - "Python 3.9+"
+      env_vars:
+        - name: HARVESTER_API_KEYS
+          description: "Optional: API keys untuk premium sources (Hunter, Shodan)"
+    usage:
+      basic_example: |
+        # CLI usage
+        # theHarvester -d example.com -b google,bing,duckduckgo -l 200
+
+        # Python subprocess call
+        import subprocess
+        import json
+
+        def run_harvester(domain: str, sources: str = "google,bing,duckduckgo") -> dict:
+            result = subprocess.run(
+                [
+                    "theHarvester",
+                    "-d", domain,
+                    "-b", sources,
+                    "-l", "200",
+                    "-f", "/tmp/harvester_output",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            # Parse JSON output
+            try:
+                with open("/tmp/harvester_output.json") as f:
+                    return json.load(f)
+            except FileNotFoundError:
+                return {"emails": [], "hosts": []}
+
+        result = run_harvester("sinarlogistik.co.id")
+        print("Emails found:", result.get("emails", []))
+
+      retro_example: |
+        import subprocess
+        import json
+        import os
+        import re
+        import tempfile
+        from pathlib import Path
+
+        def harvest_emails_osint(domain: str, timeout_seconds: int = 60) -> list[str]:
+            """
+            Scrape email dari public sources menggunakan theHarvester.
+            Return: list of email strings yang ditemukan.
+            """
+            outfile = tempfile.mktemp(prefix="harvester_")
+            try:
+                result = subprocess.run(
+                    [
+                        "theHarvester",
+                        "-d", domain,
+                        "-b", "bing,duckduckgo,google",  # Sources gratis, tidak butuh API key
+                        "-l", "100",
+                        "-f", outfile,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+
+                # Parse JSON output file
+                json_path = f"{outfile}.json"
+                if os.path.exists(json_path):
+                    with open(json_path) as f:
+                        data = json.load(f)
+                    emails = data.get("emails", [])
+                else:
+                    # Fallback: parse stdout dengan regex
+                    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+                    emails = re.findall(email_pattern, result.stdout)
+
+                # Filter untuk domain yang relevan saja
+                domain_emails = [e for e in emails if domain in e.lower()]
+                print(f"[Harvester] Found {len(domain_emails)} emails for {domain}")
+                return list(set(domain_emails))  # Dedup
+
+            except subprocess.TimeoutExpired:
+                print(f"[Harvester] Timeout after {timeout_seconds}s for {domain}")
+                return []
+            except FileNotFoundError:
+                print("[Harvester] theHarvester not installed. pip install theHarvester")
+                return []
+            finally:
+                # Cleanup temp files
+                for ext in ["", ".json", ".xml"]:
+                    p = Path(f"{outfile}{ext}")
+                    if p.exists():
+                        p.unlink()
+
+        def discover_email_pipeline(domain: str) -> dict | None:
+            """
+            Full email discovery pipeline dengan fallback:
+            1. Hunter.io (most accurate, limited quota)
+            2. Snov.io (good coverage, more quota)
+            3. theHarvester (free, OSINT)
+            4. Website scraping (contact page)
+            """
+            from retro.email_discovery.hunter import discover_email_hunter
+            from retro.email_discovery.snov import discover_email_snov
+
+            # Step 1: Hunter
+            result = discover_email_hunter(domain)
+            if result:
+                return result
+
+            # Step 2: Snov
+            result = discover_email_snov(domain)
+            if result:
+                return result
+
+            # Step 3: theHarvester
+            emails = harvest_emails_osint(domain, timeout_seconds=60)
+            if emails:
+                return {
+                    "email":    emails[0],  # Ambil yang pertama
+                    "position": None,
+                    "source":   "theharvester",
+                }
+
+            # Step 4: Website scraping (lihat bagian website scraping di 02_web_crawling.yaml)
+            print(f"[EmailDiscovery] No email found for {domain} via any method")
+            return None
+
+      expected_output: |
+        [Harvester] Searching: bing,duckduckgo,google for sinarlogistik.co.id
+        [Harvester] Found 3 emails for sinarlogistik.co.id:
+          - info@sinarlogistik.co.id
+          - budi.santoso@sinarlogistik.co.id
+          - press@sinarlogistik.co.id
+
+    notes:
+      - "theHarvester scraping search engines bisa slow (60-120 detik), set timeout yang cukup"
+      - "Google sering block scraping, gunakan Bing dan DuckDuckGo sebagai primary sources"
+      - "Filter email dengan domain yang match untuk hindari false positives dari pages yang mention email lain"
+      - "theHarvester juga menemukan subdomains dan hosts, berguna untuk OSINT tambahan"
+    pitfalls:
+      - "Google blocking: theHarvester dengan source 'google' sering dapat CAPTCHA. Fallback ke bing/duckduckgo"
+      - "JANGAN run theHarvester dengan timeout terlalu singkat (< 30 detik), butuh waktu untuk search"
+      - "Email yang ditemukan OSINT perlu divalidasi dengan email-validator sebelum digunakan"
+
+  - id: email_validator
+    name: "email-validator"
+    category: "Email Validation"
+    description: >
+      email-validator adalah library Python untuk validasi email address secara
+      comprehensive: syntax check (RFC 5322), MX record lookup (apakah domain punya
+      mail server), SMTP check (apakah mailbox exist di server), dan disposable email
+      detection. Sangat penting di RETRO untuk memastikan email yang ditemukan
+      valid sebelum dimasukkan ke database dan sebelum dikirim proposal. Bounce rate
+      tinggi merusak domain reputation email sender.
+    specific_function: >
+      Validasi semua email yang ditemukan Hunter, Snov, atau theHarvester sebelum
+      disimpan ke database dan sebelum proposal dikirim. Memastikan tidak ada bounce
+      rate tinggi yang merusak email domain reputation RETRO.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://github.com/JoshData/python-email-validator"
+    retro:
+      phase: "Phase 5 (Email Validation before Sending)"
+      role: >
+        Validation gate sebelum email masuk ke database dan sebelum proposal dikirim.
+        Mencegah bounce rate tinggi yang bisa menyebabkan email domain RETRO di-blacklist
+        oleh email providers (Gmail, Outlook, dll).
+      when_to_use: >
+        Validasi SETIAP email sebelum disimpan ke PostgreSQL company_profiles.contact_email.
+        Minimal syntax + MX record check. SMTP check bisa dilakukan sebelum actual send.
+      priority: "primary (email quality gate)"
+      output_goes_to: "PostgreSQL (validated emails only)"
+    setup:
+      install: "pip install email-validator dnspython"
+      requirements:
+        - "email-validator>=2.0.0"
+        - "dnspython>=2.3.0 (untuk MX record lookup)"
+      env_vars: []
+    usage:
+      basic_example: |
+        from email_validator import validate_email, EmailNotValidError
+
+        def check_email(email: str) -> dict:
+            try:
+                # check_deliverability=True melakukan MX record lookup
+                info = validate_email(email, check_deliverability=True)
+                return {
+                    "valid":      True,
+                    "normalized": info.normalized,  # Normalized form, e.g., lowercase domain
+                    "domain":     info.domain,
+                }
+            except EmailNotValidError as e:
+                return {"valid": False, "reason": str(e)}
+
+        print(check_email("budi.santoso@sinarlogistik.co.id"))
+        # {"valid": True, "normalized": "budi.santoso@sinarlogistik.co.id", "domain": "sinarlogistik.co.id"}
+
+        print(check_email("not-an-email"))
+        # {"valid": False, "reason": "The email address is not valid. ..."}
+
+        print(check_email("user@nonexistentdomain12345.com"))
+        # {"valid": False, "reason": "The domain name nonexistentdomain12345.com does not exist."}
+
+      retro_example: |
+        from email_validator import validate_email, EmailNotValidError
+        import re
+
+        BUSINESS_EMAIL_BLOCKLIST = [
+            "info@", "contact@", "support@", "hello@", "admin@",
+            "sales@", "marketing@", "noreply@", "no-reply@",
+            "webmaster@", "postmaster@", "office@", "reception@",
+        ]
+
+        def is_generic_email(email: str) -> bool:
+            """Cek apakah email adalah generic/role-based yang tidak efektif untuk proposal."""
+            email_lower = email.lower()
+            for prefix in BUSINESS_EMAIL_BLOCKLIST:
+                if email_lower.startswith(prefix):
+                    return True
+            return False
+
+        def validate_and_score_email(email: str) -> dict:
+            """
+            Validate email dan berikan score.
+            Return: {"valid": bool, "score": 0-100, "normalized": str, "issues": list}
+            """
+            result = {
+                "valid":      False,
+                "score":      0,
+                "normalized": email,
+                "issues":     [],
+            }
+
+            # Syntax + MX check
+            try:
+                info = validate_email(email, check_deliverability=True)
+                result["valid"]      = True
+                result["normalized"] = info.normalized
+                result["score"]     += 60  # Base score untuk valid email
+
+                # Bonus: personal email (firstname.lastname pattern)
+                local_part = info.local
+                if re.match(r'^[a-z]+\.[a-z]+$', local_part.lower()):
+                    result["score"] += 20  # Likely personal email
+                elif re.match(r'^[a-z]+[0-9]+$', local_part.lower()):
+                    result["score"] += 10  # Username pattern
+
+                # Bonus: company domain match
+                result["score"] += 10
+
+                # Penalty: generic email
+                if is_generic_email(email):
+                    result["score"] -= 30
+                    result["issues"].append("Generic/role-based email, lower response rate")
+
+                # Penalty: very short local part (likely shared)
+                if len(local_part) <= 3:
+                    result["score"] -= 15
+                    result["issues"].append("Very short local part, may be shared mailbox")
+
+            except EmailNotValidError as e:
+                result["issues"].append(str(e))
+
+            return result
+
+        def filter_and_rank_emails(emails: list[str]) -> list[dict]:
+            """
+            Validate dan rank semua email candidates.
+            Return sorted by score descending.
+            """
+            results = []
+            for email in emails:
+                v = validate_and_score_email(email)
+                v["email"] = email
+                if v["valid"] and v["score"] > 30:
+                    results.append(v)
+            return sorted(results, key=lambda x: x["score"], reverse=True)
+
+      expected_output: |
+        validate_and_score_email("budi.santoso@sinarlogistik.co.id"):
+        {"valid": True, "score": 90, "normalized": "budi.santoso@sinarlogistik.co.id", "issues": []}
+
+        validate_and_score_email("info@sinarlogistik.co.id"):
+        {"valid": True, "score": 40, "issues": ["Generic/role-based email, lower response rate"]}
+
+        validate_and_score_email("user@fakeDomain99999.xyz"):
+        {"valid": False, "score": 0, "issues": ["The domain name fakeDomain99999.xyz does not exist."]}
+
+    notes:
+      - "check_deliverability=True melakukan DNS MX record lookup, butuh internet connection dan sedikit lambat (~1-3 detik)"
+      - "email-validator normalize email (lowercase domain, handle unicode) via info.normalized"
+      - "MX record check memverifikasi domain punya mail server tapi tidak verifikasi mailbox exist. Untuk SMTP check butuh library lain"
+      - "JANGAN kirim ke generic emails (info@, support@) karena tidak personal, lebih sering diabaikan atau auto-reply"
+    pitfalls:
+      - "MX record lookup bisa timeout jika DNS lambat, tambahkan timeout handler"
+      - "check_deliverability=True bisa trigger false negative untuk domain yang punya MX record non-standard"
+      - "JANGAN validate email yang sama berulang-ulang dalam satu run, cache hasil validasi ke Redis"
+
+  - id: holehe
+    name: "Holehe"
+    category: "Email OSINT"
+    description: >
+      Holehe adalah tool Python untuk mengecek apakah email address terdaftar di
+      berbagai online services (Instagram, Twitter/X, GitHub, LinkedIn, dll)
+      tanpa mengirim request langsung ke email tersebut. Berguna untuk verifikasi
+      email yang ditemukan benar-benar aktif dan digunakan oleh orang sungguhan.
+      Juga berguna untuk memahami digital footprint orang yang akan dihubungi RETRO.
+    specific_function: >
+      Supplemental email verification untuk RETRO. Setelah email ditemukan Hunter/Snov,
+      Holehe bisa cek apakah email tersebut terdaftar di platform publik seperti
+      LinkedIn atau GitHub, mengkonfirmasi email tersebut milik orang nyata yang aktif.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2024"
+    url: "https://github.com/megadose/holehe"
+    retro:
+      phase: "Phase 5 (Email Verification - supplemental)"
+      role: >
+        Supplemental verification: konfirmasi bahwa email yang ditemukan benar-benar
+        aktif dengan mengecek registrasi di public platforms. Hasilnya disimpan sebagai
+        metadata di profile (email_active: true/false).
+      when_to_use: >
+        Gunakan Holehe untuk verify email dengan confidence rendah (50-70%) dari Hunter.
+        Tidak perlu untuk email dengan confidence >= 90%.
+      priority: "optional (verification enrichment)"
+      output_goes_to: "email verification metadata"
+    setup:
+      install: "pip install holehe"
+      requirements:
+        - "holehe>=1.4.0"
+        - "Python 3.7+"
+      env_vars: []
+    usage:
+      basic_example: |
+        import asyncio
+        import holehe.modules as modules
+
+        async def check_email_holehe(email: str) -> list[dict]:
+            """Check di mana email terdaftar."""
+            results = []
+            client  = modules.get_all_modules()
+
+            async def check_one(module, email):
+                try:
+                    result = await module(email, None, None)
+                    if result and result.get("exists"):
+                        return {"service": result["name"], "exists": True}
+                except Exception:
+                    pass
+                return None
+
+            tasks = [check_one(m, email) for m in client]
+            for coro in asyncio.as_completed(tasks):
+                r = await coro
+                if r:
+                    results.append(r)
+            return results
+
+        results = asyncio.run(check_email_holehe("budi@sinarlogistik.co.id"))
+        print(results)
+
+      retro_example: |
+        import asyncio
+        import subprocess
+
+        def verify_email_active(email: str, timeout: int = 30) -> bool:
+            """
+            Quick check apakah email terdaftar di setidaknya satu public service.
+            Jika ya, email kemungkinan besar aktif dan digunakan orang nyata.
+            """
+            try:
+                result = subprocess.run(
+                    ["holehe", "--only-used", email],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                output = result.stdout.lower()
+                # Jika ada line yang mengandung "+" (registered), email aktif
+                active = "+" in output and "email used" in output
+                print(f"[Holehe] {email}: {'ACTIVE' if active else 'NOT FOUND in public services'}")
+                return active
+            except subprocess.TimeoutExpired:
+                return True  # Assume active jika timeout (better safe than sorry)
+            except FileNotFoundError:
+                return True  # Holehe tidak terinstall, skip check
+
+      expected_output: |
+        [Holehe] budi.santoso@sinarlogistik.co.id:
+          + LinkedIn (email used)
+          + GitHub (email used)
+          ACTIVE -> email confirmed as real person's email
+
+    notes:
+      - "Holehe --only-used flag hanya tampilkan services dimana email terdaftar (tidak tampilkan yang tidak ditemukan)"
+      - "Holehe tidak mengirim email ke target, hanya check via forgot-password flow di setiap service"
+      - "Hasil Holehe bisa false negative (tidak ditemukan di platform tapi email valid), jangan jadikan satu-satunya validator"
+    pitfalls:
+      - "Holehe bisa slow (check 200+ services), gunakan timeout yang cukup (30-60 detik)"
+      - "Beberapa services memblokir Holehe setelah banyak request, bisa dapat rate limit"
+      - "JANGAN gunakan Holehe untuk email perusahaan generik (info@), fokus pada personal email"
+
+  - id: mailcheck_ai
+    name: "mailcheck.ai"
+    category: "Disposable Email Detection"
+    description: >
+      mailcheck.ai adalah API untuk mendeteksi apakah email address menggunakan
+      disposable/temporary domain (seperti 10minutemail.com, guerrillamail.com, dll).
+      Sangat berguna untuk RETRO jika menerima email leads dari form submission:
+      pastikan email bukan disposable sebelum masuk ke CRM dan pipeline.
+    specific_function: >
+      Deteksi disposable email. Berguna ketika RETRO memiliki landing page atau
+      form submission dan ingin pastikan leads yang masuk bukan dari disposable emails.
+    language: "Python (requests)"
+    pricing: "Free (100 req/hari gratis), $9/bulan (1000 req/hari)"
+    last_updated: "2025"
+    url: "https://www.mailcheck.ai"
+    retro:
+      phase: "Phase 5 (Email Quality Filter)"
+      role: "Filter disposable email dari leads yang masuk via form submission"
+      when_to_use: >
+        Gunakan jika RETRO memiliki form submission atau inbound leads. Untuk email
+        yang di-discover via Hunter/Snov (business domain), disposable check kurang
+        relevan karena business domains tidak pakai disposable.
+      priority: "optional"
+      output_goes_to: "Lead validation filter"
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "requests"
+        - "MAILCHECK_API_KEY (gratis dari mailcheck.ai)"
+      env_vars:
+        - name: MAILCHECK_API_KEY
+          description: "API key dari https://www.mailcheck.ai (gratis 100 req/hari)"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        def is_disposable_email(email: str) -> bool:
+            api_key = os.getenv("MAILCHECK_API_KEY")
+            r = requests.get(
+                "https://api.mailcheck.ai/email",
+                params={"email": email, "apikey": api_key},
+                timeout=5,
+            )
+            data = r.json()
+            return data.get("disposable", False) or data.get("role_account", False)
+
+        print(is_disposable_email("user@10minutemail.com"))  # True
+        print(is_disposable_email("budi@sinarlogistik.co.id"))  # False
+
+      retro_example: |
+        import requests
+        import os
+
+        MAILCHECK_KEY = os.getenv("MAILCHECK_API_KEY")
+
+        def validate_inbound_email(email: str) -> dict:
+            """Validate email dari form submission RETRO."""
+            r = requests.get(
+                "https://api.mailcheck.ai/email",
+                params={"email": email, "apikey": MAILCHECK_KEY},
+                timeout=5,
+            )
+            data = r.json()
+            return {
+                "email":       email,
+                "valid":       not data.get("disposable") and not data.get("role_account"),
+                "disposable":  data.get("disposable", False),
+                "role_account": data.get("role_account", False),
+                "mx_found":    data.get("mx", False),
+            }
+
+      expected_output: |
+        validate_inbound_email("user@10minutemail.com"):
+        {"valid": False, "disposable": True, "mx_found": True}
+
+        validate_inbound_email("budi@company.co.id"):
+        {"valid": True, "disposable": False, "mx_found": True}
+
+    notes:
+      - "role_account=True mendeteksi generic emails (info@, admin@, support@) yang jarang dimonitor personal"
+      - "mx_found=True memverifikasi domain punya mail server"
+    pitfalls:
+      - "100 req/hari gratis habis cepat jika ada banyak form submissions. Monitor usage"
+
+  - id: py3_validate_email
+    name: "py3-validate-email"
+    category: "Advanced Email Validation"
+    description: >
+      py3-validate-email adalah library Python untuk email validation yang lebih
+      agresif dari email-validator: mendukung SMTP mailbox existence check (koneksi
+      langsung ke mail server target untuk verify mailbox exists). Lebih akurat
+      tapi lebih lambat dan bisa di-block oleh mail servers yang mendeteksi probe.
+      Gunakan dengan hati-hati: SMTP check bisa dianggap sebagai spam probe oleh
+      beberapa mail servers.
+    specific_function: >
+      SMTP-level email validation untuk highest-confidence check sebelum send proposal.
+      Lebih akurat dari DNS MX check saja. Digunakan hanya untuk highest-value targets.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2024"
+    url: "https://github.com/disposable-email-domains/python-email-validator"
+    retro:
+      phase: "Phase 5 (Pre-send Email Validation)"
+      role: >
+        High-confidence email validation sebelum mengirim proposal ke highest-priority
+        candidates. Digunakan hanya untuk Top 3-5 candidates per expo untuk minimize
+        bounce rate pada proposal terpenting.
+      when_to_use: >
+        Gunakan HANYA untuk top priority candidates (collaboration_potential=high).
+        Jangan gunakan untuk semua email karena lambat dan bisa di-block.
+      priority: "optional (high-value target validation)"
+      output_goes_to: "Confirmed send queue"
+    setup:
+      install: "pip install py3-validate-email"
+      requirements:
+        - "py3-validate-email>=1.0.3"
+      env_vars: []
+    usage:
+      basic_example: |
+        from validate_email import validate_email
+
+        # Check 1: Syntax only (fastest)
+        is_valid = validate_email("budi@sinarlogistik.co.id", verify=False)
+
+        # Check 2: Syntax + MX record
+        is_valid = validate_email("budi@sinarlogistik.co.id", check_mx=True, verify=False)
+
+        # Check 3: Syntax + MX + SMTP probe (paling akurat, paling lambat)
+        is_valid = validate_email("budi@sinarlogistik.co.id", check_mx=True, verify=True)
+        print(f"Email valid: {is_valid}")
+
+      retro_example: |
+        from validate_email import validate_email
+        import time
+
+        def smtp_verify_email(email: str, timeout_seconds: int = 10) -> bool:
+            """
+            SMTP-level email verification.
+            HANYA gunakan untuk top priority targets.
+            """
+            try:
+                result = validate_email(
+                    email,
+                    check_mx=True,
+                    verify=True,
+                    smtp_timeout=timeout_seconds,
+                )
+                print(f"[SMTP Verify] {email}: {'VALID' if result else 'INVALID/NOT FOUND'}")
+                return bool(result)
+            except Exception as e:
+                print(f"[SMTP Verify] Error for {email}: {e}")
+                return True  # Assume valid jika tidak bisa check
+
+      expected_output: |
+        [SMTP Verify] budi@sinarlogistik.co.id: VALID
+        [SMTP Verify] nonexistent@sinarlogistik.co.id: INVALID/NOT FOUND
+
+    notes:
+      - "SMTP verify bisa lambat (5-15 detik per email) karena koneksi TCP ke mail server"
+      - "Beberapa mail servers (Gmail, Outlook) menolak SMTP probe dan selalu return VALID untuk anti-harvesting"
+      - "Jangan gunakan SMTP verify untuk semua emails, hanya Top 5 highest-priority targets"
+    pitfalls:
+      - "Gmail dan Outlook selalu return True untuk SMTP verify, tidak reliable untuk hosted email"
+      - "SMTP verify bisa bikin IP RETRO masuk blocklist jika terlalu sering melakukan probe"

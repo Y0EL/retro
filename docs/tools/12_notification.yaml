@@ -1,0 +1,1041 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Notification & Alerting (Human-in-the-Loop)
+# File: 12_notification.yaml
+# Purpose: Tools untuk mengirim notifikasi ke director/operator RETRO.
+#          RETRO adalah autonomous pipeline tapi butuh human oversight:
+#          - Pipeline selesai: "47 perusahaan di-profile, 3 proposal siap review"
+#          - Proposal siap approve sebelum dikirim (human-in-the-loop gate)
+#          - Error alert: "Context Agent gagal untuk 12 perusahaan"
+#          - Daily summary: ringkasan aktivitas pipeline hari ini
+#          - Proposal reply: "PT Sinar Logistik membalas proposal kita!"
+#
+# RETRO NOTIFICATION FLOW:
+#   Pipeline event -> Notification Agent -> Telegram Bot / WhatsApp / Ntfy
+#   Director/Operator menerima notifikasi dan bisa approve/reject proposal
+#   SEBELUM email dikirim ke potential partners
+#
+# RECOMMENDED STACK (RETRO):
+#   Primary:     python-telegram-bot (gratis, reliabel, mudah setup)
+#   Alternative: Ntfy (self-hosted, push notification ke semua device)
+#   Business:    Twilio WhatsApp API (WhatsApp Business, paid)
+#   Fallback:    Email via Resend (jika tidak ada Telegram/WhatsApp)
+
+tools:
+
+  - id: python_telegram_bot
+    name: "python-telegram-bot"
+    category: "Telegram Bot Notification"
+    description: >
+      python-telegram-bot adalah library Python resmi untuk Telegram Bot API.
+      Memungkinkan RETRO mengirim notifikasi real-time ke Telegram channel atau
+      private chat director. Telegram gratis, reliabel, dan mendukung: text messages,
+      Markdown formatting, inline keyboards (tombol approve/reject), file attachments
+      (proposal PDF), dan webhooks. Setup sangat mudah: buat bot via @BotFather,
+      dapatkan TOKEN, kirim pesan. Bot bisa di-setup sebagai notification-only
+      (one-way) atau interactive (director bisa approve proposal via tombol).
+    specific_function: >
+      Primary notification channel RETRO. Pipeline events dikirim ke Telegram:
+      crawl complete (N companies found), profiling complete, proposal ready for
+      review (dengan tombol Approve/Reject), proposal sent, dan error alerts.
+      Director bisa approve proposal langsung dari Telegram tanpa buka dashboard.
+    language: "Python"
+    pricing: "Gratis (Telegram API gratis, tidak ada biaya)"
+    last_updated: "2025"
+    url: "https://python-telegram-bot.org"
+    retro:
+      phase: "Semua Phase (Notification & Human-in-the-Loop)"
+      role: >
+        Real-time notification untuk director RETRO. Setiap milestone pipeline
+        dikirim ke Telegram: phase completion, error alerts, dan proposal approval
+        gate. Director bisa approve atau reject proposal dari Telegram sebelum
+        email dikirim ke potential partners.
+      when_to_use: >
+        Setup Telegram bot dari awal development. Semua pipeline events yang butuh
+        human awareness atau human action dikirim ke Telegram. Lebih reliabel dan
+        lebih real-time dari email notifications.
+      priority: "primary (notification channel)"
+      output_goes_to: "Director Telegram chat / RETRO channel"
+    setup:
+      install: "pip install 'python-telegram-bot>=20.0'"
+      bot_setup: |
+        1. Buka Telegram, cari @BotFather
+        2. Kirim /newbot
+        3. Ikuti instruksi, dapatkan BOT_TOKEN
+        4. Dapatkan CHAT_ID:
+           a. Kirim pesan ke bot kamu
+           b. Buka: https://api.telegram.org/bot{BOT_TOKEN}/getUpdates
+           c. Cari "chat":{"id": XXXXXXXX}
+      requirements:
+        - "python-telegram-bot>=20.0"
+        - "Telegram account dan bot yang sudah dibuat via @BotFather"
+      env_vars:
+        - name: TELEGRAM_BOT_TOKEN
+          description: "Token dari @BotFather, format: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+        - name: TELEGRAM_CHAT_ID
+          description: "Chat ID direktur atau channel RETRO (bisa negatif untuk group)"
+    usage:
+      basic_example: |
+        from telegram import Bot
+        from telegram.constants import ParseMode
+        import asyncio
+        import os
+
+        BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+        CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+
+        async def send_notification(message: str):
+            bot = Bot(token=BOT_TOKEN)
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+
+        # Sync wrapper untuk non-async code
+        def notify(message: str):
+            asyncio.run(send_notification(message))
+
+        notify("*RETRO Pipeline* selesai!\n42 perusahaan di-profile ✅")
+
+      retro_example: |
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+        from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+        from telegram.constants import ParseMode
+        from telegram.error import TelegramError
+        import asyncio
+        import os
+        import io
+
+        BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+        CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
+
+        _bot = None
+
+        def get_bot() -> Bot:
+            global _bot
+            if _bot is None:
+                _bot = Bot(token=BOT_TOKEN)
+            return _bot
+
+        def escape_md(text: str) -> str:
+            """Escape special chars untuk MarkdownV2."""
+            special = r'_*[]()~`>#+-=|{}.!'
+            return ''.join(f'\\{c}' if c in special else c for c in str(text))
+
+        async def _send_text_async(message: str, parse_mode: str = ParseMode.MARKDOWN_V2):
+            try:
+                await get_bot().send_message(
+                    chat_id=CHAT_ID,
+                    text=message,
+                    parse_mode=parse_mode,
+                )
+            except TelegramError as e:
+                print(f"[Telegram] Send error: {e}")
+
+        def notify_pipeline_complete(expo: str, stats: dict):
+            """Notifikasi setelah crawl dan profiling selesai."""
+            msg = (
+                f"*RETRO Pipeline Complete* 🤖\n"
+                f"Expo: {escape_md(expo)}\n"
+                f"Crawled: {stats['crawled']} companies\n"
+                f"Profiled: {stats['profiled']} companies\n"
+                f"High potential: {stats['high_potential']}\n"
+                f"Proposals ready: {stats['proposals_ready']}\n"
+                f"Duration: {escape_md(stats['duration'])}"
+            )
+            asyncio.run(_send_text_async(msg))
+
+        def notify_error(phase: str, error: str, domain: str = ""):
+            """Error alert ke director."""
+            msg = (
+                f"⚠️ *RETRO Error* \\- {escape_md(phase)}\n"
+                f"Domain: {escape_md(domain)}\n"
+                f"Error: {escape_md(error[:300])}"
+            )
+            asyncio.run(_send_text_async(msg))
+
+        async def _send_proposal_approval_request(
+            proposal_id:  int,
+            company_name: str,
+            domain:       str,
+            expo:         str,
+            summary:      str,
+            pdf_bytes:    bytes,
+        ):
+            """
+            Kirim request approval proposal ke director dengan tombol Approve/Reject.
+            Director bisa tekan tombol langsung dari Telegram.
+            """
+            caption = (
+                f"📄 *Proposal Ready for Approval*\n"
+                f"Company: {escape_md(company_name)}\n"
+                f"Domain: {escape_md(domain)}\n"
+                f"Expo: {escape_md(expo)}\n\n"
+                f"*Summary:*\n{escape_md(summary[:400])}"
+            )
+
+            # Inline keyboard: Approve atau Reject
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve & Send", callback_data=f"approve:{proposal_id}"),
+                    InlineKeyboardButton("❌ Reject",         callback_data=f"reject:{proposal_id}"),
+                ]
+            ])
+
+            # Kirim PDF dengan caption dan tombol
+            await get_bot().send_document(
+                chat_id=CHAT_ID,
+                document=io.BytesIO(pdf_bytes),
+                filename=f"RETRO_Proposal_{domain}.pdf",
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+
+        def send_proposal_for_approval(
+            proposal_id: int,
+            company:     dict,
+            expo:        str,
+            summary:     str,
+            pdf_bytes:   bytes,
+        ):
+            asyncio.run(_send_proposal_approval_request(
+                proposal_id=proposal_id,
+                company_name=company["company_name"],
+                domain=company["domain"],
+                expo=expo,
+                summary=summary,
+                pdf_bytes=pdf_bytes,
+            ))
+
+        # ---- Callback handler untuk tombol Approve/Reject ----
+        async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Handler ketika director tekan tombol Approve atau Reject."""
+            query = update.callback_query
+            await query.answer()
+
+            action, proposal_id = query.data.split(":")
+            proposal_id = int(proposal_id)
+
+            if action == "approve":
+                # Update DB dan trigger email sending
+                from retro.db import approve_proposal
+                from retro.email_agent import send_approved_proposal
+                approve_proposal(proposal_id)
+                send_approved_proposal(proposal_id)
+                await query.edit_message_caption(
+                    caption=f"✅ *Proposal #{proposal_id} Approved*\nEmail akan dikirim segera\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            elif action == "reject":
+                from retro.db import reject_proposal
+                reject_proposal(proposal_id)
+                await query.edit_message_caption(
+                    caption=f"❌ *Proposal #{proposal_id} Rejected*\nProposal tidak akan dikirim\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+
+        def start_approval_bot():
+            """
+            Start bot untuk listen approval callbacks.
+            Jalankan di thread terpisah atau sebagai separate process.
+            """
+            app = Application.builder().token(BOT_TOKEN).build()
+            app.add_handler(CallbackQueryHandler(button_callback))
+            app.run_polling()
+
+      expected_output: |
+        # Telegram message yang diterima director:
+        # ─────────────────────────────────────────
+        # 🤖 RETRO Pipeline Complete
+        # Expo: LogiSEA 2025
+        # Crawled: 342 companies
+        # Profiled: 329 companies
+        # High potential: 47
+        # Proposals ready: 3
+        # Duration: 2h 47m
+        # ─────────────────────────────────────────
+        # 📄 Proposal Ready for Approval
+        # Company: PT Sinar Logistik Nusantara
+        # Domain: sinarlogistik.co.id
+        # Expo: LogiSEA 2025
+        # Summary: Route optimization SaaS company...
+        # [✅ Approve & Send] [❌ Reject]
+        # ─────────────────────────────────────────
+        # (Director tekan "Approve & Send")
+        # ✅ Proposal #42 Approved
+        # Email akan dikirim segera.
+
+    notes:
+      - "InlineKeyboardMarkup callback_data harus unique per proposal untuk identify mana yang di-approve"
+      - "escape_md() wajib untuk semua text dalam MarkdownV2, karakter seperti . - ( ) harus di-escape"
+      - "send_document() mengirim file sebagai document attachment, bisa PDF maksimal 50MB"
+      - "run_polling() untuk development, gunakan set_webhook() untuk production (lebih efisien)"
+      - "CHAT_ID untuk group chat adalah negative integer, untuk private chat adalah positive integer"
+      - "Telegram bot bisa di-add ke group RETRO team sehingga semua team member lihat notifikasi"
+    pitfalls:
+      - "MarkdownV2 strict: semua special chars HARUS di-escape atau kirim akan gagal"
+      - "JANGAN simpan sensitive data (API keys, proposal content) dalam callback_data (max 64 bytes, tidak encrypted)"
+      - "run_polling() blocking, jalankan di thread terpisah jika tidak ingin block main pipeline"
+      - "Bot perlu di-start (/start) oleh user sebelum bisa menerima message dari bot"
+
+  - id: ntfy
+    name: "Ntfy (Push Notification Self-Hosted)"
+    category: "Push Notification (Self-Hosted)"
+    description: >
+      Ntfy adalah push notification service sederhana yang bisa self-hosted atau
+      menggunakan ntfy.sh (gratis, hosted). Mendukung push notifications ke Android
+      (app ntfy.sh), iOS (via ntfy app), dan web browser (via PWA). Sangat simple:
+      cukup HTTP POST ke URL topic untuk kirim notifikasi. Tidak perlu setup bot,
+      tidak perlu API key untuk basic usage. Cocok untuk internal team RETRO yang
+      tidak ingin bergantung pada Telegram atau WhatsApp.
+    specific_function: >
+      Simple push notification untuk RETRO monitoring. Director install app ntfy
+      di HP, subscribe ke topic RETRO, dan otomatis terima push notification setiap
+      pipeline event. Tidak perlu Telegram account atau setup bot.
+    language: "Python (requests)"
+    pricing: "Gratis (ntfy.sh public, dengan storage 24 jam). Self-hosted: free"
+    last_updated: "2025"
+    url: "https://ntfy.sh"
+    retro:
+      phase: "Semua Phase (Lightweight Notification)"
+      role: >
+        Lightweight notification alternative untuk director yang tidak pakai Telegram.
+        Zero setup dari sisi developer, director hanya install app ntfy dan subscribe
+        ke topic RETRO pipeline.
+      when_to_use: >
+        Gunakan Ntfy sebagai supplement atau alternative Telegram jika director
+        prefer push notification simple tanpa chat interface. Ntfy juga berguna
+        untuk critical alerts (error, pipeline down) yang butuh push notification
+        bahkan di luar jam kerja.
+      priority: "secondary (lightweight alternative)"
+      output_goes_to: "Director HP (push notification)"
+    setup:
+      install: "pip install requests  # Tidak perlu library khusus"
+      app_setup: |
+        1. Director install app ntfy di HP (Android/iOS)
+        2. Subscribe ke topic: retro-pipeline-<unique_id>
+        3. Python code kirim POST ke https://ntfy.sh/retro-pipeline-<unique_id>
+        # Atau self-hosted: docker run -p 80:80 binwiederhier/ntfy serve
+      requirements:
+        - "requests"
+        - "Ntfy app di device director (Android/iOS)"
+      env_vars:
+        - name: NTFY_TOPIC
+          description: "Unique topic name, e.g., retro-pipeline-abc123 (gunakan random suffix untuk privacy)"
+        - name: NTFY_SERVER
+          description: "https://ntfy.sh (public) atau URL self-hosted instance"
+        - name: NTFY_TOKEN
+          description: "Optional: token untuk protected topics"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
+        NTFY_TOPIC  = os.getenv("NTFY_TOPIC", "retro-pipeline")
+
+        def notify_ntfy(
+            title:    str,
+            message:  str,
+            priority: str = "default",  # "min", "low", "default", "high", "urgent"
+            tags:     list[str] | None = None,
+        ):
+            """
+            priority "urgent" = bypass DND pada HP (gunakan hanya untuk critical errors)
+            tags = emoji atau tag string: ["robot", "warning", "white_check_mark"]
+            """
+            headers = {
+                "Title":    title,
+                "Priority": priority,
+                "Tags":     ",".join(tags or []),
+            }
+            if os.getenv("NTFY_TOKEN"):
+                headers["Authorization"] = f"Bearer {os.getenv('NTFY_TOKEN')}"
+
+            requests.post(
+                f"{NTFY_SERVER}/{NTFY_TOPIC}",
+                data=message.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+            )
+
+        # Test
+        notify_ntfy(
+            title="RETRO Pipeline",
+            message="Crawling selesai: 342 perusahaan ditemukan di LogiSEA 2025",
+            priority="default",
+            tags=["robot"],
+        )
+
+      retro_example: |
+        import requests
+        import os
+        from datetime import datetime
+
+        NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
+        NTFY_TOPIC  = os.getenv("NTFY_TOPIC", "retro-alerts")
+
+        def _ntfy_post(title: str, body: str, priority: str = "default", tags: list = None):
+            try:
+                headers = {
+                    "Title":    title,
+                    "Priority": priority,
+                    "Tags":     ",".join(tags or []),
+                }
+                requests.post(
+                    f"{NTFY_SERVER}/{NTFY_TOPIC}",
+                    data=body.encode("utf-8"),
+                    headers=headers,
+                    timeout=5,
+                )
+            except Exception as e:
+                print(f"[Ntfy] Notification failed: {e}")
+
+        class RetroNotifier:
+            """Centralized notification sender untuk RETRO events."""
+
+            @staticmethod
+            def pipeline_started(expo: str, url_count: int):
+                _ntfy_post(
+                    title=f"RETRO Started: {expo}",
+                    body=f"Pipeline dimulai. Crawling {url_count} URLs...",
+                    tags=["robot", "hourglass_flowing_sand"],
+                )
+
+            @staticmethod
+            def crawl_complete(expo: str, found: int, new: int):
+                _ntfy_post(
+                    title=f"Crawl Complete: {expo}",
+                    body=f"Found: {found} companies | New: {new} | Already seen: {found - new}",
+                    tags=["mag"],
+                )
+
+            @staticmethod
+            def profiling_complete(expo: str, profiled: int, total: int, high: int):
+                _ntfy_post(
+                    title=f"Profiling Complete: {expo}",
+                    body=(
+                        f"Profiled: {profiled}/{total} companies\n"
+                        f"High potential: {high}\n"
+                        f"Ready for synthesis..."
+                    ),
+                    tags=["white_check_mark"],
+                )
+
+            @staticmethod
+            def proposal_ready_for_review(company_name: str, domain: str, expo: str):
+                _ntfy_post(
+                    title=f"Proposal Ready: {company_name}",
+                    body=(
+                        f"Proposal untuk {company_name} ({domain}) siap review.\n"
+                        f"Expo: {expo}\n"
+                        f"Cek Telegram atau dashboard untuk Approve/Reject."
+                    ),
+                    priority="high",
+                    tags=["memo", "eyes"],
+                )
+
+            @staticmethod
+            def proposal_sent(company_name: str, to_email: str):
+                _ntfy_post(
+                    title=f"Proposal Sent: {company_name}",
+                    body=f"Email proposal terkirim ke {to_email}",
+                    tags=["email", "rocket"],
+                )
+
+            @staticmethod
+            def error_alert(phase: str, error: str, domain: str = ""):
+                _ntfy_post(
+                    title=f"⚠️ RETRO Error: {phase}",
+                    body=f"Domain: {domain}\nError: {error[:300]}",
+                    priority="high",
+                    tags=["warning", "rotating_light"],
+                )
+
+            @staticmethod
+            def daily_summary(stats: dict):
+                body = (
+                    f"📊 RETRO Daily Summary - {datetime.now().strftime('%d/%m/%Y')}\n"
+                    f"Companies crawled: {stats.get('crawled', 0)}\n"
+                    f"Profiles created: {stats.get('profiled', 0)}\n"
+                    f"Proposals sent: {stats.get('proposals_sent', 0)}\n"
+                    f"Replies received: {stats.get('replies', 0)}\n"
+                    f"API cost today: ${stats.get('api_cost_usd', 0):.4f} (Rp {stats.get('api_cost_usd', 0) * 16000:,.0f})"
+                )
+                _ntfy_post(title="RETRO Daily Summary", body=body, tags=["bar_chart"])
+
+      expected_output: |
+        # Push notification di HP director (app ntfy):
+        # ─────────────────────────────────────────
+        # 🤖 RETRO Started: LogiSEA 2025
+        # Pipeline dimulai. Crawling 342 URLs...
+        # ─────────────────────────────────────────
+        # ✅ Profiling Complete: LogiSEA 2025
+        # Profiled: 329/342 companies
+        # High potential: 47
+        # Ready for synthesis...
+        # ─────────────────────────────────────────
+        # ⚠️ RETRO Error: Context Agent
+        # Domain: unknowncompany.com
+        # Error: LLM timeout after 180s
+        # ─────────────────────────────────────────
+        # 📊 RETRO Daily Summary - 23/04/2025
+        # Companies crawled: 342
+        # Proposals sent: 3
+        # API cost today: $0.0094 (Rp 150)
+
+    notes:
+      - "Topic name sebaiknya mengandung random suffix untuk privacy (bukan 'retro-pipeline' yang terlalu generic)"
+      - "Priority 'urgent' membuat notifikasi bypass DND di Android, hanya untuk critical alerts"
+      - "Tags bisa berupa emoji shortcodes yang dirender sebagai emoji: robot, warning, white_check_mark, dll"
+      - "ntfy.sh public server: notifikasi disimpan 24 jam. Self-hosted untuk long-term storage"
+      - "Protected topics: ntfy mendukung autentikasi via Authorization header untuk mencegah orang lain subscribe"
+    pitfalls:
+      - "JANGAN gunakan topic name yang bisa ditebak ('retro', 'pipeline'), orang lain bisa subscribe dan baca notifikasi"
+      - "ntfy.sh public server bisa down, self-hosted lebih reliable untuk production"
+      - "JANGAN kirim sensitive info (API keys, email addresses partner) via ntfy public server"
+
+  - id: twilio_whatsapp
+    name: "Twilio WhatsApp Business API"
+    category: "WhatsApp Notification"
+    description: >
+      Twilio WhatsApp API memungkinkan mengirim pesan WhatsApp secara programmatic
+      menggunakan Python SDK. Menggunakan WhatsApp Business API yang diapprove oleh
+      Meta. Sangat berguna untuk RETRO di Indonesia di mana WhatsApp adalah komunikasi
+      utama bisnis. Director bisa terima notifikasi pipeline langsung di WhatsApp
+      tanpa install app tambahan. Twilio menyediakan Sandbox gratis untuk testing.
+      Production memerlukan approved WhatsApp Business number dan meta business verification.
+    specific_function: >
+      WhatsApp notifications untuk director RETRO di Indonesia. Proposal ready alerts,
+      error alerts, dan daily summaries dikirim ke WhatsApp director. Lebih akrab
+      dan lebih sering dibaca daripada email atau Telegram bagi pengguna Indonesia.
+    language: "Python (twilio)"
+    pricing: "Sandbox gratis untuk testing. Production: $0.005-0.08 per message (tergantung region)"
+    last_updated: "2025"
+    url: "https://www.twilio.com/whatsapp"
+    retro:
+      phase: "Semua Phase (WhatsApp Notification)"
+      role: >
+        WhatsApp notification channel untuk director RETRO yang prefer komunikasi
+        via WhatsApp (umum di Indonesia). Pipeline events, proposal ready alerts,
+        dan daily summaries dikirim ke WhatsApp.
+      when_to_use: >
+        Gunakan Twilio WhatsApp jika director lebih aktif di WhatsApp daripada
+        Telegram. Telegram lebih direkomendasikan untuk teknis karena gratis dan
+        punya interactive buttons. WhatsApp lebih familiar untuk non-technical users.
+      priority: "secondary (Indonesia-centric)"
+      output_goes_to: "Director WhatsApp"
+    setup:
+      install: "pip install twilio"
+      sandbox_setup: |
+        1. Buat akun Twilio: https://twilio.com/try-twilio
+        2. Buka https://console.twilio.com/us1/develop/sms/try-it-out/whatsapp-learn
+        3. Ikuti instruksi sandbox: WhatsApp ke number Twilio dengan kode join
+        4. Dapatkan TWILIO_ACCOUNT_SID dan TWILIO_AUTH_TOKEN dari console
+      requirements:
+        - "twilio>=8.0.0"
+        - "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM"
+      env_vars:
+        - name: TWILIO_ACCOUNT_SID
+          description: "Account SID dari Twilio console"
+        - name: TWILIO_AUTH_TOKEN
+          description: "Auth Token dari Twilio console"
+        - name: TWILIO_WHATSAPP_FROM
+          description: "WhatsApp sender number: whatsapp:+14155238886 (sandbox) atau approved number"
+        - name: DIRECTOR_WHATSAPP
+          description: "Director phone dengan prefix: whatsapp:+628123456789"
+    usage:
+      basic_example: |
+        from twilio.rest import Client
+        import os
+
+        client = Client(
+            os.environ["TWILIO_ACCOUNT_SID"],
+            os.environ["TWILIO_AUTH_TOKEN"],
+        )
+
+        # Kirim pesan WhatsApp sederhana
+        msg = client.messages.create(
+            from_=os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886"),
+            to=os.getenv("DIRECTOR_WHATSAPP", "whatsapp:+628123456789"),
+            body="RETRO Pipeline: Crawling selesai! 342 perusahaan ditemukan di LogiSEA 2025.",
+        )
+        print(f"Message SID: {msg.sid}")
+
+      retro_example: |
+        from twilio.rest import Client
+        from twilio.base.exceptions import TwilioRestException
+        import os
+
+        _twilio_client = None
+
+        def get_twilio():
+            global _twilio_client
+            if _twilio_client is None:
+                _twilio_client = Client(
+                    os.environ["TWILIO_ACCOUNT_SID"],
+                    os.environ["TWILIO_AUTH_TOKEN"],
+                )
+            return _twilio_client
+
+        FROM_NUMBER    = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+        DIRECTOR_WA    = os.getenv("DIRECTOR_WHATSAPP", "whatsapp:+6281234567890")
+
+        def send_whatsapp(message: str) -> bool:
+            """Send WhatsApp message ke director. Return True jika berhasil."""
+            try:
+                msg = get_twilio().messages.create(
+                    from_=FROM_NUMBER,
+                    to=DIRECTOR_WA,
+                    body=message[:1600],  # WhatsApp limit 1600 chars
+                )
+                print(f"[WhatsApp] Sent: {msg.sid}")
+                return True
+            except TwilioRestException as e:
+                print(f"[WhatsApp] Error: {e.msg}")
+                return False
+
+        def notify_pipeline_complete_wa(expo: str, stats: dict):
+            msg = (
+                f"*RETRO Pipeline Complete* 🤖\n"
+                f"Expo: {expo}\n"
+                f"Crawled: {stats['crawled']} companies\n"
+                f"Profiled: {stats['profiled']} companies\n"
+                f"High potential: {stats['high_potential']}\n"
+                f"Proposals ready: {stats['proposals_ready']}\n"
+                f"\n"
+                f"_Reply 'yes approve all' untuk approve semua proposal._\n"
+                f"_Reply 'show proposals' untuk list proposal._"
+            )
+            send_whatsapp(msg)
+
+        def notify_proposal_ready_wa(company: dict, expo: str, summary: str):
+            msg = (
+                f"📄 *Proposal Siap Review*\n"
+                f"Perusahaan: {company['company_name']}\n"
+                f"Domain: {company['domain']}\n"
+                f"Expo: {expo}\n"
+                f"Potential: {company.get('collaboration_potential', 'N/A').upper()}\n\n"
+                f"Ringkasan: {summary[:300]}\n\n"
+                f"_Reply 'approve {company['domain']}' untuk kirim proposal._\n"
+                f"_Reply 'reject {company['domain']}' untuk batalkan._"
+            )
+            send_whatsapp(msg)
+
+        def notify_error_wa(phase: str, error: str):
+            msg = (
+                f"⚠️ *RETRO Error*\n"
+                f"Phase: {phase}\n"
+                f"Error: {error[:400]}\n"
+                f"\n_Cek logs untuk detail._"
+            )
+            send_whatsapp(msg)
+
+      expected_output: |
+        # WhatsApp message yang diterima director:
+        # ─────────────────────────────────────────
+        # RETRO Pipeline Complete 🤖
+        # Expo: LogiSEA 2025
+        # Crawled: 342 companies
+        # Profiled: 329 companies
+        # High potential: 47
+        # Proposals ready: 3
+        #
+        # Reply 'yes approve all' untuk approve semua proposal.
+        # ─────────────────────────────────────────
+        # 📄 Proposal Siap Review
+        # Perusahaan: PT Sinar Logistik Nusantara
+        # Domain: sinarlogistik.co.id
+        # Potential: HIGH
+        #
+        # Reply 'approve sinarlogistik.co.id' untuk kirim proposal.
+
+    notes:
+      - "Twilio Sandbox (testing): director HARUS join sandbox dulu dengan kirim pesan ke Twilio number"
+      - "Production WhatsApp: memerlukan Meta Business Verification dan WhatsApp Business API approval (proses 1-2 minggu)"
+      - "WhatsApp message max 1600 chars, potong pesan panjang sebelum kirim"
+      - "WhatsApp Template Messages diperlukan untuk menghubungi user yang belum pernah kirim pesan ke bisnis (24 jam window rule)"
+      - "Biaya: $0.005-0.08 per message tergantung region, masih sangat murah untuk notifikasi"
+    pitfalls:
+      - "JANGAN kirim ke number yang belum opt-in ke WhatsApp notifications (spam report risk)"
+      - "Sandbox Twilio hanya bisa kirim ke number yang sudah join sandbox, tidak bisa ke sembarangan"
+      - "Production approval WhatsApp Business API memerlukan business verification, persiapkan lebih awal"
+
+  - id: aiogram
+    name: "aiogram (Async Telegram Bot)"
+    category: "Telegram Bot (Async Alternative)"
+    description: >
+      aiogram adalah Telegram Bot API framework yang fully async, lebih modern
+      dari python-telegram-bot. Menggunakan native asyncio tanpa wrapper sync.
+      State machine untuk complex conversations, middleware support, dan FSM
+      (Finite State Machine) untuk multi-step interactions. Untuk RETRO yang
+      sudah fully async, aiogram lebih natural dari python-telegram-bot.
+    specific_function: >
+      Async alternative python-telegram-bot untuk pipeline RETRO yang menggunakan
+      asyncio. FSM bisa digunakan untuk complex approval workflow (director bisa
+      request preview detail sebelum approve).
+    language: "Python (asyncio)"
+    pricing: "Gratis (open-source)"
+    last_updated: "2025"
+    url: "https://docs.aiogram.dev"
+    retro:
+      phase: "Semua Phase (Async Notification)"
+      role: "Async Telegram bot untuk notifikasi dan approval workflow"
+      when_to_use: >
+        Gunakan aiogram jika pipeline RETRO sudah fully async dan ingin Telegram
+        bot yang juga fully async. Untuk simple notification tanpa complex workflow,
+        python-telegram-bot lebih simple.
+      priority: "optional (async alternative)"
+      output_goes_to: "Director Telegram"
+    setup:
+      install: "pip install aiogram"
+      requirements:
+        - "aiogram>=3.4.0"
+        - "TELEGRAM_BOT_TOKEN"
+      env_vars:
+        - name: TELEGRAM_BOT_TOKEN
+          description: "Token dari @BotFather"
+        - name: TELEGRAM_CHAT_ID
+          description: "Chat ID direktur"
+    usage:
+      basic_example: |
+        import asyncio
+        from aiogram import Bot, Dispatcher, types
+        from aiogram.filters import Command
+        import os
+
+        BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+        CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
+
+        bot = Bot(token=BOT_TOKEN)
+        dp  = Dispatcher()
+
+        async def send_notification(text: str):
+            await bot.send_message(chat_id=CHAT_ID, text=text)
+
+        @dp.message(Command("status"))
+        async def cmd_status(message: types.Message):
+            await message.answer("RETRO Pipeline Status: Running ✅")
+
+        # Start bot
+        async def main():
+            await dp.start_polling(bot)
+
+        asyncio.run(main())
+
+      retro_example: |
+        from aiogram import Bot, Dispatcher, types, F
+        from aiogram.filters import Command
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        import os
+
+        BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+        CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
+
+        bot = Bot(token=BOT_TOKEN)
+        dp  = Dispatcher()
+
+        async def notify(text: str, **kwargs):
+            """Send text notification ke director."""
+            await bot.send_message(chat_id=CHAT_ID, text=text, **kwargs)
+
+        async def send_approval_request(proposal_id: int, company: dict, summary: str):
+            """Kirim proposal approval request dengan tombol."""
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Approve", callback_data=f"app:{proposal_id}"),
+                InlineKeyboardButton(text="❌ Reject",  callback_data=f"rej:{proposal_id}"),
+            ]])
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"📄 <b>Proposal Review Needed</b>\n"
+                    f"Company: {company['company_name']}\n"
+                    f"Summary: {summary[:400]}"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+
+        @dp.callback_query(F.data.startswith("app:"))
+        async def approve_handler(callback: types.CallbackQuery):
+            proposal_id = int(callback.data.split(":")[1])
+            await callback.answer("Approving...")
+            # trigger approval logic
+            await callback.message.edit_text(f"✅ Proposal #{proposal_id} approved and sent!")
+
+        @dp.callback_query(F.data.startswith("rej:"))
+        async def reject_handler(callback: types.CallbackQuery):
+            proposal_id = int(callback.data.split(":")[1])
+            await callback.answer("Rejecting...")
+            await callback.message.edit_text(f"❌ Proposal #{proposal_id} rejected.")
+
+        async def start_bot():
+            await dp.start_polling(bot)
+
+      expected_output: |
+        # aiogram bot berjalan, menunggu callbacks dari director
+        # Saat director tekan "Approve": callback_query "app:42" diterima
+        # Handler approve_handler dipanggil, proposal dikirim
+
+    notes:
+      - "aiogram v3 fully async, semua handler harus async def"
+      - "F.data.startswith() adalah filter untuk callback_query berdasarkan data prefix"
+      - "HTML parse_mode lebih predictable dari MarkdownV2 karena tidak perlu escape banyak chars"
+    pitfalls:
+      - "aiogram v3 breaking change dari v2: migration guide di docs.aiogram.dev/en/dev-3.x/migration_guide.html"
+      - "start_polling() blocking, jalankan sebagai asyncio task jika ingin run bersama pipeline"
+
+  - id: gotify
+    name: "Gotify (Self-Hosted Push Notification)"
+    category: "Push Notification (Self-Hosted Alternative)"
+    description: >
+      Gotify adalah self-hosted push notification server dengan app Android.
+      Mirip Ntfy tapi lebih feature-rich: multiple applications dengan token berbeda,
+      priority levels, dan message history. Semua data tetap di server sendiri.
+      Cocok untuk RETRO yang butuh push notification internal dengan zero third-party.
+    specific_function: >
+      Self-hosted alternative Ntfy untuk push notification RETRO dengan message
+      history dan multiple app tokens (satu token per environment: dev, staging, production).
+    language: "Python (requests)"
+    pricing: "Free (open-source, self-hosted)"
+    last_updated: "2025"
+    url: "https://gotify.net"
+    retro:
+      phase: "All phases (Internal notification)"
+      role: "Self-hosted push notification dengan message history"
+      when_to_use: >
+        Gunakan Gotify jika: (1) butuh push notification self-hosted, (2) butuh
+        message history untuk audit trail notifikasi, (3) butuh multiple app tokens
+        untuk dev/staging/production separation.
+      priority: "optional (self-hosted alternative)"
+      output_goes_to: "Director HP (via Gotify Android app)"
+    setup:
+      install: "pip install requests"
+      docker: "docker run -p 80:80 -v gotify_data:/app/data gotify/server"
+      requirements:
+        - "requests"
+        - "Gotify server running (Docker)"
+        - "Gotify Android app installed di HP director"
+      env_vars:
+        - name: GOTIFY_URL
+          description: "URL Gotify server, e.g., http://your-server:80"
+        - name: GOTIFY_TOKEN
+          description: "Application token dari Gotify admin panel"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        GOTIFY_URL   = os.getenv("GOTIFY_URL", "http://localhost:80")
+        GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN")
+
+        def send_gotify(title: str, message: str, priority: int = 5) -> bool:
+            """
+            priority: 1-4 = low, 5-7 = normal, 8-10 = high/urgent
+            """
+            try:
+                r = requests.post(
+                    f"{GOTIFY_URL}/message",
+                    json={"title": title, "message": message, "priority": priority},
+                    headers={"X-Gotify-Key": GOTIFY_TOKEN},
+                    timeout=5,
+                )
+                return r.status_code == 200
+            except Exception as e:
+                print(f"[Gotify] Error: {e}")
+                return False
+
+        send_gotify("RETRO Pipeline", "Crawling selesai: 342 companies found", priority=5)
+
+      retro_example: |
+        import requests
+        import os
+
+        GOTIFY_URL   = os.getenv("GOTIFY_URL")
+        GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN")
+
+        def retro_notify(title: str, body: str, priority: int = 5):
+            if not GOTIFY_URL:
+                return  # Gotify tidak configured, skip
+            requests.post(
+                f"{GOTIFY_URL}/message",
+                json={"title": title, "message": body, "priority": priority},
+                headers={"X-Gotify-Key": GOTIFY_TOKEN},
+                timeout=5,
+            )
+
+        def notify_all_channels(title: str, body: str, priority: str = "normal"):
+            """Send notification ke semua channels yang configured."""
+            # Telegram (primary)
+            from retro.notifications.telegram_notify import notify as tg_notify
+            tg_notify(f"*{title}*\n{body}")
+
+            # Ntfy (if configured)
+            ntfy_topic = os.getenv("NTFY_TOPIC")
+            if ntfy_topic:
+                requests.post(
+                    f"{os.getenv('NTFY_SERVER', 'https://ntfy.sh')}/{ntfy_topic}",
+                    data=body.encode(),
+                    headers={"Title": title, "Priority": priority},
+                )
+
+            # Gotify (if configured)
+            priority_map = {"low": 3, "normal": 5, "high": 8, "critical": 10}
+            retro_notify(title, body, priority_map.get(priority, 5))
+
+      expected_output: |
+        # Gotify notification di HP director:
+        # Title: RETRO Pipeline Complete
+        # Message: 342 companies crawled, 47 high potential
+        # Priority: Normal
+
+    notes:
+      - "Gotify support Markdown di message body untuk formatting"
+      - "priority 10 = critical alert yang akan muncul dengan suara di Android meski DND aktif"
+      - "Gotify memiliki REST API untuk list, delete, dan manage messages"
+    pitfalls:
+      - "Gotify memerlukan server yang selalu online untuk receive messages, tidak cocok untuk laptop"
+      - "Android app Gotify tidak tersedia di Google Play (security policy), download dari F-Droid atau GitHub releases"
+
+  - id: apprise
+    name: "Apprise"
+    category: "Multi-Channel Notification Library"
+    description: >
+      Apprise adalah library Python yang menyediakan unified interface untuk 80+
+      notification services: Telegram, Slack, Discord, Email, WhatsApp, Ntfy, Gotify,
+      MQTT, PagerDuty, dan masih banyak lagi. Dengan satu URL format, bisa kirim
+      ke berbagai channel sekaligus. Sangat berguna untuk RETRO yang ingin kirim
+      notifikasi ke beberapa channel (Telegram DAN Ntfy DAN Email) dalam satu
+      function call tanpa manage multiple clients.
+    specific_function: >
+      Multi-channel notification dengan satu library. RETRO configures Apprise URLs
+      untuk semua notification channels, kemudian satu call ke apprise.notify() mengirim
+      ke semua channels sekaligus: Telegram, Ntfy, dan email jika diperlukan.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://github.com/caronc/apprise"
+    retro:
+      phase: "Semua Phase (Multi-channel Notification)"
+      role: >
+        Unified notification sender. Mengurangi code duplication: daripada manage
+        Telegram client, Ntfy client, dan Email client secara terpisah, Apprise
+        mengelola semua dalam satu interface.
+      when_to_use: >
+        Gunakan Apprise jika RETRO butuh kirim notifikasi ke lebih dari dua channels
+        secara bersamaan. Sangat efisien untuk setup dan maintenace notification system.
+      priority: "optional (multi-channel simplification)"
+      output_goes_to: "Semua configured notification channels"
+    setup:
+      install: "pip install apprise"
+      requirements:
+        - "apprise>=1.7.0"
+      env_vars:
+        - name: APPRISE_URLS
+          description: "Comma-separated Apprise notification URLs"
+    usage:
+      basic_example: |
+        import apprise
+
+        # Buat Apprise instance
+        apobj = apprise.Apprise()
+
+        # Tambah notification targets dengan URL format Apprise
+        apobj.add("tgram://BOT_TOKEN/CHAT_ID")          # Telegram
+        apobj.add("ntfys://ntfy.sh/retro-alerts")        # Ntfy (dengan TLS)
+        apobj.add("mailto://user:pass@gmail.com")        # Email
+
+        # Kirim ke semua channels sekaligus
+        apobj.notify(
+            title="RETRO Pipeline",
+            body="342 companies profiled! 3 proposals ready.",
+        )
+
+        # Async version
+        import asyncio
+        asyncio.run(apobj.async_notify(
+            title="Test",
+            body="Test notification",
+        ))
+
+      retro_example: |
+        import apprise
+        import os
+
+        # Setup dari environment variables
+        APPRISE_URLS = os.getenv("APPRISE_URLS", "")
+
+        _apprise = None
+
+        def get_apprise() -> apprise.Apprise:
+            global _apprise
+            if _apprise is None:
+                _apprise = apprise.Apprise()
+                # Load URLs dari environment (comma-separated)
+                for url in APPRISE_URLS.split(","):
+                    url = url.strip()
+                    if url:
+                        _apprise.add(url)
+                        print(f"[Apprise] Added channel: {url[:30]}...")
+            return _apprise
+
+        def notify_retro(title: str, body: str, notify_type: str = apprise.NotifyType.INFO):
+            """
+            notify_type: INFO, SUCCESS, WARNING, FAILURE
+            Beberapa channels menampilkan color berbeda per type.
+            """
+            ap = get_apprise()
+            if not ap:
+                return
+            ap.notify(title=title, body=body, notify_type=notify_type)
+
+        class RetroNotifications:
+            """Centralized notifications menggunakan Apprise."""
+
+            @staticmethod
+            def success(title: str, body: str):
+                notify_retro(title, body, apprise.NotifyType.SUCCESS)
+
+            @staticmethod
+            def warning(title: str, body: str):
+                notify_retro(title, body, apprise.NotifyType.WARNING)
+
+            @staticmethod
+            def failure(title: str, body: str):
+                notify_retro(title, body, apprise.NotifyType.FAILURE)
+
+            @staticmethod
+            def info(title: str, body: str):
+                notify_retro(title, body, apprise.NotifyType.INFO)
+
+        # Contoh penggunaan:
+        # APPRISE_URLS=tgram://TOKEN/CHAT_ID,ntfys://ntfy.sh/retro-abc123
+        # RetroNotifications.success("Pipeline Complete", "342 companies processed")
+
+        # Contoh URL format Apprise:
+        # Telegram:         tgram://BOT_TOKEN/CHAT_ID
+        # Ntfy (public):    ntfy://ntfy.sh/TOPIC
+        # Ntfy (TLS):       ntfys://ntfy.sh/TOPIC
+        # Email (Gmail):    mailto://gmail_user:app_password@gmail.com/recipient@example.com
+        # Slack:            slack://TOKEN_A/TOKEN_B/TOKEN_C/CHANNEL
+        # Discord:          discord://WEBHOOK_ID/WEBHOOK_TOKEN
+        # Gotify:           gotify://GOTIFY_HOST/GOTIFY_TOKEN
+        # Resend:           resend://API_KEY:from@domain.com/to@domain.com
+
+      expected_output: |
+        [Apprise] Added channel: tgram://123456789:AAAA...
+        [Apprise] Added channel: ntfys://ntfy.sh/retro-pipeline-abc...
+        [Apprise] Sent SUCCESS to 2 channels: Pipeline Complete
+
+    notes:
+      - "Apprise mendukung 80+ services: cek dokumentasi untuk format URL setiap service"
+      - "notify_type mempengaruhi tampilan notifikasi di beberapa channels (color, icon)"
+      - "async_notify() untuk non-blocking send dalam asyncio pipeline"
+      - "Apprise bisa load URLs dari file: apobj.add('apprise://path/to/config.yml')"
+      - "Gunakan env var APPRISE_URLS untuk konfigurasi tanpa ubah kode"
+    pitfalls:
+      - "Beberapa Apprise URL format mengandung password atau token, JANGAN commit ke git"
+      - "Tidak semua notification service mendukung semua fitur (attachments, HTML formatting, dll)"
+      - "Jika satu channel gagal, Apprise tetap kirim ke channel lain (tidak abort semua)"

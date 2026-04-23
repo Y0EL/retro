@@ -1,0 +1,1002 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Email Sending & Delivery
+# File: 11_email_sending.yaml
+# Purpose: Tools untuk mengirim proposal PDF ke potential partners via email.
+#          Email adalah channel pengiriman utama proposal RETRO.
+#
+# RETRO EMAIL SENDING ARCHITECTURE:
+#   1. Proposal PDF sudah di-generate (WeasyPrint) dan upload ke MinIO
+#   2. Email Agent membaca proposal dari PostgreSQL (status='ready')
+#   3. EmailDiscovery Agent sudah menemukan contact email
+#   4. Email Agent compose email dengan template Jinja2 (body) + PDF attachment
+#   5. Send via SMTP atau API (Resend/Mailgun/SendGrid)
+#   6. Track delivery status, update PostgreSQL (status='sent', sent_at=NOW())
+#   7. Notify director via Telegram/WhatsApp bahwa proposal terkirim
+#
+# RECOMMENDED STACK (RETRO):
+#   Development:     yagmail (simple SMTP via Gmail, gratis, untuk testing)
+#   MVP Production:  Resend (modern, developer-friendly, 3000 emails/bulan gratis)
+#   Scale:           Mailgun (100 emails/hari gratis, $35/bulan setelahnya)
+#   Self-hosted:     Stalwart Mail Server (full stack, zero vendor dependency)
+#
+# EMAIL DELIVERABILITY TIPS:
+#   - Gunakan domain khusus untuk proposal RETRO (bukan Gmail personal)
+#   - Setup SPF, DKIM, DMARC records di DNS domain
+#   - Mulai dari volume rendah, naikkan gradually (email warmup)
+#   - Jangan kirim > 50 email/hari dari domain baru (blacklist risk)
+#   - Selalu include plain-text version di samping HTML
+#   - Tambahkan unsubscribe link yang functional
+
+tools:
+
+  - id: resend
+    name: "Resend"
+    category: "Email API (Modern, Developer-Friendly)"
+    description: >
+      Resend adalah email API modern yang dibuat oleh developer untuk developer.
+      API sangat clean dan intuitif. SDK tersedia untuk Python, Node.js, dan berbagai
+      bahasa. Free tier: 3,000 emails/bulan dan 100 emails/hari. Setup mudah:
+      tambah domain, verify DNS records, langsung bisa kirim. Dashboard modern
+      menampilkan delivery status, bounce rates, dan email logs real-time.
+      Resend menggunakan infrastruktur terpisah dari AWS SES yang sudah terpercaya.
+      Dibandingkan SendGrid yang complex, Resend jauh lebih simple untuk developer.
+    specific_function: >
+      Primary email sender untuk proposal RETRO di production. API call sangat
+      simple (satu function call dengan dict). Track delivery status per email.
+      Free tier 3000/bulan cukup untuk RETRO MVP yang kirim rata-rata 10-20
+      proposal per expo event.
+    language: "Python (resend library)"
+    pricing: "3000 emails/bulan gratis, $20/bulan (50K emails), $90/bulan (100K emails)"
+    last_updated: "2025"
+    url: "https://resend.com"
+    retro:
+      phase: "Phase 5 (Proposal Sending)"
+      role: >
+        Primary email delivery service untuk proposal RETRO. Email Agent mengirim
+        proposal PDF ke kontak perusahaan target melalui Resend API. Setiap email
+        memiliki proposal PDF sebagai attachment dan tracking ID untuk monitoring.
+      when_to_use: >
+        Gunakan Resend untuk semua email proposal production. Mudah setup, free tier
+        generous (3000/bulan), dan monitoring dashboard bagus. Untuk development dan
+        testing, gunakan yagmail agar tidak membuang free quota.
+      priority: "primary (production email sending)"
+      output_goes_to: "Email inbox potential partner, PostgreSQL (tracking update)"
+    setup:
+      install: "pip install resend"
+      requirements:
+        - "resend>=0.8.0"
+        - "Custom domain dengan DNS records yang sudah diverifikasi di Resend dashboard"
+        - "RESEND_API_KEY dari https://resend.com/api-keys"
+      env_vars:
+        - name: RESEND_API_KEY
+          description: "API key dari https://resend.com/api-keys"
+        - name: EMAIL_FROM_ADDRESS
+          description: "Email pengirim, harus dari domain yang sudah diverifikasi: partnership@retro.id"
+        - name: EMAIL_FROM_NAME
+          description: "Nama pengirim: RETRO Partnership Team"
+    usage:
+      basic_example: |
+        import resend
+        import os
+
+        resend.api_key = os.environ["RESEND_API_KEY"]
+
+        # Kirim email sederhana
+        r = resend.Emails.send({
+            "from":    "partnership@retro.id",
+            "to":      ["budi.santoso@sinarlogistik.co.id"],
+            "subject": "Partnership Proposal - RETRO Intelligence Platform",
+            "html":    "<h1>Dear Budi,</h1><p>Please find attached our partnership proposal...</p>",
+            "text":    "Dear Budi,\n\nPlease find attached our partnership proposal...",
+        })
+        print(f"Email ID: {r['id']}")
+
+        # Dengan attachment
+        import base64
+        with open("proposal.pdf", "rb") as f:
+            pdf_base64 = base64.b64encode(f.read()).decode()
+
+        r = resend.Emails.send({
+            "from":    "partnership@retro.id",
+            "to":      ["budi@sinarlogistik.co.id"],
+            "subject": "Partnership Proposal - RETRO",
+            "html":    "<p>Please find attached...</p>",
+            "attachments": [
+                {
+                    "filename": "RETRO_Partnership_Proposal.pdf",
+                    "content":  pdf_base64,
+                }
+            ],
+        })
+        print(f"Email sent: {r['id']}")
+
+      retro_example: |
+        import resend
+        import base64
+        import os
+        import json
+        from datetime import datetime, timezone
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+        resend.api_key = os.environ["RESEND_API_KEY"]
+        FROM_ADDRESS   = os.getenv("EMAIL_FROM_ADDRESS", "partnership@retro.id")
+        FROM_NAME      = os.getenv("EMAIL_FROM_NAME", "RETRO Partnership Team")
+        REPLY_TO       = os.getenv("EMAIL_REPLY_TO", "partnership@retro.id")
+
+        # Email body template (Jinja2, lebih simple dari proposal template)
+        EMAIL_BODY_TEMPLATE = """
+        <!DOCTYPE html>
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+          <div style="border-bottom: 3px solid #e94560; padding-bottom: 15px; margin-bottom: 20px;">
+            <h2 style="color: #1a1a2e; margin: 0;">RETRO Intelligence Platform</h2>
+            <p style="color: #888; margin: 5px 0 0 0; font-size: 12px;">Autonomous B2B Partnership Intelligence</p>
+          </div>
+
+          <p>Dear {{ contact_name or (company.company_name + ' Team') }},</p>
+
+          <p>Greetings from <strong>RETRO Intelligence Platform</strong>!</p>
+
+          <p>We recently had the opportunity to learn about <strong>{{ company.company_name }}</strong>
+          at <strong>{{ expo_name }}</strong>, and we were impressed by your work in
+          <strong>{{ company.industry }}</strong>.</p>
+
+          <p>We believe there is a compelling opportunity for collaboration between our organizations.
+          Please find attached our detailed partnership proposal that outlines how we can create
+          mutual value together.</p>
+
+          <div style="background: #f8f9fa; border-left: 4px solid #e94560; padding: 12px 15px; margin: 20px 0;">
+            <strong>What we propose:</strong><br>
+            {{ proposal_summary }}
+          </div>
+
+          <p>We would love to schedule a brief introductory call at your convenience to discuss
+          this further. Please feel free to reply to this email or reach us at
+          <a href="mailto:{{ reply_to }}">{{ reply_to }}</a>.</p>
+
+          <p>Looking forward to hearing from you.</p>
+
+          <p>Best regards,<br>
+          <strong>{{ sender_name }}</strong><br>
+          Partnership Team<br>
+          RETRO Intelligence Platform<br>
+          <a href="https://retro.id">retro.id</a></p>
+
+          <hr style="border: none; border-top: 1px solid #eee; margin-top: 30px;">
+          <p style="font-size: 10px; color: #aaa; text-align: center;">
+            This email was sent because your company was showcased at {{ expo_name }}.
+            <a href="mailto:{{ reply_to }}?subject=Unsubscribe">Unsubscribe</a>
+          </p>
+        </body>
+        </html>
+        """
+
+        def compose_email_body(
+            company:          dict,
+            contact_name:     str | None,
+            expo_name:        str,
+            proposal_summary: str,
+            sender_name:      str = "RETRO Partnership Team",
+        ) -> tuple[str, str]:
+            """
+            Return (html_body, plain_text_body) tuple.
+            """
+            from jinja2 import Template
+            tmpl = Template(EMAIL_BODY_TEMPLATE, autoescape=True)
+            html = tmpl.render(
+                company=company,
+                contact_name=contact_name,
+                expo_name=expo_name,
+                proposal_summary=proposal_summary,
+                reply_to=REPLY_TO,
+                sender_name=sender_name,
+            )
+
+            # Plain text version (strip HTML tags)
+            import re
+            text = re.sub(r'<[^>]+>', '', html)
+            text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+            return html, text
+
+        def send_proposal_email(
+            to_email:         str,
+            contact_name:     str | None,
+            company:          dict,
+            proposal_pdf_bytes: bytes,
+            expo_name:        str,
+            proposal_summary: str,
+            proposal_number:  str,
+        ) -> dict:
+            """
+            Send proposal email dengan PDF attachment.
+            Return: {"email_id": str, "status": "sent", "sent_at": str}
+            """
+            html_body, text_body = compose_email_body(
+                company=company,
+                contact_name=contact_name,
+                expo_name=expo_name,
+                proposal_summary=proposal_summary,
+            )
+
+            pdf_base64 = base64.b64encode(proposal_pdf_bytes).decode()
+            filename   = f"RETRO_Partnership_Proposal_{proposal_number}.pdf"
+
+            subject = (
+                f"Partnership Proposal - RETRO x {company['company_name']} | {expo_name}"
+            )
+
+            try:
+                result = resend.Emails.send({
+                    "from":      f"{FROM_NAME} <{FROM_ADDRESS}>",
+                    "to":        [to_email],
+                    "reply_to":  [REPLY_TO],
+                    "subject":   subject,
+                    "html":      html_body,
+                    "text":      text_body,
+                    "attachments": [
+                        {
+                            "filename": filename,
+                            "content":  pdf_base64,
+                        }
+                    ],
+                    "tags": [
+                        {"name": "expo",    "value": expo_name.replace(" ", "_")},
+                        {"name": "company", "value": company["domain"]},
+                        {"name": "type",    "value": "proposal"},
+                    ],
+                })
+
+                email_id   = result.get("id")
+                sent_at    = datetime.now(timezone.utc).isoformat()
+                print(f"[Resend] Sent to {to_email} | ID: {email_id}")
+                return {"email_id": email_id, "status": "sent", "sent_at": sent_at}
+
+            except resend.exceptions.ResendError as e:
+                print(f"[Resend] Error sending to {to_email}: {e}")
+                return {"email_id": None, "status": "failed", "error": str(e)}
+
+        def send_batch_proposals(proposals_queue: list[dict]) -> list[dict]:
+            """
+            Send semua proposals dalam queue.
+            proposals_queue: list of dicts dengan keys: to_email, contact_name, company, pdf_bytes, dll
+            """
+            import time
+            results = []
+            for i, p in enumerate(proposals_queue):
+                result = send_proposal_email(**p)
+                results.append({**result, "company_domain": p["company"]["domain"]})
+
+                # Rate limiting: Resend max 10 emails/second free tier
+                if i < len(proposals_queue) - 1:
+                    time.sleep(0.5)
+
+            print(f"[Resend] Batch complete: {sum(1 for r in results if r['status']=='sent')}/{len(results)} sent")
+            return results
+
+      expected_output: |
+        [Resend] Sent to budi.santoso@sinarlogistik.co.id | ID: re_abc123xyz456
+        [Resend] Sent to agus.dharma@globalscm.io         | ID: re_def789abc012
+        [Resend] Batch complete: 3/3 sent
+
+        # Email yang diterima:
+        # From: RETRO Partnership Team <partnership@retro.id>
+        # Subject: Partnership Proposal - RETRO x PT Sinar Logistik | LogiSEA 2025
+        # Attachment: RETRO_Partnership_Proposal_RETRO-202504-SINAR.pdf (284 KB)
+
+    notes:
+      - "tags memungkinkan filter dan search email di Resend dashboard berdasarkan expo atau company"
+      - "reply_to field penting jika FROM address berbeda dengan address yang ingin terima balasan"
+      - "Selalu sertakan plain-text version (text field) di samping HTML untuk deliverability"
+      - "Free tier 3000/bulan = bisa kirim 100 proposal per hari selama 30 hari, lebih dari cukup untuk MVP"
+      - "Resend memerlukan domain yang diverifikasi, tidak bisa kirim dari Gmail atau Outlook personal"
+      - "PDF attachment: max file size biasanya 10MB, proposal PDF normal 200-500KB jauh di bawah limit"
+    pitfalls:
+      - "JANGAN gunakan Gmail personal address sebagai FROM, email bisa masuk spam"
+      - "JANGAN kirim > 100 email/hari dari domain baru (< 30 hari), naikkan volume gradually"
+      - "JANGAN lupa verify domain di Resend dashboard: setup MX, SPF, DKIM, DMARC records"
+      - "JANGAN attach file selain PDF, beberapa email clients dan spam filters block non-PDF attachments"
+      - "Base64 encoding meningkatkan ukuran attachment 33%, pastikan PDF < 7MB sebelum encode (10MB limit)"
+
+  - id: aiosmtplib
+    name: "aiosmtplib (Async SMTP)"
+    category: "SMTP Client (Async)"
+    description: >
+      aiosmtplib adalah async SMTP client untuk Python asyncio. Memungkinkan
+      mengirim email secara async tanpa blocking event loop. Cocok untuk pipeline
+      RETRO yang sudah menggunakan asyncio. Mendukung TLS, STARTTLS, authentication,
+      dan semua fitur SMTP standar. Bisa connect ke Gmail SMTP, Outlook SMTP,
+      atau SMTP server perusahaan sendiri. Tidak memerlukan API key eksternal,
+      hanya butuh SMTP credentials.
+    specific_function: >
+      Async email sending untuk pipeline RETRO yang menggunakan asyncio. Mengirim
+      proposal email secara non-blocking sehingga pipeline tidak terhenti menunggu
+      email terkirim. Gunakan dengan SMTP service seperti Gmail (testing),
+      Office 365, atau self-hosted Stalwart.
+    language: "Python (asyncio)"
+    pricing: "Free (open-source, library + SMTP server cost)"
+    last_updated: "2025"
+    url: "https://aiosmtplib.readthedocs.io"
+    retro:
+      phase: "Phase 5 (Email Sending) - Async alternative"
+      role: >
+        Async SMTP sender untuk pipeline asyncio. Alternative Resend API jika ingin
+        kontrol penuh atas SMTP server (misal: self-hosted Stalwart untuk zero
+        third-party dependency).
+      when_to_use: >
+        Gunakan aiosmtplib ketika pipeline sudah menggunakan asyncio dan ingin
+        mengirim email via SMTP server langsung. Untuk production, kombinasikan
+        dengan Mailgun atau self-hosted Stalwart sebagai SMTP relay.
+      priority: "secondary (SMTP alternative)"
+      output_goes_to: "Email inbox (via SMTP)"
+    setup:
+      install: "pip install aiosmtplib"
+      requirements:
+        - "aiosmtplib>=3.0.0"
+        - "SMTP server credentials (Gmail, Mailgun SMTP, Stalwart, dll)"
+      env_vars:
+        - name: SMTP_HOST
+          description: "SMTP server hostname, e.g., smtp.gmail.com, smtp.mailgun.org"
+        - name: SMTP_PORT
+          description: "587 (STARTTLS) atau 465 (SSL)"
+        - name: SMTP_USER
+          description: "Username SMTP (email address)"
+        - name: SMTP_PASSWORD
+          description: "Password atau App Password (untuk Gmail)"
+    usage:
+      basic_example: |
+        import asyncio
+        import aiosmtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.application import MIMEApplication
+        import os
+
+        async def send_email_async(
+            to_email:  str,
+            subject:   str,
+            html_body: str,
+            pdf_bytes: bytes | None = None,
+        ):
+            msg = MIMEMultipart("mixed")
+            msg["From"]    = os.getenv("SMTP_USER")
+            msg["To"]      = to_email
+            msg["Subject"] = subject
+
+            # HTML body
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+            # PDF attachment
+            if pdf_bytes:
+                attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
+                attachment.add_header("Content-Disposition", "attachment", filename="proposal.pdf")
+                msg.attach(attachment)
+
+            async with aiosmtplib.SMTP(
+                hostname=os.getenv("SMTP_HOST", "smtp.gmail.com"),
+                port=int(os.getenv("SMTP_PORT", "587")),
+                start_tls=True,
+            ) as smtp:
+                await smtp.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD"))
+                await smtp.send_message(msg)
+            print(f"Email sent to {to_email}")
+
+        asyncio.run(send_email_async(
+            "budi@sinarlogistik.co.id",
+            "Partnership Proposal",
+            "<h1>Dear Budi,</h1>",
+        ))
+
+      retro_example: |
+        import asyncio
+        import aiosmtplib
+        import os
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.application import MIMEApplication
+
+        SMTP_CONFIG = {
+            "hostname": os.getenv("SMTP_HOST", "smtp.gmail.com"),
+            "port":     int(os.getenv("SMTP_PORT", "587")),
+            "start_tls": True,
+            "username": os.getenv("SMTP_USER"),
+            "password": os.getenv("SMTP_PASSWORD"),
+        }
+        FROM_ADDRESS = os.getenv("SMTP_USER", "partnership@retro.id")
+        FROM_NAME    = "RETRO Partnership Team"
+
+        async def send_proposal_async(
+            to_email:    str,
+            contact_name: str | None,
+            company_name: str,
+            expo_name:   str,
+            html_body:   str,
+            text_body:   str,
+            pdf_bytes:   bytes,
+            pdf_filename: str,
+        ) -> bool:
+            """Return True jika berhasil terkirim."""
+            msg = MIMEMultipart("mixed")
+            msg["From"]    = f"{FROM_NAME} <{FROM_ADDRESS}>"
+            msg["To"]      = to_email
+            msg["Subject"] = f"Partnership Proposal - RETRO x {company_name} | {expo_name}"
+            msg["Reply-To"] = FROM_ADDRESS
+
+            # Alternative container (html + plain text)
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(text_body, "plain", "utf-8"))
+            alt.attach(MIMEText(html_body, "html", "utf-8"))
+            msg.attach(alt)
+
+            # PDF attachment
+            pdf_part = MIMEApplication(pdf_bytes, _subtype="pdf")
+            pdf_part.add_header("Content-Disposition", "attachment", filename=pdf_filename)
+            msg.attach(pdf_part)
+
+            try:
+                async with aiosmtplib.SMTP(**SMTP_CONFIG, timeout=30) as smtp:
+                    await smtp.send_message(msg)
+                print(f"[SMTP] Sent to {to_email}")
+                return True
+            except aiosmtplib.SMTPException as e:
+                print(f"[SMTP] Failed to send to {to_email}: {e}")
+                return False
+
+        async def send_batch_async(email_jobs: list[dict]) -> list[bool]:
+            """Send multiple emails concurrently (max 3 at a time untuk avoid rate limit)."""
+            sem = asyncio.Semaphore(3)
+
+            async def send_with_sem(job):
+                async with sem:
+                    return await send_proposal_async(**job)
+
+            return await asyncio.gather(*[send_with_sem(j) for j in email_jobs])
+
+      expected_output: |
+        [SMTP] Sent to budi.santoso@sinarlogistik.co.id
+        [SMTP] Sent to agus.dharma@globalscm.io
+        [SMTP] Sent to rahmat@nexusdist.sg
+        Batch: 3/3 sent successfully
+
+    notes:
+      - "start_tls=True untuk port 587 (STARTTLS). Gunakan use_tls=True untuk port 465 (direct TLS)"
+      - "Gmail memerlukan App Password (bukan password biasa) jika 2FA aktif: https://myaccount.google.com/apppasswords"
+      - "Semaphore(3) membatasi max 3 concurrent SMTP connections untuk avoid rate limiting"
+      - "timeout=30 penting untuk prevent hanging jika SMTP server tidak respond"
+    pitfalls:
+      - "Gmail SMTP punya daily limit: 500 emails/hari untuk akun biasa, 2000/hari untuk Google Workspace"
+      - "JANGAN simpan SMTP password di kode, selalu gunakan environment variable"
+      - "SMTP relay bisa di-block oleh firewall di beberapa server hosting, test koneksi sebelum deploy"
+
+  - id: yagmail
+    name: "yagmail"
+    category: "Simple SMTP via Gmail (Development)"
+    description: >
+      yagmail adalah library Python yang menyederhanakan pengiriman email via Gmail SMTP.
+      Setup sangat mudah: satu baris untuk kirim email dengan attachment. Menyimpan
+      credentials securely di OS keyring (tidak di plaintext). Cocok untuk development,
+      testing, dan notifikasi internal RETRO. Tidak disarankan untuk production
+      karena bergantung pada Gmail personal account yang punya limit harian.
+    specific_function: >
+      Quick email testing selama development RETRO. Send proposal drafts ke internal
+      team untuk review sebelum setup Resend production. Juga berguna untuk notifikasi
+      director (pipeline selesai, error alert) via Gmail personal.
+    language: "Python"
+    pricing: "Free (gunakan Gmail SMTP, limit 500 emails/hari)"
+    last_updated: "2024"
+    url: "https://github.com/kootenpv/yagmail"
+    retro:
+      phase: "Development testing + Internal notifications"
+      role: >
+        Development testing email dan internal team notifications. Tidak untuk
+        sending proposal ke external partners di production.
+      when_to_use: >
+        Gunakan yagmail untuk: (1) test email template sebelum setup Resend,
+        (2) kirim notifikasi pipeline selesai ke director secara development.
+        Untuk production proposal sending, gunakan Resend.
+      priority: "development only"
+      output_goes_to: "Developer inbox untuk testing"
+    setup:
+      install: "pip install yagmail keyring"
+      requirements:
+        - "yagmail>=0.15.0"
+        - "Gmail account dengan App Password enabled"
+      env_vars:
+        - name: GMAIL_USER
+          description: "Gmail address, e.g., retro.test@gmail.com"
+        - name: GMAIL_APP_PASSWORD
+          description: "Gmail App Password (16 karakter, bukan password biasa)"
+    usage:
+      basic_example: |
+        import yagmail
+        import os
+
+        # Kirim email sederhana
+        yag = yagmail.SMTP(
+            user=os.getenv("GMAIL_USER"),
+            password=os.getenv("GMAIL_APP_PASSWORD"),
+        )
+        yag.send(
+            to="developer@company.com",
+            subject="Test Proposal Email",
+            contents=[
+                "<h1>Dear Test,</h1><p>Please review the attached proposal.</p>",
+                "/tmp/test_proposal.pdf",  # Path ke file, otomatis di-attach
+            ],
+        )
+        print("Email sent!")
+
+      retro_example: |
+        import yagmail
+        import os
+        import tempfile
+
+        def send_test_email(
+            to:           str,
+            company_name: str,
+            html_body:    str,
+            pdf_bytes:    bytes,
+        ):
+            """
+            Development testing: kirim email ke internal reviewer.
+            Jangan gunakan untuk external proposal di production.
+            """
+            # Simpan PDF sementara ke /tmp
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(pdf_bytes)
+                pdf_path = f.name
+
+            yag = yagmail.SMTP(
+                user=os.getenv("GMAIL_USER"),
+                password=os.getenv("GMAIL_APP_PASSWORD"),
+            )
+            yag.send(
+                to=to,
+                subject=f"[DEV TEST] Proposal: RETRO x {company_name}",
+                contents=[html_body, pdf_path],
+            )
+            print(f"[yagmail] Test email sent to {to}")
+
+            # Cleanup temp file
+            os.unlink(pdf_path)
+
+        def notify_director(message: str, subject: str = "RETRO Pipeline Update"):
+            """Send quick notification ke director via Gmail."""
+            yag = yagmail.SMTP(
+                user=os.getenv("GMAIL_USER"),
+                password=os.getenv("GMAIL_APP_PASSWORD"),
+            )
+            director_email = os.getenv("DIRECTOR_EMAIL", "director@company.com")
+            yag.send(to=director_email, subject=subject, contents=message)
+            print(f"[yagmail] Notified director: {subject}")
+
+      expected_output: |
+        [yagmail] Test email sent to developer@company.com
+        [yagmail] Notified director: RETRO Pipeline Update
+
+    notes:
+      - "yagmail mendukung list di contents: bisa mix HTML string dan file paths dalam satu list"
+      - "File paths di contents list otomatis di-detect sebagai attachment"
+      - "Gmail App Password diperlukan jika 2FA aktif di akun Gmail"
+      - "Gunakan Gmail account khusus untuk testing, bukan personal Gmail utama"
+    pitfalls:
+      - "JANGAN gunakan yagmail untuk production proposal sending (daily limit, not professional)"
+      - "Gmail SMTP bisa slow (2-5 detik per email) karena rate limiting"
+
+  - id: python_sendgrid
+    name: "SendGrid (Twilio)"
+    category: "Email API (Enterprise)"
+    description: >
+      SendGrid adalah email API enterprise yang diakuisisi oleh Twilio. Mendukung
+      transactional email, marketing campaigns, dynamic templates, webhook events,
+      dan analytics mendalam. Free tier: 100 emails/hari selamanya. Lebih complex
+      dari Resend tapi lebih mature dan memiliki feature lebih lengkap. Dashboard
+      SendGrid menampilkan detailed analytics: open rates, click rates, bounce rates,
+      dan spam reports per campaign.
+    specific_function: >
+      Alternative Resend untuk production email sending dengan analytics lebih
+      mendalam. Free tier 100 emails/hari cukup untuk RETRO early production.
+      Berguna jika butuh tracking open rates dan click rates proposal email.
+    language: "Python (sendgrid library)"
+    pricing: "100 emails/hari gratis selamanya, $19.95/bulan (50K emails)"
+    last_updated: "2025"
+    url: "https://sendgrid.com"
+    retro:
+      phase: "Phase 5 (Production Email) - Alternative Resend"
+      role: "Alternative Resend dengan analytics lebih mendalam (open/click tracking)"
+      when_to_use: >
+        Gunakan SendGrid jika butuh detailed email analytics (open rates, click tracking)
+        untuk mengukur effectiveness proposal RETRO. Resend lebih simple untuk pure
+        transactional sending.
+      priority: "secondary (analytics-focused)"
+      output_goes_to: "Partner inbox + SendGrid analytics dashboard"
+    setup:
+      install: "pip install sendgrid"
+      requirements:
+        - "sendgrid>=6.9.0"
+        - "SENDGRID_API_KEY dari https://app.sendgrid.com/settings/api_keys"
+        - "Sender verification untuk domain"
+      env_vars:
+        - name: SENDGRID_API_KEY
+          description: "API key dari SendGrid dashboard"
+        - name: EMAIL_FROM_ADDRESS
+          description: "Verified sender email"
+    usage:
+      basic_example: |
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+        import base64
+        import os
+
+        sg = SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+
+        message = Mail(
+            from_email=("RETRO Partnership Team", "partnership@retro.id"),
+            to_emails="budi@sinarlogistik.co.id",
+            subject="Partnership Proposal - RETRO",
+            html_content="<h1>Dear Budi,</h1><p>Please find attached...</p>",
+            plain_text_content="Dear Budi,\n\nPlease find attached...",
+        )
+
+        # Attachment
+        with open("proposal.pdf", "rb") as f:
+            pdf_data = base64.b64encode(f.read()).decode()
+
+        attachment = Attachment(
+            file_content=FileContent(pdf_data),
+            file_name=FileName("RETRO_Proposal.pdf"),
+            file_type=FileType("application/pdf"),
+            disposition=Disposition("attachment"),
+        )
+        message.attachment = attachment
+
+        response = sg.client.mail.send.post(request_body=message.get())
+        print(f"Status: {response.status_code}")  # 202 = queued for delivery
+
+      retro_example: |
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import (
+            Mail, Attachment, FileContent, FileName, FileType,
+            Disposition, TrackingSettings, OpenTracking, ClickTracking,
+        )
+        import base64
+        import os
+
+        sg = SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+
+        def send_proposal_sendgrid(
+            to_email:   str,
+            company:    dict,
+            html_body:  str,
+            text_body:  str,
+            pdf_bytes:  bytes,
+            expo_name:  str,
+        ) -> str:
+            """Return SendGrid message ID."""
+            msg = Mail(
+                from_email=("RETRO Partnership Team", os.getenv("EMAIL_FROM_ADDRESS")),
+                to_emails=to_email,
+                subject=f"Partnership Proposal - RETRO x {company['company_name']} | {expo_name}",
+                html_content=html_body,
+                plain_text_content=text_body,
+            )
+
+            # PDF Attachment
+            pdf_b64 = base64.b64encode(pdf_bytes).decode()
+            att = Attachment(
+                file_content=FileContent(pdf_b64),
+                file_name=FileName(f"RETRO_Proposal_{company['domain']}.pdf"),
+                file_type=FileType("application/pdf"),
+                disposition=Disposition("attachment"),
+            )
+            msg.attachment = att
+
+            # Enable tracking
+            tracking = TrackingSettings()
+            tracking.open_tracking   = OpenTracking(enable=True)
+            tracking.click_tracking  = ClickTracking(enable=True, enable_text=False)
+            msg.tracking_settings    = tracking
+
+            # Custom fields untuk analytics filtering
+            msg.custom_arg = {
+                "expo_name":  expo_name,
+                "company":    company["domain"],
+                "type":       "proposal",
+            }
+
+            resp = sg.client.mail.send.post(request_body=msg.get())
+            msg_id = resp.headers.get("X-Message-Id", "unknown")
+            print(f"[SendGrid] Queued: {to_email} | ID: {msg_id}")
+            return msg_id
+
+      expected_output: |
+        [SendGrid] Queued: budi@sinarlogistik.co.id | ID: abc123.filter-relay-1.sent
+        Response status: 202 (accepted for delivery)
+
+        # SendGrid Analytics (setelah beberapa hari):
+        # Email opens: 2/3 (67%)
+        # Click tracking: 1 click on proposal link
+        # Bounce: 0
+
+    notes:
+      - "Response 202 (Accepted) bukan berarti email sudah terkirim, SendGrid queue dulu sebelum deliver"
+      - "X-Message-Id di response headers adalah tracking ID untuk monitor di dashboard"
+      - "Open tracking dan click tracking memerlukan SendGrid tracking pixel di HTML email"
+      - "custom_arg memungkinkan filter analytics per expo atau company di SendGrid dashboard"
+    pitfalls:
+      - "100 emails/hari gratis habis cepat di production, siapkan upgrade plan sebelum mulai"
+      - "SendGrid memerlukan domain verification yang lebih strict dari Resend"
+      - "JANGAN enable click tracking untuk attachment links (PDF), hanya untuk body links"
+
+  - id: mailgun
+    name: "Mailgun"
+    category: "Email API"
+    description: >
+      Mailgun adalah email API yang sangat populer di kalangan developer, dimiliki
+      oleh Sinch. Mendukung sending, receiving (email routing ke webhook), dan
+      tracking. Free tier: 100 emails/hari. Berbeda dari Resend dan SendGrid,
+      Mailgun juga mendukung email receiving (bisa terima reply dan route ke webhook)
+      yang berguna untuk RETRO jika ingin tracking replies dari proposal.
+    specific_function: >
+      Email sending dengan email receiving untuk tracking replies. Ketika partner
+      reply ke proposal email, Mailgun bisa route reply ke RETRO webhook yang
+      kemudian update database (proposal_replied=True) dan notify director.
+    language: "Python (requests atau mailgun library)"
+    pricing: "100 emails/hari gratis (Flex), $35/bulan (Foundation 50K emails)"
+    last_updated: "2025"
+    url: "https://mailgun.com"
+    retro:
+      phase: "Phase 5 (Email Sending + Reply Tracking)"
+      role: >
+        Email sending dengan bonus reply tracking via webhook. Ketika partner
+        membalas proposal, Mailgun route email ke RETRO webhook untuk update
+        pipeline status.
+      when_to_use: >
+        Pertimbangkan Mailgun jika butuh reply tracking (partner reply ke proposal).
+        Untuk pure sending, Resend lebih simple. Mailgun lebih powerful untuk
+        dua-arah email flow.
+      priority: "secondary (two-way email)"
+      output_goes_to: "Partner inbox + Mailgun webhook (untuk reply tracking)"
+    setup:
+      install: "pip install requests  # Tidak ada official SDK Python yang aktif, gunakan requests"
+      requirements:
+        - "requests"
+        - "MAILGUN_API_KEY dari https://app.mailgun.com/settings/api_security"
+        - "Domain diverifikasi di Mailgun"
+      env_vars:
+        - name: MAILGUN_API_KEY
+          description: "Private API key dari Mailgun dashboard"
+        - name: MAILGUN_DOMAIN
+          description: "Verified domain di Mailgun, e.g., mg.retro.id"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        MAILGUN_KEY    = os.getenv("MAILGUN_API_KEY")
+        MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "mg.retro.id")
+
+        def send_email_mailgun(
+            to_email:  str,
+            subject:   str,
+            html_body: str,
+            text_body: str,
+            pdf_bytes: bytes,
+            filename:  str,
+        ) -> dict:
+            r = requests.post(
+                f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+                auth=("api", MAILGUN_KEY),
+                files=[("attachment", (filename, pdf_bytes, "application/pdf"))],
+                data={
+                    "from":    f"RETRO Partnership Team <partnership@{MAILGUN_DOMAIN}>",
+                    "to":      [to_email],
+                    "subject": subject,
+                    "html":    html_body,
+                    "text":    text_body,
+                    "o:tracking": True,
+                    "o:tag":   ["proposal", "retro"],
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        result = send_email_mailgun(
+            "budi@sinarlogistik.co.id",
+            "Partnership Proposal - RETRO",
+            "<h1>Dear Budi...</h1>",
+            "Dear Budi...",
+            open("proposal.pdf", "rb").read(),
+            "RETRO_Proposal.pdf",
+        )
+        print(f"Message ID: {result['id']}")
+
+      retro_example: |
+        import requests
+        import os
+        from flask import Flask, request, jsonify  # Untuk webhook receiver
+
+        MAILGUN_KEY    = os.getenv("MAILGUN_API_KEY")
+        MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN")
+
+        def send_proposal_mailgun(
+            to_email:    str,
+            company:     dict,
+            html_body:   str,
+            text_body:   str,
+            pdf_bytes:   bytes,
+            expo_name:   str,
+        ) -> str:
+            r = requests.post(
+                f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+                auth=("api", MAILGUN_KEY),
+                files=[("attachment", (
+                    f"RETRO_Proposal_{company['domain']}.pdf",
+                    pdf_bytes,
+                    "application/pdf"
+                ))],
+                data={
+                    "from":             f"RETRO Partnership Team <partnership@{MAILGUN_DOMAIN}>",
+                    "to":               [to_email],
+                    "subject":          f"Partnership Proposal - RETRO x {company['company_name']} | {expo_name}",
+                    "html":             html_body,
+                    "text":             text_body,
+                    "o:tracking":       True,
+                    "o:tracking-opens": True,
+                    "o:tracking-clicks": "yes",
+                    "o:tag":            ["proposal", expo_name, company["domain"]],
+                    "v:expo":           expo_name,
+                    "v:company":        company["domain"],
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            msg_id = r.json()["id"]
+            print(f"[Mailgun] Sent to {to_email} | ID: {msg_id}")
+            return msg_id
+
+        # Webhook untuk terima reply notifications dari Mailgun
+        # (Deploy sebagai Flask route di retro.id/webhook/mailgun)
+        def mailgun_reply_webhook(payload: dict):
+            """
+            Dipanggil Mailgun ketika ada reply ke proposal email.
+            Update database: partner replied, notify director.
+            """
+            from_email  = payload.get("sender")
+            subject     = payload.get("subject", "")
+            body_plain  = payload.get("body-plain", "")
+            company_tag = payload.get("X-Mailgun-Variables", {}).get("company")
+
+            if company_tag:
+                from retro.db import mark_proposal_replied
+                from retro.notifications import notify_director_reply
+                mark_proposal_replied(company_tag, from_email)
+                notify_director_reply(company_tag, from_email, body_plain[:500])
+                print(f"[Mailgun] Reply received from {from_email} (company: {company_tag})")
+
+      expected_output: |
+        [Mailgun] Sent to budi@sinarlogistik.co.id | ID: <20250423103045.0.abc123@mg.retro.id>
+        [Mailgun] Reply received from budi@sinarlogistik.co.id (company: sinarlogistik.co.id)
+        [Mailgun] Director notified: "Reply from PT Sinar Logistik re: Partnership Proposal"
+
+    notes:
+      - "o:tag memungkinkan filter analytics di Mailgun dashboard per expo atau company"
+      - "v:custom_var (v: prefix) adalah custom JSON variable untuk webhook payload"
+      - "Mailgun email receiving memerlukan setup MX records khusus dan route definition di dashboard"
+      - "o:tracking-opens=True menambahkan tracking pixel, o:tracking-clicks='yes' wrap links dengan tracker"
+    pitfalls:
+      - "Mailgun EU region (api.eu.mailgun.net) untuk compliance GDPR, berbeda URL dari US region"
+      - "Free tier Mailgun hanya tersedia di US region, EU region berbayar"
+      - "Webhook harus HTTPS dengan valid SSL cert untuk Mailgun"
+
+  - id: stalwart
+    name: "Stalwart Mail Server"
+    category: "Self-Hosted Email Server"
+    description: >
+      Stalwart adalah modern self-hosted email server (SMTP, IMAP, JMAP) yang ditulis
+      dalam Rust. All-in-one: tidak perlu Postfix + Dovecot + SpamAssassin terpisah.
+      Konfigurasi via TOML config atau web admin panel. Mendukung: anti-spam, DKIM
+      signing, SPF check, DMARC, TLS, dan modern JMAP protocol. Untuk RETRO yang
+      butuh zero third-party dependency dan kontrol penuh atas email infrastructure.
+    specific_function: >
+      Self-hosted SMTP server untuk RETRO yang tidak ingin bergantung pada Resend,
+      Mailgun, atau SendGrid. Deploy di VPS sendiri, zero recurring cost selain
+      server, dan data email tetap di server RETRO sendiri.
+    language: "Rust (server), Python untuk client (smtplib atau aiosmtplib)"
+    pricing: "Free (open-source), butuh VPS untuk hosting (DigitalOcean $6/bulan)"
+    last_updated: "2025"
+    url: "https://stalw.art"
+    retro:
+      phase: "Phase 5 (Email Infrastructure) - Self-hosted option"
+      role: >
+        Full self-hosted email infrastructure untuk RETRO. Deploy Stalwart di VPS,
+        setup domain MX records, dan kirim proposal via SMTP langsung dari server
+        sendiri tanpa third-party API dependency.
+      when_to_use: >
+        Pertimbangkan Stalwart ketika RETRO sudah production dan ingin reduce
+        third-party dependencies dan cost. Untuk MVP, Resend jauh lebih mudah.
+        Stalwart memerlukan email server management knowledge.
+      priority: "optional (self-hosted)"
+      output_goes_to: "Partner inbox (via self-hosted SMTP)"
+    setup:
+      install: |
+        # Download dari https://stalw.art/docs/install/
+        # Docker:
+        docker pull stalwartlabs/mail-server:latest
+        docker run -d -p 25:25 -p 587:587 -p 993:993 -p 443:443 \
+          -v /opt/stalwart:/opt/stalwart \
+          stalwartlabs/mail-server:latest
+        # Access admin panel: https://your-server/admin
+      requirements:
+        - "VPS dengan dedicated IP (bukan shared hosting)"
+        - "Port 25 tidak diblokir ISP (jarang terbuka di VPS consumer grade)"
+        - "Reverse DNS (PTR record) untuk IP server"
+        - "DNS records: MX, SPF, DKIM, DMARC"
+      env_vars:
+        - name: SMTP_HOST
+          description: "IP atau hostname VPS Stalwart"
+        - name: SMTP_PORT
+          description: "587 (STARTTLS submission port)"
+        - name: SMTP_USER
+          description: "Email account di Stalwart"
+        - name: SMTP_PASSWORD
+          description: "Password akun Stalwart"
+    usage:
+      basic_example: |
+        # Stalwart sebagai SMTP server, client menggunakan smtplib atau aiosmtplib biasa
+        # Tidak ada library khusus, connect via SMTP protocol standar
+
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        import os
+
+        def send_via_stalwart(to: str, subject: str, html: str):
+            msg = MIMEMultipart("alternative")
+            msg["From"]    = os.getenv("SMTP_USER")
+            msg["To"]      = to
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html, "html", "utf-8"))
+
+            with smtplib.SMTP(os.getenv("SMTP_HOST"), 587) as s:
+                s.starttls()
+                s.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD"))
+                s.send_message(msg)
+            print(f"Sent via Stalwart to {to}")
+
+      retro_example: |
+        # Gunakan aiosmtplib section (code sama persis) dengan SMTP_HOST pointing ke Stalwart server.
+        # Tidak ada perubahan kode, hanya ubah env vars:
+        # SMTP_HOST=your-vps-ip
+        # SMTP_PORT=587
+        # SMTP_USER=partnership@retro.id
+        # SMTP_PASSWORD=stalwart-account-password
+
+        # Kelebihan Stalwart untuk RETRO:
+        # 1. Zero cost setelah VPS setup (tidak ada per-email fee)
+        # 2. Email data tetap di server sendiri (privacy)
+        # 3. Kontrol penuh: anti-spam rules, DKIM, bounce handling
+        # 4. Bisa terima email (reply tracking tanpa webhook eksternal)
+
+        # Kekurangan:
+        # 1. Butuh setup awal yang lebih complex
+        # 2. Butuh maintain server (update, monitor)
+        # 3. Email deliverability butuh effort: warmup IP, monitor blacklists
+
+      expected_output: |
+        [Stalwart Admin Panel] https://retro-mail.id/admin
+        SMTP Status: Running | Port 25: Open | Port 587: Open
+        DKIM: Configured | SPF: Pass | DMARC: Quarantine
+        Emails sent today: 12 | Bounce rate: 0% | Spam score: 0
+
+    notes:
+      - "Port 25 untuk server-to-server delivery sering diblokir di consumer VPS (DigitalOcean, Vultr), gunakan VPS business atau dedicated server"
+      - "Email warmup penting untuk IP baru: mulai 10-20 email/hari, naikkan perlahan selama 30-60 hari"
+      - "Monitor blacklists (MXToolbox) secara rutin untuk pastikan IP tidak di-blacklist"
+      - "Stalwart admin panel sangat memudahkan config dibanding Postfix + Dovecot manual"
+    pitfalls:
+      - "Self-hosted email server butuh maintenance yang tidak trivial, hanya untuk tim yang siap"
+      - "IP baru hampir pasti perlu warmup period, email bisa masuk spam di awal"
+      - "JANGAN gunakan shared VPS IP untuk email production, IP mungkin sudah di-blacklist"

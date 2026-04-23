@@ -1,0 +1,1508 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Relational Database, Cache, Queue & Storage
+# File: 06_relational_db_cache.yaml
+# Purpose: Infrastruktur penyimpanan data untuk semua layer RETRO:
+#          - PostgreSQL: persistent relational data (companies, proposals, audit logs)
+#          - SQLite: development / lightweight deployment
+#          - SQLModel: ORM yang type-safe untuk RETRO models
+#          - Alembic: database migrations
+#          - Redis: deduplication hash cache, job queue, rate limit counter
+#          - RQ (Redis Queue): background job processing tanpa Celery overhead
+#          - Valkey: Redis fork, drop-in replacement jika ingin fully open-source
+#          - MinIO: object storage untuk PDF, HTML, gambar (S3-compatible)
+#          - DVC: version control untuk datasets dan ML artifacts
+#
+# RECOMMENDED STACK (minimal viable RETRO):
+#   Persistent DB:  PostgreSQL (production) / SQLite (development)
+#   ORM:            SQLModel + Alembic
+#   Cache + Dedup:  Redis (atau Valkey)
+#   Job Queue:      RQ (Redis Queue)
+#   Object Storage: MinIO (atau local filesystem untuk MVP)
+
+tools:
+
+  - id: postgresql
+    name: "PostgreSQL"
+    category: "Relational Database"
+    description: >
+      PostgreSQL adalah relational database open-source yang sangat powerful, battle-tested,
+      dan feature-rich. Mendukung JSONB (JSON binary yang bisa di-query dan di-index),
+      full-text search, row-level security, partitioning, dan pgvector extension (untuk
+      vector similarity search). RETRO menggunakan PostgreSQL sebagai primary persistent
+      storage untuk semua data: company staging, company profiles, proposal drafts,
+      audit logs, dan pipeline state. Tersedia sebagai Docker image, cloud managed
+      (Supabase free tier, Railway, Neon, ElephantSQL).
+    specific_function: >
+      Primary relational database RETRO. Menyimpan semua data pipeline secara persisten:
+      raw_staging (hasil crawling), company_profiles (profile cards dari Context Agent),
+      proposals (draft dan final), pipeline_runs (audit trail), dan dedup_hashes
+      (jika tidak pakai Redis). Mendukung JSONB untuk profile_card yang flexible
+      tanpa perlu migrasi schema setiap ada field baru.
+    language: "Python (psycopg2, asyncpg, SQLModel, SQLAlchemy)"
+    pricing: "Free (self-hosted), Supabase free tier 500MB, Neon free 512MB"
+    last_updated: "2025"
+    url: "https://www.postgresql.org"
+    retro:
+      phase: "Semua Phase (persistent storage)"
+      role: >
+        Backbone penyimpanan RETRO. Setiap komponen pipeline menulis dan membaca
+        dari PostgreSQL. Crawler menulis raw_staging, Context Agent membaca dari
+        raw_staging dan menulis ke company_profiles, Synthesis Agent membaca
+        company_profiles dan menulis ke proposals, Email Agent membaca dari proposals.
+      when_to_use: >
+        Gunakan PostgreSQL untuk semua data yang perlu persisten melampaui satu
+        pipeline run. Redis untuk cache sementara, PostgreSQL untuk data permanen.
+        Selalu gunakan PostgreSQL di production. Untuk development, SQLite bisa
+        digunakan sebagai substitute yang lebih ringan.
+      priority: "primary"
+      output_goes_to: "Semua komponen pipeline (read/write)"
+    setup:
+      install: "pip install psycopg2-binary asyncpg"
+      docker: "docker run -e POSTGRES_USER=retro -e POSTGRES_PASSWORD=retro -e POSTGRES_DB=retro_db -p 5432:5432 -v pgdata:/var/lib/postgresql/data postgres:16"
+      requirements:
+        - "psycopg2-binary>=2.9.0 (sync) atau asyncpg>=0.29.0 (async)"
+        - "PostgreSQL 14+ (untuk JSONB performance dan pgvector support)"
+      env_vars:
+        - name: DATABASE_URL
+          description: "postgresql://retro:retro@localhost:5432/retro_db"
+        - name: DATABASE_URL_ASYNC
+          description: "postgresql+asyncpg://retro:retro@localhost:5432/retro_db"
+    usage:
+      basic_example: |
+        import psycopg2
+        import json
+
+        conn = psycopg2.connect("postgresql://retro:retro@localhost/retro_db")
+        cur  = conn.cursor()
+
+        # Buat tabel staging
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_staging (
+                id          SERIAL PRIMARY KEY,
+                url         TEXT UNIQUE NOT NULL,
+                url_hash    TEXT UNIQUE NOT NULL,
+                source      TEXT,
+                content     TEXT,
+                crawled_at  TIMESTAMPTZ DEFAULT NOW(),
+                processed   BOOLEAN DEFAULT FALSE
+            )
+        """)
+        conn.commit()
+
+        # Insert dengan ON CONFLICT (idempotent)
+        import hashlib
+        url = "https://example.com/exhibitor/pt-maju"
+        url_hash = hashlib.sha256(url.encode()).hexdigest()
+
+        cur.execute("""
+            INSERT INTO raw_staging (url, url_hash, source, content)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (url_hash) DO NOTHING
+            RETURNING id
+        """, (url, url_hash, "expo_crawler", "<html>..."))
+        result = cur.fetchone()
+        if result:
+            print(f"Inserted: id={result[0]}")
+        else:
+            print("Already exists, skipped")
+        conn.commit()
+
+      retro_example: |
+        import psycopg2
+        import psycopg2.extras
+        import hashlib
+        import json
+        import os
+        from datetime import datetime, timezone
+
+        DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://retro:retro@localhost/retro_db")
+        _conn = None
+
+        def get_db():
+            global _conn
+            if _conn is None or _conn.closed:
+                _conn = psycopg2.connect(DATABASE_URL)
+                _conn.autocommit = False
+                psycopg2.extras.register_default_jsonb(_conn)
+                _init_schema(_conn)
+            return _conn
+
+        def _init_schema(conn):
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS raw_staging (
+                    id          SERIAL PRIMARY KEY,
+                    url         TEXT UNIQUE NOT NULL,
+                    url_hash    CHAR(64) UNIQUE NOT NULL,
+                    domain      TEXT,
+                    source      TEXT,
+                    content     TEXT,
+                    metadata    JSONB DEFAULT '{}',
+                    crawled_at  TIMESTAMPTZ DEFAULT NOW(),
+                    processed   BOOLEAN DEFAULT FALSE
+                );
+
+                CREATE TABLE IF NOT EXISTS company_profiles (
+                    id              SERIAL PRIMARY KEY,
+                    domain          TEXT UNIQUE NOT NULL,
+                    company_name    TEXT NOT NULL,
+                    industry        TEXT,
+                    country         TEXT,
+                    expo            TEXT,
+                    profile_card    JSONB NOT NULL,
+                    profiled_at     TIMESTAMPTZ DEFAULT NOW(),
+                    embedding_id    TEXT,
+                    proposal_sent   BOOLEAN DEFAULT FALSE
+                );
+
+                CREATE TABLE IF NOT EXISTS proposals (
+                    id              SERIAL PRIMARY KEY,
+                    company_domain  TEXT REFERENCES company_profiles(domain),
+                    expo            TEXT,
+                    draft_html      TEXT,
+                    final_pdf_path  TEXT,
+                    status          TEXT DEFAULT 'draft',
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    sent_at         TIMESTAMPTZ,
+                    email_to        TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS pipeline_runs (
+                    id          SERIAL PRIMARY KEY,
+                    run_id      UUID DEFAULT gen_random_uuid(),
+                    phase       TEXT,
+                    status      TEXT,
+                    details     JSONB DEFAULT '{}',
+                    started_at  TIMESTAMPTZ DEFAULT NOW(),
+                    ended_at    TIMESTAMPTZ
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_raw_staging_processed ON raw_staging(processed);
+                CREATE INDEX IF NOT EXISTS idx_company_profiles_expo  ON company_profiles(expo);
+                CREATE INDEX IF NOT EXISTS idx_proposals_status       ON proposals(status);
+            """)
+            conn.commit()
+
+        def upsert_raw_staging(url: str, source: str, content: str, metadata: dict = None) -> bool:
+            """Return True jika inserted (baru), False jika sudah ada (duplikat)."""
+            conn = get_db()
+            cur  = conn.cursor()
+            url_hash = hashlib.sha256(url.encode()).hexdigest()
+
+            import tldextract
+            ext    = tldextract.extract(url)
+            domain = f"{ext.domain}.{ext.suffix}"
+
+            cur.execute("""
+                INSERT INTO raw_staging (url, url_hash, domain, source, content, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (url_hash) DO NOTHING
+                RETURNING id
+            """, (url, url_hash, domain, source, content, json.dumps(metadata or {})))
+
+            result = cur.fetchone()
+            conn.commit()
+            return result is not None  # True = baru, False = duplikat
+
+        def get_unprocessed_staging(limit: int = 50) -> list[dict]:
+            conn = get_db()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT id, url, domain, source, content, metadata
+                FROM raw_staging
+                WHERE processed = FALSE
+                ORDER BY crawled_at ASC
+                LIMIT %s
+            """, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+        def mark_staged_processed(staging_ids: list[int]):
+            conn = get_db()
+            cur  = conn.cursor()
+            cur.execute(
+                "UPDATE raw_staging SET processed = TRUE WHERE id = ANY(%s)",
+                (staging_ids,)
+            )
+            conn.commit()
+
+        def upsert_company_profile(profile_card: dict, expo: str, embedding_id: str = None):
+            conn = get_db()
+            cur  = conn.cursor()
+            cur.execute("""
+                INSERT INTO company_profiles
+                    (domain, company_name, industry, country, expo, profile_card, embedding_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (domain) DO UPDATE SET
+                    profile_card = EXCLUDED.profile_card,
+                    profiled_at  = NOW(),
+                    expo         = EXCLUDED.expo,
+                    embedding_id = COALESCE(EXCLUDED.embedding_id, company_profiles.embedding_id)
+            """, (
+                profile_card["domain"],
+                profile_card["company_name"],
+                profile_card.get("industry"),
+                profile_card.get("country"),
+                expo,
+                json.dumps(profile_card),
+                embedding_id,
+            ))
+            conn.commit()
+
+        def get_top_candidates(expo: str, limit: int = 20) -> list[dict]:
+            """Ambil company profiles yang belum dikirim proposal, diurut by profiled_at."""
+            conn = get_db()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT domain, company_name, industry, profile_card
+                FROM company_profiles
+                WHERE expo = %s AND proposal_sent = FALSE
+                ORDER BY profiled_at DESC
+                LIMIT %s
+            """, (expo, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+      expected_output: |
+        [DB] Schema initialized: raw_staging, company_profiles, proposals, pipeline_runs
+        [DB] Inserted new staging entry: https://logisea2025.com/exhibitors/pt-sinar
+        [DB] Duplicate skipped: https://logisea2025.com/exhibitors/pt-sinar
+        [DB] Upserted company profile: PT Sinar Logistik Nusantara (sinarlogistik.co.id)
+        [DB] 12 unprocessed staging entries retrieved
+
+    notes:
+      - "ON CONFLICT DO NOTHING / DO UPDATE adalah pola idempotent yang aman, pipeline bisa restart tanpa duplikasi data"
+      - "JSONB profile_card memungkinkan query JSON langsung: profile_card->>'company_name', profile_card @> '{\"industry\": \"logistics\"}'"
+      - "gen_random_uuid() memerlukan PostgreSQL 13+ atau extension pgcrypto di versi lama"
+      - "psycopg2.extras.RealDictCursor mengembalikan rows sebagai dict, tidak perlu mapping manual"
+      - "Supabase free tier (500MB) sudah cukup untuk RETRO MVP dengan ratusan perusahaan"
+      - "Gunakan connection pooling (PgBouncer atau psycopg2 ThreadedConnectionPool) untuk production dengan banyak concurrent workers"
+    pitfalls:
+      - "JANGAN buka connection baru setiap fungsi dipanggil, gunakan singleton connection dengan reconnect logic"
+      - "JANGAN commit dalam loop per-row, batch commit setiap N rows untuk performance"
+      - "JANGAN simpan binary file (PDF, gambar) di PostgreSQL TEXT atau BYTEA, simpan di MinIO dan simpan path di DB"
+      - "autocommit=False berarti harus panggil conn.commit() setelah setiap write operation"
+      - "psycopg2 tidak thread-safe, gunakan connection pool atau buat connection per thread/worker"
+
+  - id: sqlite
+    name: "SQLite"
+    category: "Relational Database (Embedded)"
+    description: >
+      SQLite adalah embedded relational database yang menyimpan seluruh database
+      dalam satu file. Tidak memerlukan server, zero-configuration, built-in di Python
+      standard library (sqlite3). Sangat cocok untuk development RETRO dan single-machine
+      deployment. Mendukung WAL mode untuk concurrent reads yang lebih baik. Tidak cocok
+      untuk multi-machine deployment atau high-concurrency writes.
+    specific_function: >
+      Database untuk development dan testing RETRO secara lokal tanpa Docker atau
+      PostgreSQL server. Cukup satu file .db untuk semua data pipeline. Bisa
+      digunakan untuk production jika RETRO berjalan di satu mesin dengan traffic rendah.
+    language: "Python (built-in sqlite3, atau SQLite via SQLModel)"
+    pricing: "Free (public domain)"
+    last_updated: "2025"
+    url: "https://www.sqlite.org"
+    retro:
+      phase: "Semua Phase (development mode)"
+      role: >
+        Drop-in replacement PostgreSQL untuk development. Schema sama, kode hampir
+        sama. Switch ke PostgreSQL untuk production hanya dengan mengubah DATABASE_URL.
+      when_to_use: >
+        Gunakan SQLite ketika developing RETRO di laptop tanpa Docker. Juga bisa
+        digunakan untuk production jika: single machine, < 100 companies per run,
+        tidak ada concurrent writes dari multiple workers.
+      priority: "secondary (development)"
+      output_goes_to: "Sama dengan PostgreSQL (development mode)"
+    setup:
+      install: "# Sudah built-in Python, tidak perlu install"
+      requirements:
+        - "Python 3.8+ (sqlite3 built-in)"
+        - "aiosqlite (untuk async): pip install aiosqlite"
+      env_vars:
+        - name: DATABASE_URL
+          description: "sqlite:///./retro_dev.db (SQLite) atau postgresql://... (PostgreSQL)"
+    usage:
+      basic_example: |
+        import sqlite3
+        import json
+        import hashlib
+
+        conn = sqlite3.connect("retro_dev.db")
+        conn.row_factory = sqlite3.Row  # Akses kolom by name
+        cur  = conn.cursor()
+
+        # Aktifkan WAL mode untuk better concurrency
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA foreign_keys=ON")
+
+        # Schema sama dengan PostgreSQL (beberapa tipe berbeda)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_staging (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                url         TEXT UNIQUE NOT NULL,
+                url_hash    TEXT UNIQUE NOT NULL,
+                domain      TEXT,
+                source      TEXT,
+                content     TEXT,
+                metadata    TEXT DEFAULT '{}',  -- JSON as TEXT di SQLite
+                crawled_at  TEXT DEFAULT (datetime('now')),
+                processed   INTEGER DEFAULT 0   -- Boolean as INTEGER
+            )
+        """)
+        conn.commit()
+
+        # Insert
+        url = "https://example.com/exhibitor"
+        cur.execute("""
+            INSERT OR IGNORE INTO raw_staging (url, url_hash, source, content)
+            VALUES (?, ?, ?, ?)
+        """, (url, hashlib.sha256(url.encode()).hexdigest(), "crawler", "<html>"))
+        conn.commit()
+
+        # Query
+        cur.execute("SELECT * FROM raw_staging WHERE processed = 0 LIMIT 10")
+        rows = [dict(r) for r in cur.fetchall()]
+        print(rows)
+
+      retro_example: |
+        import sqlite3
+        import json
+        import hashlib
+        import os
+
+        DB_PATH = os.getenv("SQLITE_PATH", "./retro_dev.db")
+        _conn = None
+
+        def get_sqlite():
+            global _conn
+            if _conn is None:
+                _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+                _conn.row_factory = sqlite3.Row
+                _conn.execute("PRAGMA journal_mode=WAL")
+                _conn.execute("PRAGMA synchronous=NORMAL")
+                _conn.execute("PRAGMA foreign_keys=ON")
+                _init_sqlite_schema(_conn)
+            return _conn
+
+        def _init_sqlite_schema(conn):
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS raw_staging (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url         TEXT UNIQUE NOT NULL,
+                    url_hash    TEXT UNIQUE NOT NULL,
+                    domain      TEXT,
+                    source      TEXT,
+                    content     TEXT,
+                    metadata    TEXT DEFAULT '{}',
+                    crawled_at  TEXT DEFAULT (datetime('now', 'utc')),
+                    processed   INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS company_profiles (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain          TEXT UNIQUE NOT NULL,
+                    company_name    TEXT NOT NULL,
+                    industry        TEXT,
+                    country         TEXT,
+                    expo            TEXT,
+                    profile_card    TEXT NOT NULL,
+                    profiled_at     TEXT DEFAULT (datetime('now', 'utc')),
+                    proposal_sent   INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS proposals (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_domain  TEXT,
+                    expo            TEXT,
+                    draft_html      TEXT,
+                    final_pdf_path  TEXT,
+                    status          TEXT DEFAULT 'draft',
+                    created_at      TEXT DEFAULT (datetime('now', 'utc'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_staging_processed ON raw_staging(processed);
+            """)
+            conn.commit()
+
+        def upsert_raw_staging_sqlite(url: str, source: str, content: str) -> bool:
+            conn = get_sqlite()
+            url_hash = hashlib.sha256(url.encode()).hexdigest()
+            cur  = conn.execute("""
+                INSERT OR IGNORE INTO raw_staging (url, url_hash, source, content)
+                VALUES (?, ?, ?, ?)
+            """, (url, url_hash, source, content))
+            conn.commit()
+            return cur.rowcount > 0
+
+      expected_output: |
+        [SQLite] Database initialized: retro_dev.db (WAL mode)
+        [SQLite] Schema ready: raw_staging, company_profiles, proposals
+        [SQLite] Inserted: https://logisea2025.com/exhibitors/pt-sinar
+        [SQLite] Skipped (duplicate): https://logisea2025.com/exhibitors/pt-sinar
+
+    notes:
+      - "WAL mode (PRAGMA journal_mode=WAL) memungkinkan concurrent readers saat writer aktif, WAJIB diaktifkan"
+      - "SQLite menggunakan ? sebagai placeholder, PostgreSQL menggunakan %s. SQLModel/SQLAlchemy abstraksi ini"
+      - "SQLite tidak mendukung BOOLEAN native, gunakan INTEGER 0/1. Tidak mendukung JSONB, simpan JSON sebagai TEXT"
+      - "check_same_thread=False diperlukan untuk multi-thread access, tapi HATI-HATI dengan concurrent writes"
+      - "Untuk switch ke PostgreSQL, hanya ganti DATABASE_URL dan beberapa sintaks (INSERT OR IGNORE -> INSERT ... ON CONFLICT)"
+    pitfalls:
+      - "SQLite tidak cocok untuk concurrent writes dari multiple processes/threads secara bersamaan"
+      - "JANGAN gunakan SQLite jika Celery atau RQ workers berjalan di multiple processes"
+      - "File .db harus di-backup manual karena tidak ada built-in replication"
+
+  - id: sqlmodel
+    name: "SQLModel"
+    category: "ORM (Object-Relational Mapper)"
+    description: >
+      SQLModel adalah ORM Python yang dibuat oleh creator FastAPI (Sebastian Ramirez).
+      Menggabungkan Pydantic v2 (data validation) dengan SQLAlchemy (database ORM)
+      dalam satu definisi class. Model RETRO didefinisikan sekali dan otomatis berlaku
+      sebagai Pydantic model (untuk API response/request validation) DAN SQLAlchemy
+      model (untuk database operations). Mendukung PostgreSQL, MySQL, dan SQLite.
+      Code lebih type-safe dan lebih sedikit boilerplate dibanding SQLAlchemy pure.
+    specific_function: >
+      Type-safe ORM untuk RETRO database models. Company, Proposal, PipelineRun
+      didefinisikan sebagai SQLModel class yang otomatis generate tabel schema,
+      validasi input, dan serialisasi ke JSON untuk API. Mengurangi bug karena
+      type missmatch antar layer pipeline.
+    language: "Python"
+    pricing: "Free (open-source, MIT)"
+    last_updated: "2025"
+    url: "https://sqlmodel.tiangolo.com"
+    retro:
+      phase: "Semua Phase (ORM layer)"
+      role: >
+        Definisi model data RETRO yang type-safe. Semua operasi DB melalui SQLModel
+        session untuk konsistensi dan type safety. Juga berfungsi sebagai Pydantic
+        model untuk serialisasi Company Profile Card ke/dari JSON.
+      when_to_use: >
+        Gunakan SQLModel untuk semua interaksi database di RETRO kecuali raw query
+        yang sangat complex (gunakan SQLAlchemy text() atau psycopg2 langsung untuk
+        itu). Definisikan model sekali, gunakan di seluruh pipeline.
+      priority: "primary (ORM layer)"
+      output_goes_to: "PostgreSQL / SQLite (via SQLAlchemy engine)"
+    setup:
+      install: "pip install sqlmodel psycopg2-binary"
+      requirements:
+        - "sqlmodel>=0.0.18"
+        - "psycopg2-binary (untuk PostgreSQL)"
+      env_vars:
+        - name: DATABASE_URL
+          description: "postgresql://retro:retro@localhost/retro_db atau sqlite:///./retro.db"
+    usage:
+      basic_example: |
+        from sqlmodel import SQLModel, Field, Session, create_engine, select
+        from typing import Optional
+        from datetime import datetime
+
+        # Definisi model
+        class Company(SQLModel, table=True):
+            id:           Optional[int] = Field(default=None, primary_key=True)
+            domain:       str = Field(unique=True, index=True)
+            company_name: str
+            industry:     Optional[str] = None
+            profiled_at:  datetime = Field(default_factory=datetime.utcnow)
+
+        # Setup engine
+        engine = create_engine("postgresql://retro:retro@localhost/retro_db")
+        SQLModel.metadata.create_all(engine)  # Create tables
+
+        # Insert
+        with Session(engine) as session:
+            company = Company(domain="maju.co.id", company_name="PT Maju", industry="logistics")
+            session.add(company)
+            session.commit()
+            session.refresh(company)
+            print(f"ID: {company.id}")
+
+        # Query
+        with Session(engine) as session:
+            results = session.exec(select(Company).where(Company.industry == "logistics")).all()
+            for c in results:
+                print(c.company_name, c.domain)
+
+      retro_example: |
+        from sqlmodel import SQLModel, Field, Session, create_engine, select, JSON, Column
+        from sqlalchemy import Text
+        from typing import Optional, Any
+        from datetime import datetime
+        import json
+        import os
+
+        DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://retro:retro@localhost/retro_db")
+        engine = create_engine(DATABASE_URL, echo=False)
+
+        class RawStaging(SQLModel, table=True):
+            __tablename__ = "raw_staging_orm"
+            id:         Optional[int] = Field(default=None, primary_key=True)
+            url:        str = Field(unique=True)
+            url_hash:   str = Field(unique=True)
+            domain:     Optional[str] = None
+            source:     Optional[str] = None
+            content:    Optional[str] = Field(default=None, sa_column=Column(Text))
+            processed:  bool = Field(default=False)
+            crawled_at: datetime = Field(default_factory=datetime.utcnow)
+
+        class CompanyProfile(SQLModel, table=True):
+            __tablename__ = "company_profiles_orm"
+            id:             Optional[int] = Field(default=None, primary_key=True)
+            domain:         str = Field(unique=True, index=True)
+            company_name:   str
+            industry:       Optional[str] = None
+            country:        Optional[str] = None
+            expo:           Optional[str] = Field(default=None, index=True)
+            profile_card:   str = Field(sa_column=Column(Text))  # JSON string
+            proposal_sent:  bool = Field(default=False)
+            profiled_at:    datetime = Field(default_factory=datetime.utcnow)
+
+            def get_card(self) -> dict:
+                return json.loads(self.profile_card)
+
+        class Proposal(SQLModel, table=True):
+            id:             Optional[int] = Field(default=None, primary_key=True)
+            company_domain: str = Field(index=True)
+            expo:           Optional[str] = None
+            draft_html:     Optional[str] = Field(default=None, sa_column=Column(Text))
+            final_pdf_path: Optional[str] = None
+            status:         str = Field(default="draft")
+            email_to:       Optional[str] = None
+            created_at:     datetime = Field(default_factory=datetime.utcnow)
+            sent_at:        Optional[datetime] = None
+
+        def init_db():
+            SQLModel.metadata.create_all(engine)
+
+        def get_unprocessed(limit: int = 50) -> list[RawStaging]:
+            with Session(engine) as session:
+                return session.exec(
+                    select(RawStaging)
+                    .where(RawStaging.processed == False)
+                    .order_by(RawStaging.crawled_at)
+                    .limit(limit)
+                ).all()
+
+        def upsert_company(profile_card: dict, expo: str):
+            with Session(engine) as session:
+                existing = session.exec(
+                    select(CompanyProfile).where(CompanyProfile.domain == profile_card["domain"])
+                ).first()
+                if existing:
+                    existing.profile_card = json.dumps(profile_card)
+                    existing.expo         = expo
+                    existing.profiled_at  = datetime.utcnow()
+                    session.add(existing)
+                else:
+                    company = CompanyProfile(
+                        domain=profile_card["domain"],
+                        company_name=profile_card["company_name"],
+                        industry=profile_card.get("industry"),
+                        country=profile_card.get("country"),
+                        expo=expo,
+                        profile_card=json.dumps(profile_card),
+                    )
+                    session.add(company)
+                session.commit()
+
+        def get_candidates_for_expo(expo: str, limit: int = 20) -> list[CompanyProfile]:
+            with Session(engine) as session:
+                return session.exec(
+                    select(CompanyProfile)
+                    .where(CompanyProfile.expo == expo)
+                    .where(CompanyProfile.proposal_sent == False)
+                    .limit(limit)
+                ).all()
+
+      expected_output: |
+        [SQLModel] Tables created: raw_staging_orm, company_profiles_orm, proposals
+        [SQLModel] Upserted: PT Sinar Logistik (sinarlogistik.co.id)
+        [SQLModel] Found 12 candidates for expo LogiSEA 2025
+
+    notes:
+      - "table=True membuat class menjadi database table. Tanpa table=True, class hanya Pydantic model (tidak membuat tabel)"
+      - "SQLModel session sebaiknya dibuka dengan 'with Session(engine) as session:' agar otomatis closed"
+      - "profile_card disimpan sebagai JSON string (Text column) bukan JSONB karena SQLModel tidak native support JSONB. Untuk JSONB gunakan psycopg2 langsung atau SQLAlchemy sa.Column(JSONB)"
+      - "get_card() method di CompanyProfile adalah convenience method untuk deserialize JSON string ke dict"
+      - "SQLModel menggunakan SQLAlchemy di balik layar, bisa mix SQLAlchemy core query jika SQLModel query tidak cukup expressif"
+    pitfalls:
+      - "JANGAN import SQLModel table model dan Pydantic model dengan nama yang sama di file yang sama"
+      - "session.refresh() diperlukan setelah commit jika ingin akses autoincrement ID atau default values"
+      - "Upsert di SQLModel tidak se-elegant PostgreSQL ON CONFLICT, harus query existing dulu kemudian update atau insert"
+      - "SQLModel cukup baru, beberapa fitur SQLAlchemy advanced mungkin butuh workaround"
+
+  - id: alembic
+    name: "Alembic"
+    category: "Database Migration Tool"
+    description: >
+      Alembic adalah database migration tool untuk SQLAlchemy (dan SQLModel yang
+      berbasis SQLAlchemy). Mengelola perubahan schema database (tambah kolom, ubah
+      tipe, buat index) melalui versioned migration scripts. Setiap perubahan schema
+      RETRO (misal: tambah kolom embedding_quality ke company_profiles) dibuat sebagai
+      migration file yang bisa di-apply dan di-rollback. Wajib digunakan di production
+      untuk menghindari data loss saat update schema.
+    specific_function: >
+      Version control untuk database schema RETRO. Setiap kali ada perubahan model
+      SQLModel, generate migration dengan alembic revision --autogenerate. Apply ke
+      production dengan alembic upgrade head. Rollback dengan alembic downgrade -1.
+    language: "Python (CLI + Python migration scripts)"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://alembic.sqlalchemy.org"
+    retro:
+      phase: "Infrastructure (schema management)"
+      role: >
+        Mengelola evolusi schema database RETRO seiring pipeline berkembang.
+        Setiap penambahan fitur yang memerlukan perubahan schema (kolom baru,
+        tabel baru, index baru) di-track sebagai migration file yang bisa
+        di-apply secara incremental ke database production.
+      when_to_use: >
+        Gunakan Alembic dari awal project. Setiap kali mengubah SQLModel class
+        (tambah/hapus/ubah field), buat migration baru dan apply ke database.
+        Jangan langsung CREATE TABLE manual di production.
+      priority: "primary (schema management)"
+      output_goes_to: "PostgreSQL (schema changes)"
+    setup:
+      install: "pip install alembic"
+      init: |
+        # Inisialisasi Alembic di root project
+        alembic init alembic
+        # Edit alembic.ini: ganti sqlalchemy.url = postgresql://retro:retro@localhost/retro_db
+        # Edit alembic/env.py: tambahkan import SQLModel dan set target_metadata
+      requirements:
+        - "alembic>=1.13.0"
+        - "sqlmodel atau sqlalchemy"
+      env_vars:
+        - name: DATABASE_URL
+          description: "Diset di alembic.ini atau via env variable di alembic/env.py"
+    usage:
+      basic_example: |
+        # Setup env.py untuk autogenerate (tambahkan di alembic/env.py):
+        from sqlmodel import SQLModel
+        from retro.models import CompanyProfile, RawStaging, Proposal  # Import semua models
+        target_metadata = SQLModel.metadata
+
+        # CLI commands:
+        alembic revision --autogenerate -m "add company profiles table"
+        alembic upgrade head    # Apply semua migration yang belum di-apply
+        alembic downgrade -1    # Rollback satu migration
+        alembic history         # Lihat history migrations
+        alembic current         # Lihat migration yang sedang aktif
+
+      retro_example: |
+        # alembic/env.py (konfigurasi untuk RETRO)
+        import os
+        from logging.config import fileConfig
+        from sqlalchemy import engine_from_config, pool
+        from alembic import context
+        from sqlmodel import SQLModel
+
+        # Import SEMUA models agar autogenerate bisa detect perubahan
+        from retro.models import RawStaging, CompanyProfile, Proposal, PipelineRun
+
+        config = context.config
+        fileConfig(config.config_file_name)
+
+        # Override URL dari environment variable
+        database_url = os.getenv("DATABASE_URL")
+        if database_url:
+            config.set_main_option("sqlalchemy.url", database_url)
+
+        target_metadata = SQLModel.metadata
+
+        def run_migrations_online():
+            connectable = engine_from_config(
+                config.get_section(config.config_ini_section),
+                prefix="sqlalchemy.",
+                poolclass=pool.NullPool,
+            )
+            with connectable.connect() as connection:
+                context.configure(connection=connection, target_metadata=target_metadata)
+                with context.begin_transaction():
+                    context.run_migrations()
+
+        if context.is_offline_mode():
+            run_migrations_offline()
+        else:
+            run_migrations_online()
+
+        # Contoh migration file yang dihasilkan:
+        # alembic/versions/20250423_add_embedding_quality.py
+        def upgrade():
+            op.add_column('company_profiles_orm',
+                sa.Column('embedding_quality', sa.Float(), nullable=True)
+            )
+            op.create_index('idx_embedding_quality', 'company_profiles_orm', ['embedding_quality'])
+
+        def downgrade():
+            op.drop_index('idx_embedding_quality')
+            op.drop_column('company_profiles_orm', 'embedding_quality')
+
+      expected_output: |
+        $ alembic revision --autogenerate -m "add embedding quality column"
+        INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+        INFO  [alembic.autogenerate.compare] Detected added column 'company_profiles_orm.embedding_quality'
+        Generating /retro/alembic/versions/20250423_a1b2c3d4_add_embedding_quality_column.py ... done
+
+        $ alembic upgrade head
+        INFO  [alembic.runtime.migration] Running upgrade -> a1b2c3d4, add embedding quality column
+        INFO  [alembic.runtime.migration] Done
+
+    notes:
+      - "Selalu import SEMUA SQLModel models di env.py agar autogenerate bisa detect semua perubahan"
+      - "alembic revision --autogenerate TIDAK selalu sempurna untuk perubahan complex (rename kolom, custom type). Review migration file sebelum apply"
+      - "alembic upgrade head bisa dijalankan di startup aplikasi untuk auto-migrate, tapi hati-hati di production"
+      - "Simpan alembic/versions/ di git untuk track history schema changes"
+    pitfalls:
+      - "JANGAN edit migration file yang sudah di-apply ke production. Buat migration baru untuk correction"
+      - "autogenerate tidak detect perubahan pada fungsi atau trigger PostgreSQL, tambahkan manual"
+      - "JANGAN lupa jalankan alembic upgrade head setelah deploy ke server baru"
+
+  - id: redis
+    name: "Redis"
+    category: "In-Memory Cache & Message Broker"
+    description: >
+      Redis adalah in-memory data store open-source yang sangat cepat. RETRO
+      menggunakan Redis untuk tiga fungsi utama: (1) URL deduplication hash store
+      - SET SHA256(url) dengan TTL 30 hari untuk cek duplicate crawler, (2) rate
+      limit counter - INCR dengan TTL untuk limit request ke external APIs,
+      (3) job queue backend untuk RQ worker. Redis mendukung berbagai struktur data:
+      strings, hashes, sets, sorted sets, lists, streams. Tersedia sebagai Docker
+      image, Redis Cloud (free 30MB), dan Upstash (serverless, free tier).
+    specific_function: >
+      Three fungsi utama di RETRO: (1) Deduplication gate: SISMEMBER url_hashes SHA256(url)
+      sebelum crawl, SADD url_hashes SHA256(url) setelah crawl. (2) Rate limiting:
+      INCR api:virustotal:count dengan EXPIRE 86400. (3) Job queue backend untuk
+      RQ worker yang memproses company profiling dan proposal generation.
+    language: "Python (redis-py, hiredis)"
+    pricing: "Free (self-hosted), Redis Cloud free 30MB, Upstash free 10K requests/hari"
+    last_updated: "2025"
+    url: "https://redis.io"
+    retro:
+      phase: "Phase 1 (Dedup) + Phase 2 (Rate Limit) + Phase 3-5 (Job Queue)"
+      role: >
+        Tiga peran kritis: Pertama, deduplication gate di setiap entry point crawler
+        (URL hash + content hash). Kedua, rate limit counter untuk API calls yang
+        terbatas (VirusTotal 500/hari, NewsAPI 100/hari). Ketiga, job queue backend
+        untuk RQ workers yang menjalankan Context Agent dan Proposal Writer secara
+        background.
+      when_to_use: >
+        Redis harus selalu running selama RETRO pipeline aktif. Tanpa Redis, dedup
+        tidak berjalan dan RQ worker tidak bisa receive jobs. Jika Redis down, crawler
+        akan berjalan tanpa dedup (risiko duplikat) dan background jobs tidak diproses.
+      priority: "primary (critical infrastructure)"
+      output_goes_to: "RQ workers (jobs), PostgreSQL (setelah dedup pass)"
+    setup:
+      install: "pip install redis hiredis"
+      docker: "docker run -p 6379:6379 -v redis_data:/data redis:7-alpine redis-server --appendonly yes"
+      requirements:
+        - "redis>=5.0.0"
+        - "hiredis>=2.0.0 (C parser, 5-10x lebih cepat dari pure Python parser)"
+      env_vars:
+        - name: REDIS_URL
+          description: "redis://localhost:6379/0 (production) atau redis://redis:6379/0 (Docker network)"
+        - name: REDIS_PASSWORD
+          description: "Password Redis jika menggunakan AUTH, kosongkan untuk dev"
+    usage:
+      basic_example: |
+        import redis
+        import hashlib
+
+        r = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+
+        # Ping test
+        print(r.ping())  # True
+
+        # Dedup: cek dan set URL hash
+        url = "https://example.com/exhibitor/pt-maju"
+        url_hash = hashlib.sha256(url.encode()).hexdigest()
+
+        # SETNX = Set if Not eXists (atomic check-and-set)
+        is_new = r.set(f"dedup:url:{url_hash}", "1", nx=True, ex=86400 * 30)  # 30 hari TTL
+        if is_new:
+            print("New URL, process it")
+        else:
+            print("Duplicate, skip")
+
+        # Rate limiting
+        key = "ratelimit:virustotal:daily"
+        count = r.incr(key)
+        if count == 1:
+            r.expire(key, 86400)  # Set TTL 24 jam pada first increment
+        print(f"VirusTotal calls today: {count}/500")
+
+        # Sorted set untuk priority queue
+        r.zadd("crawl_queue", {"https://example.com": 1.0})  # score = priority
+        url = r.zpopmin("crawl_queue", count=1)  # Ambil priority terendah
+
+      retro_example: |
+        import redis
+        import hashlib
+        import os
+        from functools import wraps
+
+        REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _redis_client = None
+
+        # API rate limits configuration
+        API_LIMITS = {
+            "virustotal": {"daily": 500, "minute": 4},
+            "newsapi":    {"daily": 100, "minute": 5},
+            "hunter_io":  {"monthly": 25, "minute": 1},
+            "gdelt":      {"daily": 999999, "minute": 60},
+        }
+
+        def get_redis() -> redis.Redis:
+            global _redis_client
+            if _redis_client is None:
+                _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            return _redis_client
+
+        def is_url_duplicate(url: str, ttl_days: int = 30) -> bool:
+            """
+            Atomic check-and-set: return True jika URL sudah pernah diproses.
+            False = URL baru, sudah di-mark sebagai processed.
+            """
+            r = get_redis()
+            url_hash = hashlib.sha256(url.encode()).hexdigest()
+            key      = f"dedup:url:{url_hash}"
+
+            # SET NX (Set if Not Exists) adalah atomic operation
+            is_new = r.set(key, "1", nx=True, ex=ttl_days * 86400)
+            return not is_new  # is_new=True berarti baru diset = BUKAN duplikat
+
+        def is_content_duplicate(content: str, ttl_days: int = 7) -> bool:
+            """Cek duplikat berdasarkan content hash, bukan URL (detect mirror pages)."""
+            r = get_redis()
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            key          = f"dedup:content:{content_hash}"
+            is_new = r.set(key, "1", nx=True, ex=ttl_days * 86400)
+            return not is_new
+
+        def check_rate_limit(api_name: str, period: str = "daily") -> tuple[bool, int]:
+            """
+            Return (is_allowed: bool, current_count: int).
+            True = masih dalam batas, False = limit tercapai.
+            """
+            r = get_redis()
+            limit = API_LIMITS.get(api_name, {}).get(period, 1000)
+            ttl   = 86400 if period == "daily" else (3600 if period == "hourly" else 60)
+            key   = f"ratelimit:{api_name}:{period}"
+
+            pipe = r.pipeline()
+            pipe.incr(key)
+            pipe.ttl(key)
+            count, remaining_ttl = pipe.execute()
+
+            if remaining_ttl == -1:  # Key baru, belum ada TTL
+                r.expire(key, ttl)
+
+            is_allowed = count <= limit
+            if not is_allowed:
+                print(f"[RateLimit] {api_name} {period} limit reached: {count}/{limit}")
+            return is_allowed, count
+
+        def get_rate_limit_stats() -> dict:
+            """Dashboard: lihat usage semua API."""
+            r = get_redis()
+            stats = {}
+            for api_name, limits in API_LIMITS.items():
+                stats[api_name] = {}
+                for period, limit in limits.items():
+                    key   = f"ratelimit:{api_name}:{period}"
+                    count = int(r.get(key) or 0)
+                    stats[api_name][period] = {"used": count, "limit": limit, "remaining": limit - count}
+            return stats
+
+        def cache_set(key: str, value: str, ttl_seconds: int = 3600):
+            """General purpose cache untuk hasil API yang bisa di-reuse."""
+            get_redis().set(f"cache:{key}", value, ex=ttl_seconds)
+
+        def cache_get(key: str) -> str | None:
+            return get_redis().get(f"cache:{key}")
+
+        # Contoh penggunaan di crawler
+        def should_crawl_url(url: str) -> bool:
+            if is_url_duplicate(url):
+                print(f"[Dedup] Skipped (seen before): {url}")
+                return False
+            return True
+
+      expected_output: |
+        [Redis] ping: True
+        [Dedup] New URL, processing: https://logisea2025.com/exhibitors/pt-sinar
+        [Dedup] Skipped (seen before): https://logisea2025.com/exhibitors/pt-sinar
+
+        Rate limit stats:
+        {
+          "virustotal": {"daily": {"used": 47, "limit": 500, "remaining": 453}},
+          "newsapi":    {"daily": {"used": 12, "limit": 100, "remaining": 88}},
+          "hunter_io":  {"monthly": {"used": 3, "limit": 25, "remaining": 22}}
+        }
+
+    notes:
+      - "SET ... NX EX adalah atomic, tidak ada race condition antara check dan set. JANGAN gunakan GET + SET terpisah (ada race condition)"
+      - "hiredis (C parser) 5-10x lebih cepat dari pure Python, install selalu jika tersedia"
+      - "Redis database 0 untuk production, database 1 untuk testing (redis://localhost:6379/1)"
+      - "decode_responses=True membuat semua response menjadi Python string bukan bytes"
+      - "Pipeline (r.pipeline()) untuk mengirim multiple commands sekaligus, mengurangi round-trip latency"
+      - "appendonly yes di Docker command memungkinkan persistence ke disk (AOF), data tidak hilang saat container restart"
+    pitfalls:
+      - "JANGAN lupa set TTL pada semua keys, tanpa TTL Redis bisa kehabisan memory (OOM)"
+      - "JANGAN gunakan Redis untuk menyimpan data besar (> 1MB per key), gunakan MinIO atau filesystem"
+      - "Rate limit counter bisa off-by-one jika multiple workers incr bersamaan tanpa menggunakan Lua script atau pipeline"
+      - "Redis connection bisa timeout jika tidak ada aktivitas, tambahkan socket_keepalive=True di production"
+
+  - id: rq
+    name: "RQ (Redis Queue)"
+    category: "Job Queue"
+    description: >
+      RQ adalah simple job queue untuk Python yang menggunakan Redis sebagai backend.
+      Lebih simple dari Celery (tidak perlu AMQP broker, tidak ada beat scheduler,
+      tidak ada complex configuration). Jobs adalah Python function references yang
+      di-serialize dan di-push ke Redis queue. Workers pull dari queue dan execute.
+      Mendukung job retry, job timeout, job dependencies, dan failed job queue.
+      Sangat cocok untuk RETRO karena pipeline tasks (Context Agent, Proposal Writer)
+      bisa di-enqueue secara async dan di-process oleh dedicated workers.
+    specific_function: >
+      Background job processing untuk RETRO pipeline. Context Agent job di-enqueue
+      setiap kali crawler menemukan company baru. Proposal Writer job di-enqueue
+      setelah Synthesis Agent selesai ranking. Workers (satu atau lebih) pull jobs
+      dari queue dan process secara concurrent tanpa blocking main process.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://python-rq.org"
+    retro:
+      phase: "Phase 3 (Context Agent) + Phase 5 (Proposal Writer) - Async processing"
+      role: >
+        Decoupling antara crawler (producer) dan Context Agent (consumer). Crawler
+        menemukan URL baru, enqueue job ke RQ, kemudian lanjut crawl berikutnya.
+        Worker RQ mengambil job dari queue dan menjalankan Context Agent untuk profiling.
+        Proposal Writer juga di-enqueue sebagai RQ job setelah Synthesis Agent selesai.
+      when_to_use: >
+        Gunakan RQ untuk semua long-running tasks yang tidak perlu dijalankan secara
+        synchronous: Context Agent profiling (bisa 30-120 detik per company karena
+        memerlukan LLM call), Proposal Writer (5-30 detik per proposal), email sending.
+      priority: "primary (async processing)"
+      output_goes_to: "PostgreSQL (hasil processing disimpan), Redis (job status)"
+    setup:
+      install: "pip install rq"
+      requirements:
+        - "rq>=1.16.0"
+        - "Redis running (lihat setup Redis di atas)"
+      env_vars:
+        - name: REDIS_URL
+          description: "redis://localhost:6379/0"
+    usage:
+      basic_example: |
+        from rq import Queue
+        from rq.job import Job
+        import redis
+
+        conn = redis.from_url("redis://localhost:6379/0")
+        q    = Queue("retro_jobs", connection=conn)
+
+        # Define function yang akan dijadikan job (harus importable)
+        def profile_company(domain: str, expo: str) -> dict:
+            # ... panggil Context Agent ...
+            return {"domain": domain, "status": "profiled"}
+
+        # Enqueue job
+        job = q.enqueue(
+            profile_company,
+            args=("sinarlogistik.co.id", "LogiSEA 2025"),
+            job_timeout=300,  # 5 menit max
+            result_ttl=3600,  # Simpan hasil 1 jam
+            retry=Retry(max=3, interval=[60, 120, 240]),  # Retry 3x dengan backoff
+        )
+        print(f"Job ID: {job.id}")
+        print(f"Job Status: {job.get_status()}")  # queued, started, finished, failed
+
+        # Di terminal, jalankan worker:
+        # rq worker retro_jobs --url redis://localhost:6379/0
+
+      retro_example: |
+        from rq import Queue, Retry
+        from rq.job import Job, JobStatus
+        from rq.worker import Worker
+        import redis
+        import os
+
+        REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _rq_conn  = None
+        _queues   = {}
+
+        def get_rq_conn():
+            global _rq_conn
+            if _rq_conn is None:
+                _rq_conn = redis.from_url(REDIS_URL)
+            return _rq_conn
+
+        def get_queue(name: str = "retro_default") -> Queue:
+            if name not in _queues:
+                _queues[name] = Queue(name, connection=get_rq_conn())
+            return _queues[name]
+
+        # ---- Job functions (harus di module yang bisa di-import worker) ----
+
+        def job_profile_company(staging_id: int, expo: str):
+            """
+            Job yang di-run oleh RQ worker untuk profile satu company.
+            Dipanggil setelah crawler selesai crawl URL dan simpan ke raw_staging.
+            """
+            from retro.db import get_db, get_unprocessed
+            from retro.context_agent import run_context_agent
+            from retro.db import upsert_company_profile, mark_staged_processed
+
+            # Ambil content dari DB
+            conn = get_db()
+            cur  = conn.cursor()
+            cur.execute("SELECT url, domain, content FROM raw_staging WHERE id = %s", (staging_id,))
+            row = cur.fetchone()
+            if not row:
+                return {"status": "error", "reason": "staging_id not found"}
+
+            url, domain, content = row
+
+            # Run Context Agent
+            profile_card = run_context_agent(domain=domain, content=content, expo=expo)
+            if profile_card:
+                upsert_company_profile(profile_card, expo)
+                mark_staged_processed([staging_id])
+                return {"status": "success", "domain": domain}
+            else:
+                return {"status": "no_profile", "domain": domain}
+
+        def job_generate_proposal(company_domain: str, expo: str):
+            """
+            Job untuk generate proposal setelah Synthesis Agent ranking selesai.
+            """
+            from retro.proposal_writer import generate_proposal
+            from retro.db import mark_proposal_sent
+
+            pdf_path = generate_proposal(company_domain=company_domain, expo=expo)
+            return {"status": "success", "domain": company_domain, "pdf": pdf_path}
+
+        # ---- Enqueue functions dipanggil dari main pipeline ----
+
+        def enqueue_profile_job(staging_id: int, expo: str) -> str:
+            q   = get_queue("retro_profiling")
+            job = q.enqueue(
+                job_profile_company,
+                args=(staging_id, expo),
+                job_timeout=180,
+                result_ttl=7200,
+                retry=Retry(max=2, interval=[30, 90]),
+            )
+            return job.id
+
+        def enqueue_proposal_job(company_domain: str, expo: str) -> str:
+            q   = get_queue("retro_proposals")
+            job = q.enqueue(
+                job_generate_proposal,
+                args=(company_domain, expo),
+                job_timeout=300,
+                result_ttl=7200,
+            )
+            return job.id
+
+        def get_queue_stats() -> dict:
+            conn = get_rq_conn()
+            stats = {}
+            for queue_name in ["retro_profiling", "retro_proposals", "retro_default"]:
+                q = Queue(queue_name, connection=conn)
+                stats[queue_name] = {
+                    "queued":   len(q),
+                    "failed":   q.failed_job_registry.count,
+                    "finished": q.finished_job_registry.count,
+                }
+            return stats
+
+        # Worker dijalankan dari CLI:
+        # rq worker retro_profiling retro_proposals --url redis://localhost:6379/0 --burst
+
+      expected_output: |
+        # Producer output:
+        [RQ] Enqueued profile job: staging_id=42, expo=LogiSEA 2025 -> job_id=abc123
+        [RQ] Enqueued profile job: staging_id=43, expo=LogiSEA 2025 -> job_id=def456
+
+        # Worker output (terminal):
+        16:32:01 Worker rq:worker:retro_profiling started
+        16:32:05 retro_profiling: job job_profile_company(42, 'LogiSEA 2025') (abc123)
+        16:32:47 retro_profiling: Job OK (42.3s) | sinarlogistik.co.id profiled
+        16:32:47 retro_proposals: job job_generate_proposal('sinarlogistik.co.id', ...) (ghi789)
+        16:33:15 retro_proposals: Job OK (28.1s) | PDF generated
+
+        Queue stats:
+        {
+          "retro_profiling": {"queued": 8, "failed": 0, "finished": 12},
+          "retro_proposals": {"queued": 3, "failed": 0, "finished": 5}
+        }
+
+    notes:
+      - "Job functions harus bisa di-import oleh worker process, jadi harus di module Python yang proper (bukan __main__)"
+      - "Gunakan multiple queues dengan priority berbeda: retro_urgent, retro_profiling, retro_proposals"
+      - "rq worker bisa subscribe ke multiple queues: rq worker q1 q2 q3 (cek q1 dulu baru q2 dst)"
+      - "Retry dengan backoff exponential mencegah thundering herd saat API external error"
+      - "result_ttl mengontrol berapa lama hasil job disimpan di Redis, set secukupnya untuk debug"
+      - "--burst flag membuat worker berhenti sendiri setelah queue kosong (untuk scheduled batch)"
+    pitfalls:
+      - "JANGAN import database connection atau model yang tidak picklable di top-level job function, import di dalam fungsi"
+      - "Job yang timeout akan masuk ke FailedJobRegistry, bukan auto-retry. Gunakan Retry() untuk auto-retry"
+      - "JANGAN simpan large data (HTML 1MB+) sebagai job argument, simpan ke DB dan pass ID saja"
+      - "RQ worker crash jika import error di job function, selalu test import path sebelum enqueue"
+
+  - id: minio
+    name: "MinIO"
+    category: "Object Storage (S3-Compatible)"
+    description: >
+      MinIO adalah object storage open-source yang fully compatible dengan AWS S3 API.
+      Berjalan sebagai Docker container atau binary. RETRO menggunakan MinIO untuk
+      menyimpan binary files yang tidak cocok disimpan di PostgreSQL: PDF brochures
+      yang di-download dari expo websites, generated PDF proposals, cached HTML pages,
+      dan screenshot halaman web. MinIO menyimpan files dengan bucket + key scheme
+      mirip S3. Tersedia juga alternatif managed: AWS S3, Cloudflare R2 (murah),
+      Backblaze B2 (murah).
+    specific_function: >
+      Object storage untuk semua binary artifacts RETRO: (1) downloaded_pdfs bucket
+      untuk brochures dari expo websites, (2) proposals bucket untuk final proposal
+      PDFs yang siap dikirim, (3) html_cache bucket untuk cached HTML crawl results.
+      PostgreSQL menyimpan path/key ke MinIO, bukan file itu sendiri.
+    language: "Python (minio, boto3)"
+    pricing: "Free (self-hosted), Cloudflare R2: free 10GB/bulan, AWS S3: ~$0.023/GB"
+    last_updated: "2025"
+    url: "https://min.io"
+    retro:
+      phase: "Phase 2 (PDF Storage) + Phase 5 (Proposal Storage)"
+      role: >
+        Penyimpanan binary files. PDF brochures dari expo websites disimpan ke
+        MinIO setelah didownload dan scan VirusTotal. Generated proposal PDFs
+        disimpan ke MinIO proposals bucket. URL pre-signed dari MinIO digunakan
+        oleh email agent untuk attach proposal PDF.
+      when_to_use: >
+        Gunakan MinIO untuk semua files > 100KB. Untuk development MVP, bisa
+        simpan ke local filesystem terlebih dahulu dan migrasi ke MinIO nanti.
+        Penting: JANGAN simpan files besar langsung ke PostgreSQL.
+      priority: "secondary (file storage)"
+      output_goes_to: "Email Agent (presigned URL untuk attachment), PostgreSQL (key reference)"
+    setup:
+      install: "pip install minio"
+      docker: "docker run -p 9000:9000 -p 9001:9001 -v minio_data:/data minio/minio server /data --console-address ':9001'"
+      requirements:
+        - "minio>=7.2.0"
+        - "Docker untuk self-hosted MinIO"
+      env_vars:
+        - name: MINIO_ENDPOINT
+          description: "localhost:9000 (self-hosted) atau s3.amazonaws.com (AWS)"
+        - name: MINIO_ACCESS_KEY
+          description: "Access key, default 'minioadmin' untuk Docker"
+        - name: MINIO_SECRET_KEY
+          description: "Secret key, default 'minioadmin' untuk Docker"
+        - name: MINIO_SECURE
+          description: "False untuk HTTP (dev), True untuk HTTPS (production)"
+    usage:
+      basic_example: |
+        from minio import Minio
+        from minio.error import S3Error
+        import io
+
+        client = Minio(
+            "localhost:9000",
+            access_key="minioadmin",
+            secret_key="minioadmin",
+            secure=False,
+        )
+
+        # Buat bucket jika belum ada
+        if not client.bucket_exists("retro-pdfs"):
+            client.make_bucket("retro-pdfs")
+
+        # Upload file
+        client.fput_object("retro-pdfs", "brochures/pt-maju.pdf", "/local/path/to/file.pdf")
+
+        # Upload dari bytes
+        data = b"PDF binary content here"
+        client.put_object("retro-pdfs", "brochures/pt-maju.pdf", io.BytesIO(data), len(data))
+
+        # Download
+        client.fget_object("retro-pdfs", "brochures/pt-maju.pdf", "/tmp/downloaded.pdf")
+
+        # Presigned URL (valid 1 jam)
+        from datetime import timedelta
+        url = client.presigned_get_object("retro-pdfs", "proposals/pt-maju-proposal.pdf",
+                                           expires=timedelta(hours=1))
+        print(url)  # https://localhost:9000/retro-pdfs/proposals/...?X-Amz-Signature=...
+
+      retro_example: |
+        from minio import Minio
+        from minio.error import S3Error
+        from datetime import timedelta
+        import io
+        import os
+        import hashlib
+
+        MINIO_ENDPOINT  = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+        MINIO_ACCESS    = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+        MINIO_SECRET    = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+        MINIO_SECURE    = os.getenv("MINIO_SECURE", "False").lower() == "true"
+
+        BUCKETS = {
+            "pdfs":      "retro-downloaded-pdfs",
+            "proposals": "retro-proposals",
+            "html":      "retro-html-cache",
+        }
+
+        _minio_client = None
+
+        def get_minio() -> Minio:
+            global _minio_client
+            if _minio_client is None:
+                _minio_client = Minio(
+                    MINIO_ENDPOINT,
+                    access_key=MINIO_ACCESS,
+                    secret_key=MINIO_SECRET,
+                    secure=MINIO_SECURE,
+                )
+                for bucket in BUCKETS.values():
+                    if not _minio_client.bucket_exists(bucket):
+                        _minio_client.make_bucket(bucket)
+                        print(f"[MinIO] Created bucket: {bucket}")
+            return _minio_client
+
+        def upload_pdf(pdf_path: str, domain: str, bucket_type: str = "pdfs") -> str:
+            """Upload PDF dan return object key."""
+            client     = get_minio()
+            bucket     = BUCKETS[bucket_type]
+            file_hash  = hashlib.md5(open(pdf_path, 'rb').read()).hexdigest()[:8]
+            object_key = f"{domain}/{file_hash}.pdf"
+
+            client.fput_object(
+                bucket_name=bucket,
+                object_name=object_key,
+                file_path=pdf_path,
+                content_type="application/pdf",
+            )
+            print(f"[MinIO] Uploaded: {bucket}/{object_key}")
+            return object_key
+
+        def upload_proposal_bytes(pdf_bytes: bytes, company_domain: str, expo: str) -> str:
+            """Upload proposal PDF dari bytes (WeasyPrint output)."""
+            client     = get_minio()
+            object_key = f"{expo.replace(' ', '_')}/{company_domain}/proposal.pdf"
+            client.put_object(
+                bucket_name=BUCKETS["proposals"],
+                object_name=object_key,
+                data=io.BytesIO(pdf_bytes),
+                length=len(pdf_bytes),
+                content_type="application/pdf",
+            )
+            return object_key
+
+        def get_proposal_presigned_url(object_key: str, expires_hours: int = 24) -> str:
+            """Generate presigned URL untuk proposal PDF, digunakan sebagai email attachment URL."""
+            client = get_minio()
+            url = client.presigned_get_object(
+                BUCKETS["proposals"],
+                object_key,
+                expires=timedelta(hours=expires_hours),
+            )
+            return url
+
+        def download_pdf_to_temp(bucket_type: str, object_key: str) -> str:
+            """Download dari MinIO ke /tmp, return local path."""
+            client    = get_minio()
+            tmp_path  = f"/tmp/retro_{hashlib.md5(object_key.encode()).hexdigest()[:8]}.pdf"
+            client.fget_object(BUCKETS[bucket_type], object_key, tmp_path)
+            return tmp_path
+
+      expected_output: |
+        [MinIO] Created bucket: retro-downloaded-pdfs
+        [MinIO] Created bucket: retro-proposals
+        [MinIO] Created bucket: retro-html-cache
+        [MinIO] Uploaded: retro-downloaded-pdfs/sinarlogistik.co.id/a1b2c3d4.pdf
+        [MinIO] Presigned URL (24h): http://localhost:9000/retro-proposals/LogiSEA_2025/sinarlogistik.co.id/proposal.pdf?X-Amz-Signature=...
+
+    notes:
+      - "Presigned URL memungkinkan akses temporary ke file tanpa autentikasi, aman untuk email attachment link"
+      - "MinIO console tersedia di port 9001 (jika Docker run dengan --console-address ':9001') untuk browse files via GUI"
+      - "Untuk production, ganti ke Cloudflare R2 (lebih murah dari AWS S3, kompatibel S3 API) hanya dengan ubah endpoint"
+      - "Bucket name harus lowercase, tidak boleh ada underscore (gunakan hyphen), max 63 karakter"
+      - "fput_object untuk upload dari file path, put_object untuk upload dari bytes/stream"
+    pitfalls:
+      - "JANGAN hardcode credentials di kode, selalu gunakan environment variables"
+      - "JANGAN simpan file sementara di /tmp tanpa cleanup, bisa kehabisan disk space"
+      - "Presigned URL expired setelah expires duration, generate fresh URL saat akan digunakan bukan saat upload"
+      - "MinIO default credentials 'minioadmin/minioadmin' HARUS diganti sebelum expose ke internet"
+
+  - id: valkey
+    name: "Valkey"
+    category: "In-Memory Cache (Redis Fork)"
+    description: >
+      Valkey adalah fork open-source dari Redis yang dibuat oleh komunitas setelah
+      Redis Inc mengubah lisensi menjadi non-open-source. Valkey sepenuhnya kompatibel
+      dengan Redis protocol dan client libraries (redis-py, hiredis, dll bekerja
+      tanpa perubahan). Valkey tersedia sebagai Docker image dan package manager.
+      Jika RETRO memerlukan Redis-compatible store dengan lisensi fully open-source
+      (misalnya untuk distribusi commercial), Valkey adalah drop-in replacement.
+    specific_function: >
+      Drop-in replacement untuk Redis di RETRO. Semua code Redis (dedup, rate limit,
+      RQ backend) bekerja tanpa perubahan. Hanya ganti Docker image dan URL.
+    language: "Python (redis-py, kompatibel penuh)"
+    pricing: "Free (open-source, BSD-3)"
+    last_updated: "2025"
+    url: "https://valkey.io"
+    retro:
+      phase: "Sama dengan Redis (Phase 1-5)"
+      role: "Drop-in replacement Redis, digunakan jika ingin fully open-source stack"
+      when_to_use: >
+        Gunakan Valkey jika organisasi memerlukan fully open-source licensed software
+        stack. Untuk RETRO MVP, Redis dan Valkey identik dari sisi fungsionalitas.
+      priority: "optional (Redis alternative)"
+      output_goes_to: "Sama dengan Redis"
+    setup:
+      install: "pip install redis  # redis-py kompatibel dengan Valkey"
+      docker: "docker run -p 6379:6379 -v valkey_data:/data valkey/valkey:latest"
+      requirements:
+        - "redis-py >= 5.0.0 (sama dengan Redis)"
+      env_vars:
+        - name: REDIS_URL
+          description: "redis://localhost:6379/0 (sama dengan Redis, tidak ada perubahan)"
+    usage:
+      basic_example: |
+        # Kode IDENTIK dengan Redis, hanya Docker image yang berbeda
+        import redis
+        r = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        print(r.ping())  # True
+
+        # Semua operasi Redis berlaku: SET, GET, SADD, SISMEMBER, INCR, dll
+        r.set("test", "valkey works!", ex=60)
+        print(r.get("test"))  # valkey works!
+
+      retro_example: |
+        # Tidak ada perubahan kode dari Redis section.
+        # Hanya ubah Docker run command:
+        # docker run -p 6379:6379 valkey/valkey:latest
+        #
+        # REDIS_URL tetap: redis://localhost:6379/0
+        # redis-py client tetap sama, tidak ada breaking changes
+
+      expected_output: |
+        True
+        valkey works!
+
+    notes:
+      - "Valkey fully compatible dengan Redis 7.2 commands dan protocol"
+      - "Valkey maintained oleh Linux Foundation, tidak akan ada lisensi perubahan mendadak"
+      - "Performance Valkey hampir identik dengan Redis 7.2 dalam benchmark"
+    pitfalls:
+      - "Beberapa Redis Enterprise fitur (Redis Search, Redis JSON module) mungkin tidak tersedia di Valkey vanilla"
+
+  - id: dvc
+    name: "DVC (Data Version Control)"
+    category: "Data & ML Artifact Versioning"
+    description: >
+      DVC adalah data version control tool yang bekerja di atas git. Memungkinkan
+      versioning untuk large files, datasets, dan ML model artifacts yang tidak cocok
+      disimpan langsung di git (terlalu besar). DVC menyimpan file di remote storage
+      (MinIO, S3, Google Drive) dan hanya menyimpan pointer (.dvc file) di git.
+      RETRO menggunakan DVC untuk versioning company profile datasets, trained NLP models,
+      dan benchmark datasets untuk evaluasi kualitas proposal.
+    specific_function: >
+      Versioning datasets RETRO: company profile exports, pipeline evaluation datasets,
+      dan fine-tuned model artifacts. Memungkinkan reproduce eksperimen dan rollback
+      ke versi dataset sebelumnya jika ada corruption.
+    language: "Python (CLI + Python API)"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://dvc.org"
+    retro:
+      phase: "Infrastructure (data versioning)"
+      role: >
+        Version control untuk datasets RETRO yang besar: full export company profiles
+        per expo, evaluation datasets untuk benchmarking kualitas Context Agent,
+        dan NLP model files (sentence-transformers fine-tuned pada domain-specific data).
+      when_to_use: >
+        Gunakan DVC ketika ingin share dataset antar tim anggota, track perubahan
+        dataset dari satu expo event ke event berikutnya, atau rollback ke versi
+        data sebelumnya. Untuk MVP RETRO single-user, DVC optional.
+      priority: "optional (data versioning)"
+      output_goes_to: "MinIO atau S3 (data storage), git (pointer files)"
+    setup:
+      install: "pip install dvc dvc-s3  # dvc-s3 untuk MinIO/S3 backend"
+      init: |
+        git init  # DVC memerlukan git repo
+        dvc init
+        dvc remote add -d minio_remote s3://retro-dvc/
+        dvc remote modify minio_remote endpointurl http://localhost:9000
+        dvc remote modify minio_remote access_key_id minioadmin
+        dvc remote modify minio_remote secret_access_key minioadmin
+      requirements:
+        - "dvc>=3.0.0"
+        - "dvc-s3>=3.0.0 (untuk S3/MinIO backend)"
+        - "git repository yang sudah diinit"
+      env_vars:
+        - name: AWS_ACCESS_KEY_ID
+          description: "MinIO access key untuk DVC remote (jika tidak diset via dvc remote modify)"
+        - name: AWS_SECRET_ACCESS_KEY
+          description: "MinIO secret key untuk DVC remote"
+    usage:
+      basic_example: |
+        # Track dataset besar dengan DVC
+        dvc add data/company_profiles_logisea2025.csv
+        git add data/company_profiles_logisea2025.csv.dvc .gitignore
+        git commit -m "Add LogiSEA 2025 company profiles dataset"
+        dvc push  # Upload actual file ke MinIO
+
+        # Clone dan pull dataset
+        git clone <repo>
+        dvc pull  # Download actual files dari MinIO
+
+        # Lihat versi sebelumnya
+        git log --oneline data/company_profiles_logisea2025.csv.dvc
+        git checkout <commit_hash> data/company_profiles_logisea2025.csv.dvc
+        dvc checkout  # Restore file ke versi yang dipilih
+
+      retro_example: |
+        import subprocess
+        import os
+        import json
+        from datetime import datetime
+
+        def export_and_version_profiles(expo: str, profiles: list[dict]):
+            """
+            Export company profiles ke CSV dan version dengan DVC.
+            """
+            import pandas as pd
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            expo_slug  = expo.replace(" ", "_").lower()
+            filename   = f"data/profiles/{expo_slug}_{timestamp}.json"
+
+            os.makedirs("data/profiles", exist_ok=True)
+            with open(filename, 'w') as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=2)
+
+            # DVC add dan git commit
+            subprocess.run(["dvc", "add", filename], check=True)
+            subprocess.run(["git", "add", f"{filename}.dvc", ".gitignore"], check=True)
+            subprocess.run([
+                "git", "commit", "-m",
+                f"Add company profiles: {expo} ({len(profiles)} companies)"
+            ], check=True)
+            subprocess.run(["dvc", "push"], check=True)
+
+            print(f"[DVC] Versioned: {filename} ({len(profiles)} profiles) -> MinIO")
+            return filename
+
+      expected_output: |
+        $ dvc add data/company_profiles_logisea2025.json
+        Adding data/company_profiles_logisea2025.json to cache
+        Saving info to 'data/company_profiles_logisea2025.json.dvc'
+
+        $ dvc push
+        1 file pushed to remote 'minio_remote'
+        [DVC] Versioned: data/profiles/logisea2025_20250423_103045.json (342 profiles) -> MinIO
+
+    notes:
+      - "DVC .dvc file (pointer) disimpan di git, actual data di MinIO/S3. Pisahkan dengan jelas mana yang di git dan mana di DVC"
+      - "dvc pull diperlukan setelah git clone atau git checkout untuk mendapatkan actual data files"
+      - "DVC mendukung pipeline (dvc.yaml) untuk reproducible ML pipeline, tapi untuk RETRO cukup gunakan dvc add saja"
+      - "Gunakan .dvcignore (mirip .gitignore) untuk exclude temporary files dari DVC tracking"
+    pitfalls:
+      - "JANGAN add file ke git DAN DVC sekaligus, pilih salah satu. File yang sudah di-dvc add otomatis masuk .gitignore"
+      - "DVC push/pull bisa lambat untuk file besar (> 1GB), gunakan dengan sabar atau tambahkan bandwidth"
+      - "JANGAN lupa dvc push sebelum push git ke remote, jika tidak tim lain tidak bisa dvc pull data terbaru"

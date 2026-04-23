@@ -1,0 +1,787 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Structured Output, Data Validation & Configuration
+# File: 15_structured_output.yaml
+# Purpose: Tools untuk memastikan output LLM dan data pipeline selalu terstruktur,
+#          type-safe, dan bisa di-validate. Menggantikan manual JSON parsing yang rapuh.
+#
+# MASALAH YANG DISELESAIKAN:
+#   LLM kadang return JSON tidak valid, field yang salah, atau tipe data yang berbeda.
+#   Manual json.loads() + key-checking sangat rapuh di production.
+#   Pydantic v2 + instructor = solusi: LLM dipaksa return schema yang valid via retry.
+#
+# STACK YANG DIREKOMENDASIKAN:
+#   Pydantic v2         = model definisi (CompanyProfileCard, ProposalData, dll)
+#   instructor          = enforce pydantic schema ke LLM output (cloud LLM)
+#   outlines            = enforce JSON schema ke local LLM via constrained decoding
+#   pydantic-settings   = konfigurasi pipeline dari env vars secara type-safe
+
+tools:
+
+  - id: instructor
+    name: "instructor"
+    category: "LLM Structured Output Enforcement"
+    description: >
+      instructor adalah Python library oleh Jason Liu yang memungkinkan LLM selalu
+      return output yang sesuai Pydantic schema. Bekerja dengan semua major providers:
+      OpenAI, Anthropic Claude, Groq, Mistral, Cohere, Google Gemini, dan Ollama.
+      Mechanism: instructor meng-intercept LLM call, jika output tidak valid Pydantic,
+      otomatis retry dengan error message sebagai feedback hingga max_retries tercapai.
+      3M+ monthly downloads, battle-tested di production. Eliminasi semua manual
+      json.loads(), key checking, dan type conversion.
+    specific_function: >
+      Enforce structured output dari Context Agent, Synthesis Agent, dan Proposal Writer
+      RETRO. Gantikan fragile json.loads() + manual validation dengan Pydantic model
+      sebagai contract. Jika LLM return "N/A" untuk field yang seharusnya list,
+      instructor otomatis retry sambil memberitahu LLM kesalahannya.
+    language: "Python"
+    pricing: "Gratis & open-source (biaya sesuai LLM provider)"
+    last_updated: "2025"
+    url: "https://github.com/567-labs/instructor"
+
+    retro:
+      phase: "Phase 3, 4, 5 — semua LLM agent calls"
+      role: >
+        Lapisan validasi output di setiap LLM call. Context Agent menggunakan instructor
+        untuk memastikan CompanyProfileCard selalu punya semua field yang benar.
+        Synthesis Agent menggunakan instructor untuk CollaborationMatch yang type-safe.
+        Proposal Writer untuk ProposalData yang siap di-render ke PDF.
+      when_to_use: >
+        Gunakan instructor untuk SETIAP LLM call yang harus return structured data.
+        Terutama wajib untuk: company profiling (field banyak, tipe beragam),
+        entity extraction, synthesis ranking, proposal section generation.
+        Tidak perlu untuk pure text generation (email subject, satu kalimat).
+      priority: "primary — wajib di semua structured LLM output"
+      output_goes_to: "Validated Pydantic objects langsung ke PostgreSQL atau PDF generator"
+
+    setup:
+      install: |
+        pip install instructor
+        # Sudah include: pydantic, openai, anthropic client support
+        # Untuk Anthropic Claude (RETRO primary):
+        pip install instructor anthropic
+      requirements:
+        - "Python 3.9+"
+        - "pydantic>=2.0"
+        - "Minimal satu LLM client: anthropic, openai, atau groq"
+      env_vars:
+        - name: ANTHROPIC_API_KEY
+          description: "Untuk Claude via instructor"
+        - name: OPENAI_API_KEY
+          description: "Untuk GPT-4o via instructor"
+        - name: GROQ_API_KEY
+          description: "Untuk Llama 70B via instructor (gratis dev)"
+
+    usage:
+      basic_example: |
+        import instructor
+        from anthropic import Anthropic
+        from pydantic import BaseModel, Field
+        from typing import Optional, List
+
+        # Wrap Anthropic client dengan instructor
+        client = instructor.from_anthropic(Anthropic())
+
+        class CompanyProfile(BaseModel):
+            name: str = Field(description="Nama lengkap perusahaan termasuk PT/CV/Ltd")
+            industry: str = Field(description="Sektor industri utama perusahaan")
+            products: List[str] = Field(description="Daftar produk atau layanan utama", min_length=1)
+            email: Optional[str] = Field(default=None, description="Email kontak jika ditemukan")
+            founded_year: Optional[int] = Field(default=None, description="Tahun berdiri")
+            employee_count: Optional[str] = Field(default=None, description="Estimasi jumlah karyawan: '1-10', '11-50', '51-200', '200+'")
+
+        profile = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            response_model=CompanyProfile,
+            messages=[{
+                "role": "user",
+                "content": """Ekstrak informasi dari teks berikut:
+                PT Maju Jaya Abadi didirikan tahun 2010, bergerak di bidang konstruksi dan manufaktur.
+                Produk utama: beton siap pakai, baja tulangan, jasa kontraktor.
+                Karyawan: sekitar 150 orang. Kontak: info@majujaya.co.id"""
+            }]
+        )
+
+        print(profile.name)            # "PT Maju Jaya Abadi"
+        print(profile.industry)        # "konstruksi dan manufaktur"
+        print(profile.products)        # ["beton siap pakai", "baja tulangan", "jasa kontraktor"]
+        print(profile.founded_year)    # 2010
+        print(profile.employee_count)  # "51-200"
+
+      retro_example: |
+        import instructor
+        from anthropic import Anthropic
+        from pydantic import BaseModel, Field, validator
+        from typing import Optional, List, Literal
+        import os
+
+        client = instructor.from_anthropic(Anthropic())
+
+        # RETRO Company Profile Card — full schema
+        class CompanyProfileCard(BaseModel):
+            company_name: str = Field(description="Nama resmi perusahaan")
+            domain: Optional[str] = Field(default=None, description="Domain website tanpa https://")
+            industry: str = Field(description="Industri utama: konstruksi/manufaktur/teknologi/logistik/dll")
+            sub_industry: Optional[str] = Field(default=None, description="Sub-industri spesifik")
+            products_services: List[str] = Field(description="Produk atau layanan utama, max 5 item", max_length=5)
+            target_customers: Optional[str] = Field(default=None, description="Siapa pelanggan mereka: B2B/B2C/pemerintah")
+            company_size: Literal["micro", "small", "medium", "large", "unknown"] = Field(
+                default="unknown",
+                description="micro=<10, small=10-50, medium=50-250, large=250+"
+            )
+            tech_maturity: Literal["traditional", "digital_adopter", "tech_native", "unknown"] = Field(
+                default="unknown",
+                description="Tingkat adopsi teknologi perusahaan"
+            )
+            collaboration_potential: List[str] = Field(
+                description="Area kolaborasi potensial dengan RETRO: distribusi/teknologi/co-branding/dll",
+                default_factory=list
+            )
+            red_flags: List[str] = Field(
+                description="Potensi masalah: kompetitor langsung, reputasi buruk, dll",
+                default_factory=list
+            )
+            confidence_score: float = Field(
+                ge=0.0, le=1.0,
+                description="Seberapa yakin dengan profil ini: 0.0-1.0"
+            )
+
+        class CollaborationMatch(BaseModel):
+            company_name: str
+            match_score: float = Field(ge=0.0, le=1.0, description="Skor kesesuaian kolaborasi 0-1")
+            collaboration_type: str = Field(description="Jenis kolaborasi yang disarankan")
+            rationale: str = Field(description="Alasan mengapa cocok sebagai partner")
+            proposed_pitch: str = Field(description="Satu kalimat pitch yang personal untuk perusahaan ini")
+            priority: Literal["high", "medium", "low"]
+
+        def profile_company_with_instructor(
+            company_text: str,
+            company_name: str,
+            retries: int = 3
+        ) -> CompanyProfileCard:
+            """
+            Profile satu perusahaan menggunakan Claude + instructor.
+            Otomatis retry jika output tidak sesuai schema.
+            """
+            return client.messages.create(
+                model=os.environ.get("LLM_MODEL", "claude-sonnet-4-6"),
+                max_tokens=2048,
+                max_retries=retries,  # instructor retry bukan anthropic retry
+                response_model=CompanyProfileCard,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Analisis perusahaan berikut dan buat profile card terstruktur.
+
+Nama perusahaan: {company_name}
+
+Informasi yang tersedia:
+{company_text[:3000]}
+
+Instruksi:
+- Isi semua field berdasarkan informasi yang tersedia
+- Gunakan "unknown" untuk field yang tidak bisa ditentukan
+- collaboration_potential: area dimana perusahaan ini bisa menjadi mitra bisnis
+- red_flags: hal yang perlu diperhatikan sebelum approach
+- confidence_score: 1.0 jika semua info lengkap, 0.5 jika banyak yang unknown"""
+                }]
+            )
+
+        def synthesize_collaborations_with_instructor(
+            company_profiles: List[dict],
+            retro_company_profile: str
+        ) -> List[CollaborationMatch]:
+            """
+            Synthesis Agent: rank company profiles berdasarkan potensi kolaborasi.
+            """
+            profiles_text = "\n\n".join([
+                f"Company: {p['company_name']}\nIndustry: {p['industry']}\nProducts: {', '.join(p['products_services'])}"
+                for p in company_profiles[:20]  # Max 20 company per synthesis call
+            ])
+
+            class CollaborationRanking(BaseModel):
+                matches: List[CollaborationMatch]
+                synthesis_notes: str = Field(description="Catatan umum tentang batch ini")
+
+            ranking = client.messages.create(
+                model=os.environ.get("LLM_MODEL", "claude-sonnet-4-6"),
+                max_tokens=4096,
+                max_retries=2,
+                response_model=CollaborationRanking,
+                messages=[{
+                    "role": "user",
+                    "content": f"""Kamu adalah business development analyst.
+
+Profil perusahaan kita (RETRO):
+{retro_company_profile}
+
+Perusahaan kandidat partner dari expo:
+{profiles_text}
+
+Rank semua perusahaan di atas berdasarkan potensi kolaborasi dengan kita.
+Sertakan hanya yang match_score >= 0.6."""
+                }]
+            )
+            return ranking.matches
+
+      expected_output: |
+        CompanyProfileCard(
+            company_name="PT Maju Jaya Abadi",
+            domain="majujaya.co.id",
+            industry="konstruksi",
+            sub_industry="material bangunan",
+            products_services=["beton siap pakai", "baja tulangan", "jasa kontraktor"],
+            target_customers="B2B - kontraktor, developer properti",
+            company_size="medium",
+            tech_maturity="traditional",
+            collaboration_potential=["distribusi material", "proyek infrastruktur bersama"],
+            red_flags=[],
+            confidence_score=0.85
+        )
+
+    notes: >
+      instructor.from_anthropic() menggunakan tool_use (function calling) Claude untuk
+      enforce schema, bukan JSON mode. Ini lebih reliable karena Claude dilatih untuk
+      function calling. Untuk Groq (dev mode), gunakan instructor.from_groq().
+      Mode: instructor.Mode.TOOLS (default Claude), instructor.Mode.JSON (untuk OpenAI).
+
+    pitfalls:
+      - issue: "instructor retry loop habis (max_retries exceeded)"
+        fix: "Lihat error message dari instructor — biasanya ada field required yang ambigu. Tambahkan description lebih jelas di Field(). Tambah max_retries=5 untuk schema kompleks."
+      - issue: "instructor dari LiteLLM tidak bisa langsung"
+        fix: "Gunakan instructor.from_litellm(litellm.completion) — instructor support LiteLLM via patch. Atau langsung pakai client specific (instructor.from_anthropic)."
+      - issue: "Response terlalu panjang, max_tokens tidak cukup"
+        fix: "Naikkan max_tokens ke 4096 untuk CompanyProfileCard dengan banyak field. Atau pisah menjadi dua call: basic fields dulu, lalu enrichment fields."
+
+  - id: outlines
+    name: "outlines"
+    category: "Local LLM Constrained Decoding"
+    description: >
+      outlines adalah library untuk structured generation dari local LLM menggunakan
+      constrained decoding (Finite State Machine / FSM). Berbeda dari instructor yang
+      bekerja via retry, outlines secara fisik membatasi token yang bisa di-generate
+      LLM agar hanya menghasilkan output yang valid sesuai schema. Artinya: zero retry,
+      zero hallucination pada format, guaranteed valid JSON setiap kali.
+      Mendukung: transformers (HuggingFace), llama.cpp, vLLM, Ollama.
+    specific_function: >
+      Structured output untuk local LLM (Ollama, llama.cpp) di RETRO. Ketika menjalankan
+      model lokal untuk privacy atau cost reasons, outlines memastikan output selalu
+      valid JSON sesuai Pydantic schema tanpa perlu retry. Complement instructor
+      yang digunakan untuk cloud LLM.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://github.com/outlines-dev/outlines"
+
+    retro:
+      phase: "Phase 3 — Context Agent dengan local LLM"
+      role: >
+        Digunakan ketika RETRO dijalankan dalam mode local/offline dengan Ollama.
+        Terutama untuk data confidential yang tidak boleh dikirim ke cloud.
+        outlines + Ollama = structured output tanpa internet connection.
+      when_to_use: >
+        Gunakan outlines ketika:
+        1. Menjalankan local LLM via Ollama atau llama.cpp
+        2. Data company sangat confidential (tidak boleh ke cloud)
+        3. Ingin zero-retry guaranteed output untuk speed
+        Tidak perlu jika menggunakan cloud LLM (Claude/GPT) — gunakan instructor.
+      priority: "secondary (untuk local LLM deployment)"
+      output_goes_to: "Sama dengan instructor: validated Pydantic objects ke pipeline"
+
+    setup:
+      install: |
+        pip install outlines
+        # Untuk HuggingFace transformers backend:
+        pip install outlines transformers torch
+        # Untuk Ollama backend (lebih mudah):
+        pip install outlines ollama
+      requirements:
+        - "Python 3.9+"
+        - "Ollama running di localhost:11434 untuk Ollama backend"
+        - "GPU sangat disarankan untuk inference speed"
+      env_vars:
+        - name: OLLAMA_HOST
+          description: "URL Ollama server, default http://localhost:11434"
+
+    usage:
+      basic_example: |
+        import outlines
+        from pydantic import BaseModel
+        from typing import List, Optional
+
+        # Load model via Ollama (pastikan Ollama sudah jalan)
+        model = outlines.models.ollama("llama3.2", "http://localhost:11434")
+
+        class CompanyProfile(BaseModel):
+            company_name: str
+            industry: str
+            products: List[str]
+            email: Optional[str] = None
+
+        # Generator yang dijamin output JSON valid sesuai schema
+        generator = outlines.generate.json(model, CompanyProfile)
+
+        result = generator(
+            "Ekstrak informasi: PT Maju Jaya bergerak di konstruksi, "
+            "jual beton dan baja, kontak info@majujaya.co.id"
+        )
+
+        print(result.company_name)  # "PT Maju Jaya"
+        print(result.products)      # ["beton", "baja"]
+        print(result.email)         # "info@majujaya.co.id"
+
+      retro_example: |
+        import outlines
+        from pydantic import BaseModel, Field
+        from typing import List, Optional, Literal
+        import os
+
+        # Pilih backend berdasarkan environment
+        def get_outlines_model():
+            backend = os.environ.get("LOCAL_LLM_BACKEND", "ollama")
+            model_name = os.environ.get("LOCAL_LLM_MODEL", "llama3.2")
+
+            if backend == "ollama":
+                return outlines.models.ollama(model_name, os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+            elif backend == "transformers":
+                return outlines.models.transformers(model_name)
+            else:
+                raise ValueError(f"Unknown backend: {backend}")
+
+        class CompanyProfileCard(BaseModel):
+            company_name: str
+            industry: str
+            products_services: List[str]
+            company_size: Literal["micro", "small", "medium", "large", "unknown"]
+            tech_maturity: Literal["traditional", "digital_adopter", "tech_native", "unknown"]
+            confidence_score: float
+
+        _MODEL = None
+        _GENERATOR = None
+
+        def get_generator():
+            global _MODEL, _GENERATOR
+            if _GENERATOR is None:
+                _MODEL = get_outlines_model()
+                _GENERATOR = outlines.generate.json(_MODEL, CompanyProfileCard)
+            return _GENERATOR
+
+        def profile_company_local(company_text: str, company_name: str) -> CompanyProfileCard:
+            """
+            Profile company menggunakan local LLM dengan guaranteed structured output.
+            Tidak ada network call, tidak ada retry, 100% offline.
+            """
+            generator = get_generator()
+
+            prompt = f"""Analisis perusahaan berikut dan buat profile terstruktur.
+
+Perusahaan: {company_name}
+Informasi:
+{company_text[:1500]}
+
+Berikan profile yang akurat berdasarkan informasi di atas."""
+
+            return generator(prompt)
+
+      expected_output: |
+        CompanyProfileCard(
+            company_name="PT Maju Jaya",
+            industry="konstruksi",
+            products_services=["beton siap pakai", "baja tulangan"],
+            company_size="medium",
+            tech_maturity="traditional",
+            confidence_score=0.8
+        )
+
+    notes: >
+      outlines via Ollama adalah cara paling mudah untuk production deployment.
+      Pastikan Ollama model sudah di-pull: ollama pull llama3.2.
+      Untuk schema yang kompleks dengan banyak nested model, outlines bisa lebih
+      lambat karena FSM compilation. Cache generator object (global _GENERATOR).
+
+    pitfalls:
+      - issue: "outlines lambat untuk schema yang kompleks"
+        fix: "Compile generator sekali dan cache sebagai global variable. FSM compilation hanya terjadi sekali per schema."
+      - issue: "Ollama connection refused"
+        fix: "Pastikan Ollama running: ollama serve. Cek OLLAMA_HOST env var."
+      - issue: "outlines tidak support semua Pydantic field types"
+        fix: "Hindari complex Union types dan circular references. Flatten schema jika perlu."
+
+  - id: pydantic_v2
+    name: "Pydantic v2"
+    category: "Data Validation & Schema Definition"
+    description: >
+      Pydantic v2 adalah library Python untuk data validation menggunakan type hints.
+      v2 (2023+) ditulis ulang dalam Rust, 5-50x lebih cepat dari v1. Core dari
+      RETRO data layer: semua model data (CompanyProfileCard, ProposalData, ExpoData)
+      didefinisikan sebagai Pydantic BaseModel. Terintegrasi langsung dengan instructor,
+      FastAPI, SQLModel, dan hampir semua modern Python framework.
+    specific_function: >
+      Definisi schema untuk semua data di RETRO: company profiles, proposals, expo data,
+      pipeline config. Validasi data input sebelum masuk DB. Type coercion otomatis
+      (string "2024" ke int 2024). Custom validators untuk business rules
+      (e.g., domain harus lowercase, email harus valid format).
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://docs.pydantic.dev/latest/"
+
+    retro:
+      phase: "Semua phase — data model foundation"
+      role: >
+        Backbone type system RETRO. Setiap data structure yang melewati pipeline
+        didefinisikan sebagai Pydantic model. Ini memastikan data konsisten dari
+        crawling hingga PDF generation. Juga digunakan sebagai schema untuk instructor
+        (structured LLM output) dan SQLModel (ORM).
+      when_to_use: >
+        Gunakan Pydantic untuk SEMUA data structure di RETRO. Jangan gunakan plain dict
+        untuk data yang melewati lebih dari satu component. BaseModel memberikan:
+        type safety, auto-validation, serialization ke dict/JSON, dan schema generation.
+      priority: "foundational — semua tools lain bergantung pada ini"
+      output_goes_to: "Semua — digunakan di setiap layer pipeline"
+
+    setup:
+      install: |
+        pip install pydantic
+        # Pydantic v2 adalah default sekarang (pip install pydantic >= 2.0.0)
+        # Cek versi:
+        python -c "import pydantic; print(pydantic.VERSION)"
+      requirements:
+        - "Python 3.8+"
+        - "pydantic>=2.0.0"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from pydantic import BaseModel, Field, validator, field_validator
+        from typing import Optional, List, Literal
+        from datetime import datetime
+
+        class CompanyProfileCard(BaseModel):
+            company_name: str = Field(min_length=2, max_length=200)
+            domain: Optional[str] = None
+            industry: str
+            products_services: List[str] = Field(default_factory=list, max_length=10)
+            company_size: Literal["micro", "small", "medium", "large", "unknown"] = "unknown"
+            confidence_score: float = Field(ge=0.0, le=1.0, default=0.5)
+            created_at: datetime = Field(default_factory=datetime.utcnow)
+
+            @field_validator('domain')
+            @classmethod
+            def domain_lowercase(cls, v):
+                if v:
+                    return v.lower().strip().removeprefix("https://").removeprefix("http://").removesuffix("/")
+                return v
+
+            @field_validator('products_services')
+            @classmethod
+            def deduplicate_products(cls, v):
+                return list(dict.fromkeys(v))  # Preserve order, remove duplicates
+
+        # Validasi otomatis
+        profile = CompanyProfileCard(
+            company_name="PT Maju Jaya",
+            domain="HTTPS://majujaya.co.id/",  # Akan di-normalize otomatis
+            industry="konstruksi",
+            products_services=["beton", "baja", "beton"],  # Duplikat dihapus
+            confidence_score=0.85
+        )
+
+        print(profile.domain)           # "majujaya.co.id" (normalized)
+        print(profile.products_services)  # ["beton", "baja"]
+        print(profile.model_dump())     # Dict untuk JSON/DB insert
+        print(profile.model_dump_json()) # JSON string
+
+      retro_example: |
+        from pydantic import BaseModel, Field, field_validator, model_validator
+        from typing import Optional, List, Literal, Dict, Any
+        from datetime import datetime
+        import re
+
+        class ExpoData(BaseModel):
+            """Data expo / pameran dagang yang ditemukan dari crawling"""
+            expo_name: str
+            expo_date: Optional[str] = None
+            location: Optional[str] = None
+            website: Optional[str] = None
+            source_url: str
+            crawled_at: datetime = Field(default_factory=datetime.utcnow)
+
+        class CompanyStaging(BaseModel):
+            """Raw data sebelum profiling — hasil crawl langsung"""
+            company_name: str
+            domain: Optional[str] = None
+            raw_text: str = Field(max_length=50000)  # Hard limit untuk mencegah noise
+            source_type: Literal["website", "pdf", "expo_list", "news"]
+            source_url: str
+            expo_id: Optional[int] = None
+            is_processed: bool = False
+            content_hash: Optional[str] = None  # MD5 untuk dedup
+
+            @field_validator('domain')
+            @classmethod
+            def clean_domain(cls, v):
+                if not v:
+                    return v
+                v = v.lower().strip()
+                # Hapus protocol dan path
+                v = re.sub(r'^https?://', '', v)
+                v = v.split('/')[0]  # Hapus path
+                return v
+
+        class ProposalData(BaseModel):
+            """Data proposal yang dihasilkan oleh Proposal Writer agent"""
+            proposal_id: str
+            target_company: str
+            target_email: str
+            sections: Dict[str, str] = Field(
+                description="Keys: executive_summary, collaboration_opportunity, proposed_value, next_steps"
+            )
+            subject_line: str = Field(max_length=150)
+            personalization_notes: str
+            confidence_score: float = Field(ge=0.0, le=1.0)
+            status: Literal["draft", "approved", "sent", "rejected"] = "draft"
+            created_at: datetime = Field(default_factory=datetime.utcnow)
+
+            @model_validator(mode='after')
+            def validate_sections(self):
+                required_sections = {"executive_summary", "collaboration_opportunity", "proposed_value", "next_steps"}
+                missing = required_sections - set(self.sections.keys())
+                if missing:
+                    raise ValueError(f"Missing required sections: {missing}")
+                return self
+
+        # Serialize ke dict untuk PostgreSQL JSONB
+        proposal = ProposalData(
+            proposal_id="prop-2024-001",
+            target_company="PT Maju Jaya",
+            target_email="budi@majujaya.co.id",
+            sections={
+                "executive_summary": "...",
+                "collaboration_opportunity": "...",
+                "proposed_value": "...",
+                "next_steps": "..."
+            },
+            subject_line="Proposal Kolaborasi Strategis dari RETRO",
+            personalization_notes="Mention recent expo participation",
+            confidence_score=0.9
+        )
+
+        db_record = proposal.model_dump()  # Untuk INSERT ke PostgreSQL
+        json_str = proposal.model_dump_json()  # Untuk API response
+
+      expected_output: |
+        # model_dump() output:
+        {
+          "proposal_id": "prop-2024-001",
+          "target_company": "PT Maju Jaya",
+          "target_email": "budi@majujaya.co.id",
+          "sections": {...},
+          "subject_line": "Proposal Kolaborasi Strategis dari RETRO",
+          "confidence_score": 0.9,
+          "status": "draft",
+          "created_at": "2024-03-15T08:30:00"
+        }
+
+    notes: >
+      Pydantic v2 BREAKING CHANGE dari v1: @validator diganti @field_validator,
+      .dict() diganti .model_dump(), .json() diganti .model_dump_json().
+      SQLModel menggunakan Pydantic v2 dan table=True untuk ORM. Jika pakai SQLModel,
+      tidak perlu definisi model Pydantic terpisah — satu class untuk keduanya.
+
+    pitfalls:
+      - issue: "Import error setelah upgrade dari Pydantic v1 ke v2"
+        fix: "Gunakan pydantic.v1 import untuk legacy code: from pydantic.v1 import BaseModel. Atau migrate dengan panduan resmi pydantic.dev/blog/pydantic-v2-migration"
+      - issue: "model_validator tidak dipanggil saat update field"
+        fix: "model_validator mode='after' hanya dipanggil saat konstruksi. Untuk validasi update, gunakan .model_validate(data) atau .model_copy(update=data)."
+      - issue: "JSON serialization error untuk custom types (datetime, UUID)"
+        fix: "Gunakan model.model_dump_json() bukan json.dumps(model.model_dump()). Atau tambahkan model_config = ConfigDict(json_encoders={datetime: str})"
+
+  - id: pydantic_settings
+    name: "pydantic-settings"
+    category: "Configuration Management"
+    description: >
+      pydantic-settings adalah extension Pydantic untuk membaca konfigurasi dari
+      environment variables, .env files, secrets files, dan cloud secret managers
+      secara type-safe. Semua API keys, database credentials, dan pipeline parameters
+      RETRO didefinisikan sebagai Pydantic settings class — type-checked, documented,
+      dan dengan default values yang jelas.
+    specific_function: >
+      Central configuration hub untuk RETRO pipeline. Satu Settings class yang
+      mendefinisikan semua konfigurasi: LLM_MODEL, database URLs, API keys, rate limits,
+      batch sizes, cron schedules. Dibaca dari .env file atau environment variables.
+      Menggantikan scattered os.environ.get() di seluruh codebase.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://docs.pydantic.dev/latest/concepts/pydantic_settings/"
+
+    retro:
+      phase: "Semua phase — konfigurasi pipeline"
+      role: >
+        Single source of truth untuk semua konfigurasi RETRO. Import settings dari
+        satu tempat di semua module. Mudah untuk switch environment (dev/staging/prod)
+        hanya dengan ubah .env file. Type safety mencegah bug dari typo env var name.
+      when_to_use: >
+        Gunakan pydantic-settings sejak awal project. Setiap kali ada konfigurasi
+        baru (API key, feature flag, threshold value), tambahkan ke Settings class
+        bukan di-hardcode di kode.
+      priority: "foundational — setup di awal project"
+      output_goes_to: "Diimport oleh semua module yang butuh konfigurasi"
+
+    setup:
+      install: |
+        pip install pydantic-settings
+      requirements:
+        - "pydantic>=2.0.0"
+        - ".env file di root project (opsional, bisa juga pure env vars)"
+      env_vars:
+        - name: ENV
+          description: "Environment: development/staging/production. Default: development"
+
+    usage:
+      basic_example: |
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+        from pydantic import Field
+        from typing import Optional
+        from functools import lru_cache
+
+        class Settings(BaseSettings):
+            model_config = SettingsConfigDict(
+                env_file=".env",
+                env_file_encoding="utf-8",
+                case_sensitive=False,
+                extra="ignore"  # Abaikan env vars yang tidak didefinisikan
+            )
+
+            # LLM Configuration
+            llm_model: str = "claude-sonnet-4-6"
+            anthropic_api_key: Optional[str] = None
+            groq_api_key: Optional[str] = None
+
+            # Database
+            database_url: str = "postgresql://retro:password@localhost:5432/retro_db"
+            redis_url: str = "redis://localhost:6379"
+
+            # Email Discovery
+            hunter_api_key: Optional[str] = None
+            apollo_api_key: Optional[str] = None
+
+        @lru_cache()
+        def get_settings() -> Settings:
+            return Settings()
+
+        # Penggunaan di mana saja
+        settings = get_settings()
+        print(settings.llm_model)  # Baca dari LLM_MODEL env var atau default
+
+      retro_example: |
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+        from pydantic import Field, field_validator
+        from typing import Optional, List
+        from functools import lru_cache
+
+        class RetroSettings(BaseSettings):
+            model_config = SettingsConfigDict(
+                env_file=".env",
+                env_file_encoding="utf-8",
+                case_sensitive=False,
+                extra="ignore"
+            )
+
+            # ===== ENVIRONMENT =====
+            env: str = Field(default="development", description="development/staging/production")
+
+            # ===== LLM =====
+            llm_model: str = Field(default="claude-sonnet-4-6", description="Primary LLM model")
+            llm_fast_model: str = Field(default="groq/llama-3.1-70b-versatile", description="Fast/cheap LLM untuk batch")
+            anthropic_api_key: Optional[str] = None
+            groq_api_key: Optional[str] = None
+            ollama_host: str = Field(default="http://localhost:11434")
+
+            # ===== DATABASE =====
+            database_url: str = Field(default="sqlite:///./retro.db", description="PostgreSQL untuk prod, SQLite untuk dev")
+            redis_url: str = Field(default="redis://localhost:6379")
+            qdrant_host: str = Field(default="localhost")
+            qdrant_port: int = Field(default=6333)
+
+            # ===== EMAIL DISCOVERY =====
+            hunter_api_key: Optional[str] = None
+            snov_api_key: Optional[str] = None
+            apollo_api_key: Optional[str] = None
+
+            # ===== EMAIL SENDING =====
+            resend_api_key: Optional[str] = None
+            sender_email: str = Field(default="retro@yourdomain.com")
+            sender_name: str = Field(default="RETRO Business Intelligence")
+
+            # ===== NOTIFICATION =====
+            telegram_bot_token: Optional[str] = None
+            telegram_chat_id: Optional[str] = None
+
+            # ===== STORAGE =====
+            minio_endpoint: str = Field(default="localhost:9000")
+            minio_access_key: Optional[str] = None
+            minio_secret_key: Optional[str] = None
+            minio_bucket: str = Field(default="retro-proposals")
+
+            # ===== PIPELINE PARAMETERS =====
+            max_companies_per_expo: int = Field(default=100, ge=1, le=1000)
+            min_collaboration_score: float = Field(default=0.6, ge=0.0, le=1.0)
+            email_send_limit_daily: int = Field(default=50, description="Max email per hari untuk domain warming")
+            crawl_delay_seconds: float = Field(default=1.0, description="Delay antar HTTP request")
+
+            # ===== OSINT =====
+            shodan_api_key: Optional[str] = None
+            crunchbase_api_key: Optional[str] = None
+
+            @field_validator('env')
+            @classmethod
+            def validate_env(cls, v):
+                allowed = {"development", "staging", "production"}
+                if v not in allowed:
+                    raise ValueError(f"env harus salah satu dari: {allowed}")
+                return v
+
+            @property
+            def is_production(self) -> bool:
+                return self.env == "production"
+
+            @property
+            def active_llm_model(self) -> str:
+                """Return fast model untuk dev, primary untuk prod"""
+                if not self.is_production:
+                    return self.llm_fast_model
+                return self.llm_model
+
+        @lru_cache()
+        def get_settings() -> RetroSettings:
+            return RetroSettings()
+
+        # Gunakan di semua module:
+        # from retro.config import get_settings
+        # settings = get_settings()
+        # model = settings.active_llm_model
+
+      expected_output: |
+        # .env file:
+        # LLM_MODEL=claude-sonnet-4-6
+        # ANTHROPIC_API_KEY=sk-ant-xxxxx
+        # DATABASE_URL=postgresql://retro:pw@localhost/retro
+
+        # settings = get_settings()
+        # settings.llm_model  -> "claude-sonnet-4-6"
+        # settings.is_production -> False (jika ENV=development)
+
+    notes: >
+      @lru_cache() pada get_settings() memastikan Settings hanya dibaca dari .env
+      sekali per process. Ini penting karena Settings() membaca file system setiap
+      kali diinstansiasi. Untuk testing, reset cache dengan get_settings.cache_clear().
+
+    pitfalls:
+      - issue: "Settings tidak membaca .env file"
+        fix: "Pastikan .env ada di directory dimana script dijalankan. Gunakan env_file='../.env' untuk relative path. Atau set absolute path."
+      - issue: "env var tidak terbaca di Docker container"
+        fix: "Di Docker, env vars diset via environment: di docker-compose.yml. Pastikan tidak ada conflict dengan .env file yang di-copy ke image."
+      - issue: "Circular import antara settings dan module lain"
+        fix: "Gunakan lazy import: import settings di dalam function, bukan di module level. Atau pisahkan settings ke retro/config.py yang tidak import modul lain."

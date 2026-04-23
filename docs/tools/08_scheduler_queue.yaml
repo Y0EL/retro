@@ -1,0 +1,1043 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Scheduler, Task Queue & Workflow Orchestration
+# File: 08_scheduler_queue.yaml
+# Purpose: Tools untuk menjalankan RETRO pipeline secara otomatis tanpa intervensi manual.
+#          Scheduler menentukan KAPAN pipeline berjalan (jam 8 pagi setiap hari, setiap Senin, dll).
+#          Task queue menentukan BAGAIMANA tasks didistribusikan ke workers secara async.
+#
+# RETRO SCHEDULING REQUIREMENTS:
+#   - Daily news crawl: setiap hari jam 06:00 pagi (sebelum jam kerja)
+#   - Expo website crawl: setiap hari atau setiap jam selama periode expo berlangsung
+#   - Context Agent batch: trigger otomatis setelah crawl selesai
+#   - Synthesis + Proposal: trigger setelah Context Agent batch selesai
+#   - Email sending: jam 09:00-11:00 pagi (prime business hours)
+#   - Weekly cleanup: setiap Minggu dini hari
+#
+# RECOMMENDED STACK (minimal viable RETRO):
+#   Simple scheduling:   APScheduler (no broker needed, embedded in Python process)
+#   Production workflow: Prefect (open-source, beautiful UI, easy setup)
+#   Heavy job queue:     Celery + Redis (jika RQ tidak cukup)
+#   Lightweight queue:   RQ (Redis Queue - lihat 06_relational_db_cache.yaml)
+
+tools:
+
+  - id: apscheduler
+    name: "APScheduler (Advanced Python Scheduler)"
+    category: "In-Process Scheduler"
+    description: >
+      APScheduler adalah scheduler library Python yang berjalan embedded dalam
+      proses Python yang sama (tidak butuh server terpisah). Mendukung tiga jenis
+      trigger: interval (setiap N menit/jam), cron (ekspresi cron: '0 6 * * *' =
+      jam 6 pagi setiap hari), dan date (sekali pada tanggal tertentu). Mendukung
+      multiple job stores (memory, SQLAlchemy, Redis) dan multiple executors
+      (thread pool, process pool, asyncio). Sangat cocok untuk RETRO MVP karena
+      tidak perlu setup broker atau server tambahan: scheduler jalan sebagai
+      background thread dalam proses Python utama.
+    specific_function: >
+      In-process scheduler untuk RETRO pipeline. Crawl trigger berjalan otomatis
+      setiap hari jam 06:00. News aggregation trigger jam 05:30. Context Agent
+      batch trigger setelah crawl selesai. Email sending window jam 09:00-11:00.
+      Semua schedule dikonfigurasi sekali di startup dan berjalan tanpa intervensi.
+    language: "Python"
+    pricing: "Free (open-source, MIT)"
+    last_updated: "2025"
+    url: "https://apscheduler.readthedocs.io"
+    retro:
+      phase: "Phase 0 (Orchestration) - Schedule semua phase lain"
+      role: >
+        Master scheduler RETRO. Menentukan kapan setiap komponen pipeline berjalan.
+        APScheduler menjalankan: news crawler (cron 05:30), expo crawler (interval
+        atau cron), Context Agent batch trigger, dan email sending window.
+        Berjalan embedded dalam proses utama, tidak butuh Docker container tambahan.
+      when_to_use: >
+        Gunakan APScheduler untuk RETRO MVP dan single-server deployment. Scheduler
+        berjalan bersama aplikasi utama. Jika butuh distributed scheduling (multiple
+        servers, shared state), upgrade ke Prefect atau Airflow.
+      priority: "primary (simple scheduling)"
+      output_goes_to: "Trigger untuk semua phase pipeline"
+    setup:
+      install: "pip install 'apscheduler>=4.0.0a5'  # APScheduler v4 (async-first)"
+      requirements:
+        - "apscheduler>=3.10.0 (v3, stable) atau apscheduler>=4.0.0a5 (v4, async)"
+        - "Untuk SQLAlchemy job store: pip install sqlalchemy"
+        - "Untuk Redis job store: pip install redis"
+      env_vars:
+        - name: SCHEDULER_TIMEZONE
+          description: "Timezone untuk scheduler, e.g., 'Asia/Jakarta' untuk WIB"
+    usage:
+      basic_example: |
+        from apscheduler.schedulers.blocking import BlockingScheduler
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
+        import pytz
+
+        WIB = pytz.timezone("Asia/Jakarta")
+
+        scheduler = BackgroundScheduler(timezone=WIB)
+
+        # Cron trigger: setiap hari jam 06:00 WIB
+        @scheduler.scheduled_job(CronTrigger(hour=6, minute=0, timezone=WIB))
+        def daily_expo_crawl():
+            print("Starting daily expo crawl...")
+
+        # Interval trigger: setiap 2 jam
+        @scheduler.scheduled_job(IntervalTrigger(hours=2))
+        def periodic_news_fetch():
+            print("Fetching latest news...")
+
+        # Cron: Senin-Jumat jam 09:00 WIB
+        @scheduler.scheduled_job(CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone=WIB))
+        def send_proposals_window():
+            print("Proposal sending window open...")
+
+        scheduler.start()
+
+        # Keep main thread alive
+        import time
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            scheduler.shutdown()
+
+      retro_example: |
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        from apscheduler.executors.pool import ThreadPoolExecutor, ProcessPoolExecutor
+        from apscheduler.triggers.cron import CronTrigger
+        import pytz
+        import os
+        import logging
+
+        log = logging.getLogger("retro.scheduler")
+        WIB = pytz.timezone("Asia/Jakarta")
+        DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://retro:retro@localhost/retro_db")
+
+        def create_retro_scheduler() -> BackgroundScheduler:
+            """
+            Buat dan konfigurasi master scheduler RETRO.
+            Job definitions survive restart karena disimpan ke PostgreSQL.
+            """
+            jobstores = {
+                "default": SQLAlchemyJobStore(url=DATABASE_URL, tablename="apscheduler_jobs"),
+            }
+            executors = {
+                "default":  ThreadPoolExecutor(max_workers=4),
+                "crawlers": ThreadPoolExecutor(max_workers=8),
+            }
+            job_defaults = {
+                "coalesce":    True,   # Jika missed multiple runs, jalankan sekali saja
+                "max_instances": 1,    # Jangan overlap run yang sama
+                "misfire_grace_time": 3600,  # Toleransi keterlambatan 1 jam
+            }
+
+            scheduler = BackgroundScheduler(
+                jobstores=jobstores,
+                executors=executors,
+                job_defaults=job_defaults,
+                timezone=WIB,
+            )
+            return scheduler
+
+        def register_retro_jobs(scheduler: BackgroundScheduler, expo_configs: list[dict]):
+            """
+            Register semua recurring jobs untuk RETRO pipeline.
+            expo_configs: list of {"expo_name": "...", "crawl_url": "...", "active": True}
+            """
+
+            # ---- Phase 1: News & Trend Monitoring ----
+            scheduler.add_job(
+                func="retro.phase1.news_aggregator:run_daily_news_fetch",  # String import path
+                trigger=CronTrigger(hour=5, minute=30, timezone=WIB),
+                id="daily_news_fetch",
+                name="Daily News & Trend Fetch",
+                replace_existing=True,
+            )
+
+            # ---- Phase 2: Expo Crawler ----
+            for expo in expo_configs:
+                if not expo.get("active"):
+                    continue
+                expo_id = expo["expo_name"].replace(" ", "_").lower()
+
+                scheduler.add_job(
+                    func="retro.phase2.expo_crawler:crawl_expo",
+                    trigger=CronTrigger(hour=6, minute=0, timezone=WIB),
+                    id=f"expo_crawl_{expo_id}",
+                    name=f"Daily Expo Crawl: {expo['expo_name']}",
+                    kwargs={"expo_name": expo["expo_name"], "crawl_url": expo["crawl_url"]},
+                    replace_existing=True,
+                )
+
+            # ---- Phase 3: Context Agent Batch ----
+            scheduler.add_job(
+                func="retro.phase3.context_agent_batch:run_batch",
+                trigger=CronTrigger(hour=8, minute=0, timezone=WIB),  # Setelah crawl selesai
+                id="context_agent_batch",
+                name="Context Agent Batch Processing",
+                replace_existing=True,
+            )
+
+            # ---- Phase 5: Proposal Sending Window ----
+            scheduler.add_job(
+                func="retro.phase5.email_agent:open_sending_window",
+                trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone=WIB),
+                id="proposal_sending_window",
+                name="Proposal Email Sending Window (Mon-Fri 09:00 WIB)",
+                replace_existing=True,
+            )
+
+            # ---- Maintenance: Weekly cleanup ----
+            scheduler.add_job(
+                func="retro.maintenance.cleanup:run_weekly_cleanup",
+                trigger=CronTrigger(day_of_week="sun", hour=2, minute=0, timezone=WIB),
+                id="weekly_cleanup",
+                name="Weekly Database Cleanup",
+                replace_existing=True,
+            )
+
+            log.info(f"[Scheduler] Registered {len(scheduler.get_jobs())} jobs")
+
+        def start_retro_pipeline():
+            """Entry point: jalankan scheduler RETRO."""
+            scheduler = create_retro_scheduler()
+            expo_configs = [
+                {"expo_name": "LogiSEA 2025", "crawl_url": "https://logisea.com/exhibitors", "active": True},
+                {"expo_name": "IndoTrans 2025", "crawl_url": "https://indotrans.co.id/peserta", "active": True},
+            ]
+            register_retro_jobs(scheduler, expo_configs)
+            scheduler.start()
+            log.info("[Scheduler] RETRO pipeline scheduler started")
+
+            import time
+            try:
+                while True:
+                    time.sleep(300)
+                    # Log job status setiap 5 menit
+                    for job in scheduler.get_jobs():
+                        log.debug(f"  {job.name} -> next run: {job.next_run_time}")
+            except (KeyboardInterrupt, SystemExit):
+                scheduler.shutdown()
+                log.info("[Scheduler] Scheduler stopped")
+
+      expected_output: |
+        [Scheduler] Registered 6 jobs:
+          Daily News & Trend Fetch             -> next: 2025-04-24 05:30:00 WIB
+          Daily Expo Crawl: LogiSEA 2025       -> next: 2025-04-24 06:00:00 WIB
+          Daily Expo Crawl: IndoTrans 2025     -> next: 2025-04-24 06:00:00 WIB
+          Context Agent Batch Processing       -> next: 2025-04-24 08:00:00 WIB
+          Proposal Email Sending Window        -> next: 2025-04-28 09:00:00 WIB (Senin)
+          Weekly Database Cleanup              -> next: 2025-04-27 02:00:00 WIB (Minggu)
+
+        [05:30:02] Starting daily news fetch...
+        [06:00:01] Starting expo crawl: LogiSEA 2025
+        [06:00:01] Starting expo crawl: IndoTrans 2025
+        [08:00:03] Context Agent Batch: 47 companies queued
+
+    notes:
+      - "SQLAlchemyJobStore menyimpan job definitions ke PostgreSQL sehingga survive restart. Tanpa jobstore, jobs hilang saat restart"
+      - "coalesce=True mencegah backlog saat server mati: jika 3 scheduled runs missed, jalankan sekali saja saat recover"
+      - "max_instances=1 mencegah overlap run yang sama (crawl job baru mulai sebelum yang lama selesai)"
+      - "Gunakan string import path ('module:function') untuk func parameter agar tidak perlu import semua di startup"
+      - "misfire_grace_time=3600 artinya: jika scheduled time terlewat < 1 jam, tetap jalankan. Lebih dari 1 jam, skip"
+      - "SCHEDULER_TIMEZONE harus 'Asia/Jakarta' untuk WIB. Selalu set timezone eksplisit, jangan rely on system timezone"
+    pitfalls:
+      - "JANGAN gunakan BlockingScheduler jika scheduler berjalan bersama web server atau other async code, gunakan BackgroundScheduler"
+      - "ThreadPoolExecutor terbatas pada GIL Python. Untuk CPU-intensive tasks, gunakan ProcessPoolExecutor"
+      - "APScheduler tidak mendukung distributed scheduling (multiple servers). Untuk multi-server, gunakan Prefect atau Celery Beat"
+      - "Job function harus idempotent: aman dijalankan dua kali tanpa efek samping buruk (misalnya karena coalesce)"
+
+  - id: celery
+    name: "Celery"
+    category: "Distributed Task Queue"
+    description: >
+      Celery adalah distributed task queue framework yang paling populer di Python.
+      Mendukung multiple brokers (Redis, RabbitMQ, SQS) dan multiple result backends.
+      Fitur utama: task routing ke queue berbeda, rate limiting per task, task
+      expiry, ETA (schedule task untuk waktu tertentu), canvas (chord, chain, group
+      untuk task composition), dan Celery Beat untuk periodic tasks. Jauh lebih
+      powerful dari RQ tapi juga lebih complex. Cocok untuk RETRO jika needs:
+      task chaining (crawl -> profile -> synthesize -> send) yang deterministic,
+      atau distributed processing di multiple servers.
+    specific_function: >
+      Distributed task queue untuk RETRO dengan task chaining. Setelah crawl selesai
+      (Task A), otomatis trigger Context Agent batch (Task B), kemudian setelah semua
+      profiling selesai, trigger Synthesis Agent (Task C). Celery canvas (chord)
+      memungkinkan ini secara native. Celery Beat menggantikan APScheduler untuk
+      periodic scheduling.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://docs.celeryq.dev"
+    retro:
+      phase: "Phase 0-5 (distributed orchestration)"
+      role: >
+        Full pipeline orchestration menggunakan Celery task chaining. Setiap
+        phase RETRO adalah satu Celery task. Celery Beat handle periodic scheduling
+        (pengganti APScheduler). Multiple Celery workers bisa di-deploy di
+        server berbeda untuk horizontal scaling.
+      when_to_use: >
+        Gunakan Celery ketika RETRO berkembang ke multi-server deployment atau
+        ketika task chaining complex (crawl -> profile -> synthesize -> propose)
+        perlu di-orchestrate secara deterministic. Untuk MVP, RQ + APScheduler
+        sudah cukup.
+      priority: "secondary (production scale)"
+      output_goes_to: "Sama dengan RQ tapi dengan more control"
+    setup:
+      install: "pip install celery redis flower  # flower untuk monitoring UI"
+      requirements:
+        - "celery>=5.3.0"
+        - "redis (sebagai broker)"
+        - "flower>=2.0.0 (optional, monitoring UI)"
+      env_vars:
+        - name: CELERY_BROKER_URL
+          description: "redis://localhost:6379/1"
+        - name: CELERY_RESULT_BACKEND
+          description: "redis://localhost:6379/2"
+    usage:
+      basic_example: |
+        from celery import Celery
+        import os
+
+        app = Celery(
+            "retro",
+            broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1"),
+            backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/2"),
+        )
+
+        @app.task(bind=True, max_retries=3, default_retry_delay=60)
+        def profile_company_task(self, domain: str, content: str, expo: str):
+            try:
+                from retro.context_agent import run_context_agent
+                return run_context_agent(domain, content, expo)
+            except Exception as exc:
+                raise self.retry(exc=exc)
+
+        # Jalankan task
+        result = profile_company_task.delay("sinarlogistik.co.id", "<content>", "LogiSEA 2025")
+        print(result.get(timeout=180))
+
+        # Jalankan worker: celery -A retro_tasks worker --loglevel=info -Q retro_profiling
+
+      retro_example: |
+        from celery import Celery, chord, chain
+        from celery.schedules import crontab
+        import os
+
+        app = Celery("retro_pipeline")
+        app.config_from_object({
+            "broker_url":            os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1"),
+            "result_backend":        os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/2"),
+            "task_serializer":       "json",
+            "result_serializer":     "json",
+            "accept_content":        ["json"],
+            "timezone":              "Asia/Jakarta",
+            "enable_utc":            True,
+            "task_track_started":    True,
+            "worker_prefetch_multiplier": 1,  # Satu task per worker (untuk long tasks)
+            # Celery Beat schedule (pengganti APScheduler)
+            "beat_schedule": {
+                "daily-news-fetch": {
+                    "task":     "retro.tasks.fetch_news",
+                    "schedule": crontab(hour=5, minute=30),
+                },
+                "daily-expo-crawl": {
+                    "task":     "retro.tasks.crawl_all_expos",
+                    "schedule": crontab(hour=6, minute=0),
+                },
+                "daily-context-batch": {
+                    "task":     "retro.tasks.run_context_batch",
+                    "schedule": crontab(hour=8, minute=0),
+                },
+                "weekly-cleanup": {
+                    "task":     "retro.tasks.cleanup",
+                    "schedule": crontab(hour=2, minute=0, day_of_week="sunday"),
+                },
+            },
+        })
+
+        @app.task(queue="crawlers", max_retries=3, default_retry_delay=120)
+        def crawl_expo_task(expo_name: str, crawl_url: str) -> list[str]:
+            """Return list of found company URLs."""
+            from retro.phase2.expo_crawler import crawl_expo
+            return crawl_expo(expo_name, crawl_url)
+
+        @app.task(queue="profiling", max_retries=2, default_retry_delay=60, time_limit=300)
+        def profile_company_task(staging_id: int, expo: str) -> dict | None:
+            """Profile satu company, return profile card dict."""
+            from retro.phase3.context_agent import run_for_staging_id
+            return run_for_staging_id(staging_id, expo)
+
+        @app.task(queue="synthesis")
+        def synthesize_and_propose_task(profiled_domains: list[str], expo: str) -> dict:
+            """Jalankan Synthesis Agent dan generate proposals."""
+            from retro.phase4.synthesis import run_synthesis
+            from retro.phase5.proposal_writer import generate_proposals
+            candidates = run_synthesis(profiled_domains, expo)
+            proposals  = generate_proposals(candidates, expo)
+            return {"candidates": len(candidates), "proposals": len(proposals)}
+
+        def run_full_pipeline_async(expo_name: str, crawl_url: str):
+            """
+            Orchestrate full pipeline menggunakan Celery canvas.
+            1. crawl_expo_task -> list of staging_ids
+            2. chord(profile_company_task for each id) -> list of results
+            3. synthesize_and_propose_task -> final output
+            """
+            # Step 1: Crawl (satu task)
+            crawl_result = crawl_expo_task.delay(expo_name, crawl_url)
+            staging_ids  = crawl_result.get(timeout=1800)  # Max 30 menit crawl
+
+            if not staging_ids:
+                print(f"[Celery] No new companies found for {expo_name}")
+                return
+
+            # Step 2: Profile semua (parallel, menggunakan chord)
+            profile_tasks = [profile_company_task.s(sid, expo_name) for sid in staging_ids]
+            callback      = synthesize_and_propose_task.s(expo_name)
+            chord(profile_tasks)(callback).get(timeout=7200)  # Max 2 jam profiling
+
+      expected_output: |
+        $ celery -A retro.tasks worker -Q crawlers,profiling,synthesis --loglevel=info --concurrency=4
+        [celery] INFO - Connected to redis://localhost:6379/1
+        [celery] INFO - Received task: retro.tasks.crawl_expo_task[abc123]
+        [celery] INFO - Task crawl_expo_task[abc123] succeeded in 847.3s: [1, 2, 3, ..., 342]
+        [celery] INFO - Received task: retro.tasks.profile_company_task[def456]
+        [celery] INFO - Task profile_company_task[def456] succeeded in 23.4s: {"company_name": ...}
+
+        $ celery -A retro.tasks beat --loglevel=info
+        [celery] INFO - Scheduler: Sending due task daily-news-fetch (retro.tasks.fetch_news)
+
+        $ flower --broker=redis://localhost:6379/1
+        Flower dashboard: http://localhost:5555
+
+    notes:
+      - "queue='crawlers' memisahkan tasks ke queue berbeda, sehingga bisa punya worker khusus per tipe task"
+      - "chord() menunggu SEMUA parallel tasks selesai sebelum menjalankan callback (synthesize_and_propose)"
+      - "worker_prefetch_multiplier=1 penting untuk long-running tasks: worker hanya ambil satu task per kali"
+      - "Celery Beat memerlukan running process terpisah: celery -A retro.tasks beat"
+      - "Flower adalah web UI untuk monitoring Celery: lihat task status, worker status, queue depth"
+      - "time_limit=300 (5 menit) mencegah task stuck forever, task akan di-kill dan masuk REVOKED state"
+    pitfalls:
+      - "JANGAN return non-serializable objects dari task (hanya return JSON-serializable: dict, list, str, int)"
+      - "JANGAN call task.get() dari dalam task lain (deadlock potential), gunakan chord/chain/group untuk task composition"
+      - "Celery result backend di Redis expire setelah 24 jam default, ambil result sebelum expire"
+      - "Celery Beat dan worker adalah proses TERPISAH, harus running dua-duanya secara bersamaan"
+
+  - id: prefect
+    name: "Prefect"
+    category: "Workflow Orchestration"
+    description: >
+      Prefect adalah modern workflow orchestration platform open-source. Memungkinkan
+      mendefinisikan pipeline sebagai Python function dengan decorator @flow dan @task.
+      Prefect menangani: retry logic, caching, parallel execution, scheduling,
+      observability (beautiful UI), dan state management. Prefect Cloud memiliki
+      free tier generous (3 workspaces, 3 workers). Self-hosted dengan prefect server
+      sangat mudah di-setup (satu command). Lebih developer-friendly dari Airflow
+      karena tidak perlu DAG XML dan bisa debug Python langsung.
+    specific_function: >
+      End-to-end RETRO pipeline orchestration dengan observability. Setiap phase
+      RETRO adalah Prefect flow yang bisa di-monitor dari Prefect UI. Retry otomatis
+      jika crawl gagal. Caching untuk hindari re-crawl URL yang sama. Scheduling
+      via Prefect deployments. Single Prefect UI untuk melihat seluruh pipeline health.
+    language: "Python"
+    pricing: "Free self-hosted, Prefect Cloud free: 3 workspaces unlimited runs"
+    last_updated: "2025"
+    url: "https://prefect.io"
+    retro:
+      phase: "Phase 0-5 (full pipeline orchestration)"
+      role: >
+        Modern pipeline orchestration yang menggabungkan scheduler, task queue, retry,
+        dan observability dalam satu tool. Ideal sebagai step-up dari APScheduler + RQ
+        ketika RETRO butuh lebih banyak observability dan control.
+      when_to_use: >
+        Gunakan Prefect ketika RETRO sudah melampaui MVP dan butuh: visual pipeline
+        monitoring, automatic retries dengan backoff, caching results, dan scheduling
+        yang lebih powerful dari APScheduler. Jauh lebih mudah dari Airflow.
+      priority: "secondary (recommended for production)"
+      output_goes_to: "PostgreSQL (data), Prefect UI (monitoring)"
+    setup:
+      install: |
+        pip install prefect
+        prefect server start  # Self-hosted server (port 4200)
+        # Atau gunakan Prefect Cloud: prefect cloud login
+      requirements:
+        - "prefect>=2.14.0"
+        - "Python 3.9+"
+      env_vars:
+        - name: PREFECT_API_URL
+          description: "http://localhost:4200/api (self-hosted) atau Prefect Cloud URL"
+    usage:
+      basic_example: |
+        from prefect import flow, task
+        from prefect.tasks import task_input_hash
+        from datetime import timedelta
+
+        @task(retries=3, retry_delay_seconds=30, cache_key_fn=task_input_hash, cache_expiration=timedelta(hours=24))
+        def crawl_company(url: str) -> str:
+            """Crawl satu URL. Di-cache 24 jam berdasarkan URL."""
+            from crawl4ai import WebCrawler
+            crawler = WebCrawler()
+            result  = crawler.run(url=url, word_count_threshold=100)
+            return result.markdown
+
+        @task(retries=2, retry_delay_seconds=60)
+        def profile_company(domain: str, content: str) -> dict | None:
+            from retro.context_agent import run_context_agent
+            return run_context_agent(domain, content)
+
+        @flow(name="RETRO Daily Pipeline", log_prints=True)
+        def retro_daily_pipeline(expo_name: str, exhibitor_urls: list[str]):
+            """Main RETRO flow."""
+            print(f"Processing {len(exhibitor_urls)} companies for {expo_name}")
+
+            # Parallel crawl semua URLs
+            contents = crawl_company.map(exhibitor_urls)
+
+            # Profile setiap company
+            profiles = []
+            for url, content in zip(exhibitor_urls, contents):
+                domain  = extract_domain(url)
+                profile = profile_company(domain, content)
+                if profile:
+                    profiles.append(profile)
+
+            print(f"Profiled {len(profiles)}/{len(exhibitor_urls)} companies")
+            return profiles
+
+        # Jalankan sekali
+        if __name__ == "__main__":
+            retro_daily_pipeline(
+                expo_name="LogiSEA 2025",
+                exhibitor_urls=["https://logisea.com/exhibitor/1", ...]
+            )
+
+      retro_example: |
+        from prefect import flow, task, get_run_logger
+        from prefect.tasks import task_input_hash
+        from prefect.deployments import Deployment
+        from prefect.server.schemas.schedules import CronSchedule
+        from prefect.context import get_run_context
+        from datetime import timedelta
+        import pytz
+
+        # ---- TASK DEFINITIONS ----
+
+        @task(name="fetch-news", retries=2, retry_delay_seconds=60)
+        def task_fetch_news() -> dict:
+            logger = get_run_logger()
+            from retro.phase1.news_aggregator import run_daily_news_fetch
+            result = run_daily_news_fetch()
+            logger.info(f"News fetched: {result['count']} articles")
+            return result
+
+        @task(
+            name="crawl-expo",
+            retries=3,
+            retry_delay_seconds=[30, 60, 120],  # Exponential backoff
+            cache_key_fn=task_input_hash,
+            cache_expiration=timedelta(hours=6),
+        )
+        def task_crawl_expo(expo_name: str, crawl_url: str) -> list[dict]:
+            logger = get_run_logger()
+            from retro.phase2.expo_crawler import crawl_expo
+            results = crawl_expo(expo_name, crawl_url)
+            logger.info(f"Crawled {len(results)} companies from {expo_name}")
+            return results
+
+        @task(
+            name="profile-company",
+            retries=2,
+            retry_delay_seconds=30,
+            timeout_seconds=180,
+        )
+        def task_profile_company(staging_entry: dict, expo: str) -> dict | None:
+            logger = get_run_logger()
+            from retro.phase3.context_agent import profile_one
+            profile = profile_one(staging_entry["domain"], staging_entry["content"], expo)
+            if profile:
+                logger.info(f"Profiled: {profile['company_name']} | {profile['collaboration_potential']}")
+            return profile
+
+        @task(name="run-synthesis", retries=1)
+        def task_synthesis(profiles: list[dict], expo: str) -> list[dict]:
+            from retro.phase4.synthesis import run_synthesis
+            return run_synthesis(profiles, expo)
+
+        @task(name="generate-proposals")
+        def task_generate_proposals(candidates: list[dict], expo: str) -> list[str]:
+            from retro.phase5.proposal_writer import generate_proposals_batch
+            return generate_proposals_batch(candidates, expo)
+
+        # ---- MAIN FLOW ----
+
+        @flow(
+            name="retro-full-pipeline",
+            description="RETRO daily B2B intelligence pipeline",
+            timeout_seconds=14400,  # 4 jam max total
+        )
+        def retro_full_pipeline(expo_name: str, crawl_url: str):
+            logger = get_run_logger()
+            logger.info(f"RETRO pipeline started for: {expo_name}")
+
+            # Phase 1: News (concurrent dengan Phase 2)
+            news_future = task_fetch_news.submit()
+
+            # Phase 2: Crawl
+            staging_entries = task_crawl_expo(expo_name, crawl_url)
+
+            # Phase 3: Profile (parallel dengan .map())
+            profile_futures = task_profile_company.map(
+                staging_entry=staging_entries,
+                expo=[expo_name] * len(staging_entries),
+            )
+            profiles = [p for p in profile_futures if p is not None]
+            logger.info(f"Profiling complete: {len(profiles)}/{len(staging_entries)}")
+
+            # Phase 4: Synthesis
+            candidates = task_synthesis(profiles, expo_name)
+
+            # Phase 5: Proposals
+            proposals = task_generate_proposals(candidates, expo_name)
+
+            # Tunggu news (seharusnya sudah selesai)
+            news_result = news_future.result()
+
+            return {
+                "expo":       expo_name,
+                "crawled":    len(staging_entries),
+                "profiled":   len(profiles),
+                "candidates": len(candidates),
+                "proposals":  len(proposals),
+                "news":       news_result["count"],
+            }
+
+        # ---- DEPLOYMENT (scheduling) ----
+        def create_retro_deployment():
+            """Create deployment dengan cron schedule."""
+            deployment = Deployment.build_from_flow(
+                flow=retro_full_pipeline,
+                name="retro-logisea-2025",
+                parameters={
+                    "expo_name": "LogiSEA 2025",
+                    "crawl_url": "https://logisea.com/exhibitors",
+                },
+                schedule=CronSchedule(
+                    cron="0 6 * * *",  # Jam 06:00 setiap hari
+                    timezone="Asia/Jakarta",
+                ),
+                work_queue_name="retro-production",
+            )
+            deployment.apply()
+            print("Deployment created. Start worker: prefect worker start -q retro-production")
+
+      expected_output: |
+        # Prefect UI: http://localhost:4200
+        #
+        # Flow Run: retro-full-pipeline / LogiSEA 2025
+        # Status: Completed in 2h 47m
+        # Tasks:
+        #   fetch-news           [SUCCESS] 0:02:31
+        #   crawl-expo           [SUCCESS] 0:47:23 (342 companies found)
+        #   profile-company (x342) [SUCCESS] 1:38:14 (parallel, 4 workers)
+        #   run-synthesis        [SUCCESS] 0:08:42
+        #   generate-proposals   [SUCCESS] 0:11:08 (3 proposals)
+        #
+        # Result:
+        # {"expo": "LogiSEA 2025", "crawled": 342, "profiled": 329, "candidates": 15, "proposals": 3}
+
+    notes:
+      - "cache_key_fn=task_input_hash menyimpan hasil task berdasarkan input hash. Crawl URL yang sama tidak di-crawl ulang dalam cache_expiration"
+      - ".map() menjalankan task secara parallel untuk setiap item dalam list, sangat efisien untuk batch profiling"
+      - ".submit() menjalankan task secara async (non-blocking), berguna untuk tasks concurrent seperti news fetch"
+      - "retry_delay_seconds bisa berupa list [30, 60, 120] untuk exponential backoff"
+      - "prefect server start menjalankan Prefect server lokal di http://localhost:4200 tanpa perlu cloud"
+      - "Prefect deployment memisahkan scheduling dari flow definition: bisa deploy satu flow ke multiple schedules"
+    pitfalls:
+      - "JANGAN mix Prefect tasks dengan blocking I/O tanpa threading, gunakan asyncio tasks untuk async operations"
+      - "Cache Prefect disimpan di Prefect backend, bukan di Redis atau disk, jika Prefect server restart cache hilang"
+      - "prefect worker start -q QUEUE_NAME harus match dengan work_queue_name di deployment"
+      - "Flow parameters harus JSON-serializable karena disimpan di Prefect database"
+
+  - id: airflow
+    name: "Apache Airflow"
+    category: "Workflow Orchestration (Enterprise)"
+    description: >
+      Apache Airflow adalah platform workflow orchestration yang paling mature dan
+      widely-used di enterprise. Mendefinisikan pipeline sebagai DAG (Directed Acyclic
+      Graph) dalam Python. Sangat powerful tapi juga paling complex dalam setup.
+      Memerlukan: webserver, scheduler, executor, worker, dan metadata database. Untuk
+      RETRO, Airflow overkill kecuali sudah ada infrastruktur Airflow di perusahaan
+      atau tim data engineering yang familiar. Prefect lebih direkomendasikan untuk
+      RETRO karena lebih developer-friendly.
+    specific_function: >
+      Enterprise-grade workflow orchestration untuk RETRO. Cocok jika perusahaan
+      sudah menggunakan Airflow dan RETRO perlu terintegrasi ke ekosistem data
+      pipeline yang ada. Tidak disarankan untuk RETRO greenfield project.
+    language: "Python"
+    pricing: "Free (open-source), MWAA (AWS managed): ~$150/bulan, Cloud Composer (GCP): ~$150/bulan"
+    last_updated: "2025"
+    url: "https://airflow.apache.org"
+    retro:
+      phase: "Phase 0-5 (enterprise orchestration)"
+      role: "Enterprise workflow orchestration jika sudah ada Airflow infrastructure"
+      when_to_use: >
+        Gunakan Airflow HANYA jika perusahaan sudah ada Airflow deployment dan RETRO
+        perlu integrate. Untuk greenfield RETRO, gunakan Prefect atau APScheduler + RQ.
+      priority: "optional (enterprise only)"
+      output_goes_to: "Sama dengan Prefect"
+    setup:
+      install: "pip install apache-airflow"
+      docker: "docker compose up (dari https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html)"
+      requirements:
+        - "apache-airflow>=2.8.0"
+        - "PostgreSQL (metadata database)"
+        - "Redis (untuk CeleryExecutor)"
+      env_vars:
+        - name: AIRFLOW__CORE__SQL_ALCHEMY_CONN
+          description: "postgresql://airflow:airflow@postgres/airflow"
+        - name: AIRFLOW__CELERY__BROKER_URL
+          description: "redis://redis:6379/0"
+    usage:
+      basic_example: |
+        from airflow import DAG
+        from airflow.operators.python import PythonOperator
+        from datetime import datetime, timedelta
+        import pytz
+
+        WIB = pytz.timezone("Asia/Jakarta")
+
+        default_args = {
+            "owner":            "retro",
+            "retries":          3,
+            "retry_delay":      timedelta(minutes=5),
+            "email_on_failure": True,
+            "email":            ["retro-alerts@company.com"],
+        }
+
+        with DAG(
+            dag_id="retro_daily_pipeline",
+            default_args=default_args,
+            schedule="0 6 * * *",  # Jam 06:00 setiap hari
+            start_date=datetime(2025, 1, 1, tzinfo=WIB),
+            catchup=False,
+            tags=["retro", "b2b-intelligence"],
+        ) as dag:
+
+            fetch_news = PythonOperator(
+                task_id="fetch_news",
+                python_callable=lambda: __import__("retro.phase1", fromlist=["run"]).run(),
+            )
+
+            crawl_expo = PythonOperator(
+                task_id="crawl_expo",
+                python_callable=lambda: __import__("retro.phase2", fromlist=["run"]).run(),
+            )
+
+            run_context_batch = PythonOperator(
+                task_id="context_agent_batch",
+                python_callable=lambda: __import__("retro.phase3", fromlist=["run"]).run(),
+            )
+
+            # DAG dependency: fetch_news dan crawl_expo parallel, lalu context_batch
+            [fetch_news, crawl_expo] >> run_context_batch
+
+      retro_example: |
+        # Untuk RETRO, Airflow DAG structure lebih verbose dari Prefect.
+        # Contoh sederhana yang menunjukkan RETRO pipeline sebagai Airflow DAG.
+
+        from airflow import DAG
+        from airflow.operators.python import PythonOperator
+        from airflow.operators.bash import BashOperator
+        from airflow.sensors.python import PythonSensor
+        from datetime import datetime, timedelta
+
+        with DAG(
+            dag_id="retro_pipeline_v1",
+            schedule="0 6 * * 1-5",  # Senin-Jumat jam 06:00
+            start_date=datetime(2025, 4, 1),
+            catchup=False,
+            max_active_runs=1,  # Jangan overlap runs
+        ) as dag:
+
+            def _crawl_expos(**context):
+                from retro.phase2.expo_crawler import crawl_all_expos
+                return crawl_all_expos()
+
+            def _run_context_batch(**context):
+                from retro.phase3.context_agent_batch import run_batch
+                return run_batch()
+
+            def _run_synthesis(**context):
+                from retro.phase4.synthesis import run_synthesis_batch
+                return run_synthesis_batch()
+
+            def _send_proposals(**context):
+                from retro.phase5.email_agent import send_pending_proposals
+                return send_pending_proposals()
+
+            t1 = PythonOperator(task_id="crawl_expos",      python_callable=_crawl_expos)
+            t2 = PythonOperator(task_id="context_batch",    python_callable=_run_context_batch)
+            t3 = PythonOperator(task_id="synthesis",        python_callable=_run_synthesis)
+            t4 = PythonOperator(task_id="send_proposals",   python_callable=_send_proposals)
+
+            t1 >> t2 >> t3 >> t4
+
+      expected_output: |
+        # Airflow UI: http://localhost:8080
+        # DAG: retro_pipeline_v1
+        # Schedule: 0 6 * * 1-5
+        # Last Run: 2025-04-23 06:00:00 | Status: success | Duration: 2h 47m
+        #
+        # Task Tree:
+        # crawl_expos -> context_batch -> synthesis -> send_proposals
+        #
+        # Task Durations:
+        # crawl_expos:  47m 23s [success]
+        # context_batch: 1h 38m 14s [success]
+        # synthesis:    8m 42s [success]
+        # send_proposals: 11m 8s [success]
+
+    notes:
+      - "Airflow sangat mature dan battle-tested untuk enterprise, tapi setup awal butuh effort signifikan"
+      - "CeleryExecutor memungkinkan parallel task execution di multiple workers"
+      - "XCom (cross-task communication) untuk pass data antar tasks, tapi JANGAN pass data besar via XCom"
+      - "Airflow Sensors berguna untuk menunggu kondisi tertentu (file muncul, DB record ada) sebelum lanjut"
+    pitfalls:
+      - "JANGAN gunakan Airflow untuk RETRO greenfield project, terlalu complex untuk nilai yang didapat"
+      - "JANGAN pass dataframes atau large data via XCom, simpan ke database dan pass ID saja"
+      - "Airflow DAG bisa susah di-debug dibanding Prefect, log tersebar di multiple workers"
+
+  - id: schedule_python
+    name: "schedule (Python)"
+    category: "Simple In-Process Scheduler"
+    description: >
+      `schedule` adalah library Python ultra-simple untuk periodic job scheduling.
+      Tidak ada dependency, tidak ada background thread (harus dipanggil manual dalam
+      loop). Sangat readable dan Pythonic: schedule.every().day.at("06:00").do(my_func).
+      Cocok hanya untuk script sederhana yang berjalan manual atau di dalam while loop.
+      Untuk RETRO production, gunakan APScheduler yang lebih robust.
+    specific_function: >
+      Ultra-simple scheduler untuk testing dan development. Gunakan untuk cepat
+      test scheduling logic sebelum migrasi ke APScheduler atau Prefect.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2024"
+    url: "https://schedule.readthedocs.io"
+    retro:
+      phase: "Development only"
+      role: "Simple scheduler untuk development dan quick testing"
+      when_to_use: >
+        Gunakan hanya saat prototyping dan development awal. Untuk production RETRO,
+        gunakan APScheduler, Prefect, atau Celery Beat.
+      priority: "development only"
+      output_goes_to: "Development testing"
+    setup:
+      install: "pip install schedule"
+      requirements:
+        - "schedule>=1.2.0"
+      env_vars: []
+    usage:
+      basic_example: |
+        import schedule
+        import time
+
+        def job():
+            print("Running RETRO daily crawl...")
+
+        # Simple scheduling
+        schedule.every().day.at("06:00").do(job)
+        schedule.every(2).hours.do(job)
+        schedule.every().monday.at("09:00").do(job)
+
+        # Loop (blocking)
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+
+      retro_example: |
+        import schedule
+        import time
+        from datetime import datetime
+
+        def run_news_fetch():
+            print(f"[{datetime.now()}] Running news fetch...")
+            from retro.phase1.news_aggregator import run_daily_news_fetch
+            run_daily_news_fetch()
+
+        def run_expo_crawl():
+            print(f"[{datetime.now()}] Running expo crawl...")
+            from retro.phase2.expo_crawler import crawl_expo
+            crawl_expo("LogiSEA 2025", "https://logisea.com/exhibitors")
+
+        # Development schedule
+        schedule.every().day.at("05:30").do(run_news_fetch)
+        schedule.every().day.at("06:00").do(run_expo_crawl)
+
+        # Trigger manual untuk testing
+        run_expo_crawl()  # Test run sekarang
+
+        # Production loop
+        print("Scheduler running (Ctrl+C to stop)...")
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+
+      expected_output: |
+        [2025-04-23 05:30:00] Running news fetch...
+        [2025-04-23 06:00:00] Running expo crawl...
+        Scheduler running (Ctrl+C to stop)...
+
+    notes:
+      - "schedule tidak memiliki background thread: run_pending() HARUS dipanggil dari main thread dalam while loop"
+      - "schedule tidak thread-safe untuk concurrent job execution, semua jobs run synchronous dalam while loop"
+      - "Tidak ada persistence: jika script mati, schedule restart dari awal dan mungkin skip jobs"
+      - "Sangat mudah dipahami, cocok untuk demo dan cepat prototyping"
+    pitfalls:
+      - "JANGAN gunakan schedule di production RETRO, tidak ada retry, tidak ada persistence"
+      - "JANGAN jalankan long-running jobs di schedule tanpa threading karena akan block loop"
+      - "Tidak ada timezone support built-in, jobs berjalan di system timezone"
+
+  - id: dagster
+    name: "Dagster"
+    category: "Workflow Orchestration (Data-Aware)"
+    description: >
+      Dagster adalah workflow orchestration platform yang sangat data-aware: setiap
+      step memiliki typed input dan output (Assets), sehingga Dagster tahu dependensi
+      data antar steps. Asset-based model (bukan DAG task-based) lebih intuitif untuk
+      data pipelines. Dagster Cloud memiliki free tier generous. Lebih modern dari
+      Airflow dan memiliki konsep materialization (update data) yang cocok untuk RETRO
+      yang update company profiles secara periodic.
+    specific_function: >
+      Alternative ke Prefect dengan pendekatan asset-based. Company profiles, news articles,
+      proposal PDFs adalah Dagster assets yang di-materialize secara periodic. Dagster
+      tahu kapan asset perlu di-refresh berdasarkan upstream changes.
+    language: "Python"
+    pricing: "Free self-hosted, Dagster Cloud free: unlimited assets"
+    last_updated: "2025"
+    url: "https://dagster.io"
+    retro:
+      phase: "Phase 0-5 (asset-based pipeline)"
+      role: >
+        Alternative Prefect dengan asset-based model. Company profiles adalah assets
+        yang di-materialize setiap hari. Dagster otomatis track freshness dan
+        trigger re-materialization jika ada upstream changes (crawl baru).
+      when_to_use: >
+        Pertimbangkan Dagster jika RETRO butuh asset-based data model (track kapan
+        setiap company profile terakhir di-refresh) dan freshness checks. Prefect
+        lebih simple untuk task-based pipelines.
+      priority: "optional (asset-based alternative)"
+      output_goes_to: "PostgreSQL (materialized assets)"
+    setup:
+      install: "pip install dagster dagster-webserver"
+      requirements:
+        - "dagster>=1.6.0"
+        - "dagster-webserver (untuk UI)"
+      env_vars:
+        - name: DAGSTER_HOME
+          description: "Path untuk Dagster metadata storage, e.g., ~/.dagster"
+    usage:
+      basic_example: |
+        from dagster import asset, Definitions, ScheduleDefinition, define_asset_job
+        import pandas as pd
+
+        @asset(description="Raw company data crawled from expo websites")
+        def raw_expo_companies() -> pd.DataFrame:
+            from retro.phase2.expo_crawler import crawl_all_expos
+            data = crawl_all_expos()
+            return pd.DataFrame(data)
+
+        @asset(deps=["raw_expo_companies"], description="Company profiles generated by Context Agent")
+        def company_profiles(raw_expo_companies: pd.DataFrame) -> pd.DataFrame:
+            from retro.phase3.context_agent_batch import profile_batch
+            profiles = profile_batch(raw_expo_companies.to_dict(orient="records"))
+            return pd.DataFrame(profiles)
+
+        @asset(deps=["company_profiles"])
+        def collaboration_candidates(company_profiles: pd.DataFrame) -> pd.DataFrame:
+            from retro.phase4.synthesis import rank_candidates
+            return pd.DataFrame(rank_candidates(company_profiles.to_dict(orient="records")))
+
+        # Schedule
+        daily_job = define_asset_job("daily_retro_job", selection="*")
+        daily_schedule = ScheduleDefinition(
+            job=daily_job,
+            cron_schedule="0 6 * * *",
+        )
+
+        defs = Definitions(
+            assets=[raw_expo_companies, company_profiles, collaboration_candidates],
+            schedules=[daily_schedule],
+        )
+
+        # Jalankan: dagster dev (UI di http://localhost:3000)
+
+      retro_example: |
+        from dagster import (
+            asset, AssetIn, Definitions, ScheduleDefinition, define_asset_job,
+            MaterializeResult, MetadataValue, AssetExecutionContext,
+        )
+
+        @asset(
+            name="raw_expo_companies",
+            group_name="phase_2_crawl",
+            description="Exhibitor profiles crawled from expo websites",
+        )
+        def raw_expo_companies_asset(context: AssetExecutionContext) -> list[dict]:
+            from retro.phase2.expo_crawler import crawl_all_expos
+            results = crawl_all_expos()
+            context.add_output_metadata({
+                "company_count": MetadataValue.int(len(results)),
+                "expo_names":    MetadataValue.text(str([r["expo"] for r in results[:3]])),
+            })
+            return results
+
+        @asset(
+            name="company_profiles",
+            ins={"raw_companies": AssetIn("raw_expo_companies")},
+            group_name="phase_3_profiling",
+        )
+        def company_profiles_asset(
+            context: AssetExecutionContext,
+            raw_companies: list[dict],
+        ) -> list[dict]:
+            from retro.phase3.context_agent_batch import profile_batch
+            profiles = profile_batch(raw_companies)
+            high_potential = [p for p in profiles if p.get("collaboration_potential") == "high"]
+            context.add_output_metadata({
+                "total_profiled":    MetadataValue.int(len(profiles)),
+                "high_potential":    MetadataValue.int(len(high_potential)),
+            })
+            return profiles
+
+        daily_schedule = ScheduleDefinition(
+            name="retro_daily",
+            cron_schedule="0 6 * * *",
+            job=define_asset_job("retro_daily_job"),
+            execution_timezone="Asia/Jakarta",
+        )
+
+        defs = Definitions(
+            assets=[raw_expo_companies_asset, company_profiles_asset],
+            schedules=[daily_schedule],
+        )
+
+      expected_output: |
+        # Dagster UI: http://localhost:3000
+        # Assets:
+        #   raw_expo_companies  [Materialized: 2025-04-23 06:47] | 342 companies
+        #   company_profiles    [Materialized: 2025-04-23 08:34] | 329 profiled | 47 high-potential
+        #
+        # Asset lineage: raw_expo_companies -> company_profiles -> collaboration_candidates
+
+    notes:
+      - "Asset-based model lebih intuitif untuk RETRO: company_profiles adalah data asset yang di-refresh setiap hari"
+      - "MetadataValue memungkinkan attach statistics ke setiap materialization run (count, sample data)"
+      - "dagster dev command menjalankan webserver + scheduler dalam satu command untuk development"
+      - "Dagster mendukung partitioned assets: bisa track company profiles per expo per bulan secara terpisah"
+    pitfalls:
+      - "Dagster learning curve lebih tinggi dari APScheduler dan schedule karena konsep Asset dan Definitions baru"
+      - "JANGAN return large DataFrames dari assets di development, gunakan persistence ke PostgreSQL"
+      - "dagster dev tidak production-ready, gunakan dagster-daemon + dagster-webserver untuk production"

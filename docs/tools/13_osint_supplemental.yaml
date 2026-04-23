@@ -1,0 +1,1435 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: OSINT & Supplemental Intelligence
+# File: 13_osint_supplemental.yaml
+# Purpose: Tools untuk Open Source Intelligence (OSINT) yang memperkaya Company Profile.
+#          Setelah crawl website dan analisis PDF, RETRO menggunakan OSINT tools untuk
+#          tambahan context: siapa founder-nya, apakah perusahaan terdaftar resmi,
+#          berapa besar funding mereka, apa yang dikatakan publik tentang mereka.
+#
+# OSINT ENRICHMENT PIPELINE (setelah basic crawl):
+#   Company domain --> tldextract --> canonical domain
+#   Canonical domain --> Shodan/Censys --> tech stack, open ports, server info
+#   Company name --> OpenCorporates --> legal registration, directors, status
+#   Company name --> Crunchbase --> funding, investors, team size
+#   Domain --> Wayback Machine CDX --> historical versions, changes over time
+#   Company address --> Nominatim/geopy --> coordinates, region
+#
+# IMPORTANT LEGAL NOTE:
+#   Semua OSINT di RETRO menggunakan PUBLIC data saja.
+#   Jangan mengakses data yang memerlukan authorization.
+#   Jangan scraping data personal yang dilindungi GDPR/UU PDP.
+#   Fokus pada business entity data bukan personal data.
+
+tools:
+
+  - id: shodan
+    name: "Shodan"
+    category: "Internet-Connected Device Search"
+    description: >
+      Shodan adalah search engine untuk internet-connected devices. Indexing
+      semua IP addresses dan menampilkan: open ports, services running, SSL certificate
+      info, banner data, dan vulnerabilities. Untuk RETRO, Shodan berguna untuk
+      mendapatkan tech stack perusahaan target: server type (Apache, Nginx, IIS),
+      cloud provider (AWS, GCP, Azure), programming frameworks yang terdeteksi
+      di HTTP headers, dan apakah perusahaan menggunakan shared hosting atau
+      dedicated infrastructure. Data ini memperkaya Company Profile Card dengan
+      tech intelligence.
+    specific_function: >
+      Tech stack detection untuk company profiling. Dari domain perusahaan,
+      resolve IP, query Shodan untuk dapatkan: web server type, cloud provider,
+      teknologi yang digunakan (PHP, Python, Node.js dari headers), SSL certificate
+      info (expiry, org name), dan open services. Berguna untuk segment companies
+      berdasarkan tech maturity.
+    language: "Python (shodan library)"
+    pricing: "Gratis: 1 result/query (sangat terbatas). Membership: $49/bulan (unlimited)"
+    last_updated: "2025"
+    url: "https://shodan.io"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Tech intelligence enrichment"
+      role: >
+        Tech stack enrichment untuk Company Profile Card. Menambahkan field:
+        tech_stack (server, cloud, framework), tech_maturity (startup = shared hosting,
+        enterprise = dedicated cloud infra), dan infrastructure_notes. Informasi ini
+        membantu Synthesis Agent memilih companies yang tech-compatible dengan RETRO.
+      when_to_use: >
+        Gunakan Shodan sebagai optional enrichment setelah basic web crawl selesai.
+        Tidak semua company perlu Shodan lookup (terbatas quota). Prioritaskan
+        untuk high-potential companies yang lolos Synthesis Agent ranking.
+      priority: "optional (tech intelligence)"
+      output_goes_to: "Company Profile Card (tech_stack field)"
+    setup:
+      install: "pip install shodan"
+      requirements:
+        - "shodan>=1.28.0"
+        - "SHODAN_API_KEY dari https://account.shodan.io (gratis dengan limit)"
+      env_vars:
+        - name: SHODAN_API_KEY
+          description: "API key dari https://account.shodan.io"
+    usage:
+      basic_example: |
+        import shodan
+        import socket
+        import os
+
+        api = shodan.Shodan(os.environ["SHODAN_API_KEY"])
+
+        def lookup_domain_shodan(domain: str) -> dict | None:
+            try:
+                # Resolve domain ke IP
+                ip = socket.gethostbyname(domain)
+                host = api.host(ip)
+                return {
+                    "ip":         ip,
+                    "country":    host.get("country_name"),
+                    "org":        host.get("org"),
+                    "isp":        host.get("isp"),
+                    "ports":      host.get("ports", []),
+                    "tags":       host.get("tags", []),
+                    "hostnames":  host.get("hostnames", []),
+                }
+            except shodan.APIError as e:
+                if "No information" in str(e):
+                    return {"ip": ip, "shodan": "no_data"}
+                return None
+            except socket.gaierror:
+                return None
+
+        result = lookup_domain_shodan("sinarlogistik.co.id")
+        print(result)
+
+      retro_example: |
+        import shodan
+        import socket
+        import os
+        from retro.redis_client import cache_get, cache_set
+        import json
+
+        SHODAN_KEY = os.getenv("SHODAN_API_KEY")
+        _shodan_api = None
+
+        def get_shodan():
+            global _shodan_api
+            if _shodan_api is None and SHODAN_KEY:
+                _shodan_api = shodan.Shodan(SHODAN_KEY)
+            return _shodan_api
+
+        def enrich_company_tech(domain: str) -> dict:
+            """
+            Enrich company profile dengan tech intelligence dari Shodan.
+            Return dict dengan tech_stack, cloud_provider, tech_maturity.
+            """
+            # Cache check (cache 7 hari untuk Shodan results)
+            cache_key = f"shodan:{domain}"
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            api = get_shodan()
+            if not api:
+                return {"tech_stack": None, "cloud_provider": "unknown", "tech_maturity": "unknown"}
+
+            result = {
+                "tech_stack":     [],
+                "cloud_provider": "unknown",
+                "tech_maturity":  "unknown",
+                "ports_open":     [],
+                "server_info":    None,
+            }
+
+            try:
+                ip  = socket.gethostbyname(domain)
+                host = api.host(ip)
+
+                # Extract tech signals dari banners
+                for item in host.get("data", []):
+                    # Server header
+                    headers = item.get("http", {}).get("headers", {})
+                    server  = headers.get("Server", "")
+                    if server:
+                        result["tech_stack"].append(server)
+                    # X-Powered-By
+                    powered = headers.get("X-Powered-By", "")
+                    if powered:
+                        result["tech_stack"].append(powered)
+
+                result["ports_open"] = host.get("ports", [])
+                org = host.get("org", "").lower()
+
+                # Detect cloud provider dari org name
+                cloud_map = {
+                    "amazon":    "AWS",
+                    "google":    "GCP",
+                    "microsoft": "Azure",
+                    "alibaba":   "Alibaba Cloud",
+                    "digitalocean": "DigitalOcean",
+                    "cloudflare": "Cloudflare",
+                }
+                for keyword, provider in cloud_map.items():
+                    if keyword in org:
+                        result["cloud_provider"] = provider
+                        break
+
+                # Tech maturity: shared hosting vs cloud = indicator company scale
+                if result["cloud_provider"] in ["AWS", "GCP", "Azure"]:
+                    result["tech_maturity"] = "enterprise"
+                elif 443 in result["ports_open"]:
+                    result["tech_maturity"] = "established"
+                else:
+                    result["tech_maturity"] = "basic"
+
+                result["server_info"] = host.get("org")
+
+            except (shodan.APIError, socket.gaierror) as e:
+                pass
+
+            # Cache 7 hari
+            cache_set(cache_key, json.dumps(result), ttl_seconds=7 * 86400)
+            return result
+
+      expected_output: |
+        {
+          "tech_stack":     ["nginx/1.24.0", "PHP/8.1"],
+          "cloud_provider": "AWS",
+          "tech_maturity":  "enterprise",
+          "ports_open":     [80, 443, 22],
+          "server_info":    "Amazon Data Services Indonesia"
+        }
+        # Insight: Perusahaan menggunakan AWS infrastructure -> tech-savvy, lebih mudah integrasi API
+
+    notes:
+      - "Shodan gratis hanya 1 result/query, sangat terbatas. Gunakan hanya untuk high-priority targets"
+      - "Cache Shodan results aggressively (7-30 hari) karena data infrastruktur jarang berubah"
+      - "Shodan tidak selalu punya data semua IP, terutama untuk perusahaan kecil atau Indonesia-only"
+      - "Tech maturity detection dari Shodan berguna untuk qualify companies: enterprise cloud user = lebih sophisticated"
+    pitfalls:
+      - "Shodan API gratis quota sangat terbatas, jangan gunakan untuk semua company"
+      - "Resolve domain ke IP sebelum query Shodan, Shodan index by IP bukan domain"
+      - "JANGAN gunakan Shodan data untuk vulnerability exploitation, hanya untuk profiling"
+
+  - id: censys
+    name: "Censys"
+    category: "Internet Asset Intelligence"
+    description: >
+      Censys adalah alternative Shodan untuk internet asset intelligence. Indexing
+      IP addresses dan certificates (SSL/TLS). Sangat kuat untuk certificate-based
+      intelligence: temukan semua domain yang dimiliki perusahaan berdasarkan
+      SSL certificate organization name. Gratis untuk riset dengan rate limit.
+      Mendukung query language yang lebih powerful dari Shodan.
+    specific_function: >
+      Discover semua domain yang dimiliki perusahaan target berdasarkan SSL certificate
+      org name. Berguna untuk menemukan subsidiary, product domains, dan regional
+      sites yang tidak disebutkan di website utama.
+    language: "Python (censys library)"
+    pricing: "Free: 250 queries/bulan. Paid: mulai $99/bulan"
+    last_updated: "2025"
+    url: "https://censys.io"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Domain discovery"
+      role: >
+        Discover hidden domains dan subsidiaries perusahaan target melalui SSL
+        certificate intelligence. Memperkaya Company Profile dengan subsidiary
+        brands dan regional presence.
+      when_to_use: >
+        Gunakan untuk enterprise-size companies yang mungkin punya banyak domains.
+        Tidak perlu untuk UKM atau startup yang hanya punya satu domain.
+      priority: "optional (enterprise profiling)"
+      output_goes_to: "Company Profile Card (subsidiary_domains field)"
+    setup:
+      install: "pip install censys"
+      requirements:
+        - "censys>=2.2.0"
+        - "CENSYS_API_ID dan CENSYS_API_SECRET dari https://search.censys.io/account"
+      env_vars:
+        - name: CENSYS_API_ID
+          description: "API ID dari account.censys.io"
+        - name: CENSYS_API_SECRET
+          description: "API Secret dari account.censys.io"
+    usage:
+      basic_example: |
+        from censys.search import CensysHosts
+        import os
+
+        h = CensysHosts(api_id=os.getenv("CENSYS_API_ID"), api_secret=os.getenv("CENSYS_API_SECRET"))
+
+        # Search hosts by IP or domain
+        for cert in h.search(
+            "services.tls.certificate.parsed.subject.organization: 'PT Sinar Logistik'",
+            fields=["ip", "services.tls.certificate.parsed.names"],
+        ):
+            print(cert["ip"], cert.get("services.tls.certificate.parsed.names", []))
+
+      retro_example: |
+        from censys.search import CensysCerts
+        import os
+
+        def find_company_domains(company_name: str) -> list[str]:
+            """
+            Temukan semua domain yang terkait dengan company berdasarkan SSL certificates.
+            """
+            certs = CensysCerts(
+                api_id=os.getenv("CENSYS_API_ID"),
+                api_secret=os.getenv("CENSYS_API_SECRET"),
+            )
+            domains = set()
+            try:
+                for cert in certs.search(
+                    f"parsed.subject.organization: \"{company_name}\"",
+                    fields=["parsed.names"],
+                    max_records=50,
+                ):
+                    for name in cert.get("parsed.names", []):
+                        if not name.startswith("*"):  # Skip wildcards
+                            domains.add(name)
+            except Exception as e:
+                print(f"[Censys] Error: {e}")
+            return list(domains)
+
+        domains = find_company_domains("PT Sinar Logistik Nusantara")
+        print("Related domains:", domains)
+
+      expected_output: |
+        Related domains: [
+          "sinarlogistik.co.id",
+          "sinar-logistik.com",
+          "api.sinarlogistik.co.id",
+          "dashboard.sinarlogistik.co.id"
+        ]
+
+    notes:
+      - "Censys certificate search sangat powerful untuk discover subsidiary domains"
+      - "250 queries/bulan gratis cukup untuk light OSINT, gunakan dengan bijak"
+    pitfalls:
+      - "Company name harus exact match di certificate, variasi nama bisa miss results"
+      - "Banyak certificate menggunakan wildcard (*.domain.com), filter ini dari results"
+
+  - id: opencorporates
+    name: "OpenCorporates"
+    category: "Company Registry Data"
+    description: >
+      OpenCorporates adalah database terbesar untuk informasi perusahaan resmi dari
+      registri perusahaan di seluruh dunia (180+ yurisdiksi). Data meliputi: nama
+      resmi perusahaan, nomor registrasi, direktur, status aktif/tidak aktif, tanggal
+      pendaftaran, dan alamat terdaftar. Gratis untuk basic lookup (rate limited).
+      Paid API untuk high-volume access. Sangat berguna untuk RETRO untuk verifikasi
+      bahwa perusahaan target adalah entitas legal yang valid.
+    specific_function: >
+      Verifikasi legal entity perusahaan target. Sebelum mengirim proposal, RETRO
+      memverifikasi bahwa perusahaan terdaftar resmi via OpenCorporates atau setara.
+      Mencegah mengirim proposal ke company shell atau entitas yang tidak aktif.
+    language: "Python (requests)"
+    pricing: "Gratis: terbatas (100 req/hari estimate). Paid: mulai $50/bulan"
+    last_updated: "2025"
+    url: "https://opencorporates.com"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Legal verification"
+      role: >
+        Legal entity verification. Konfirmasi bahwa company target adalah entitas
+        legal terdaftar yang aktif sebelum proposal dikirim. Menambahkan field:
+        registered_name, registration_number, incorporation_date, status.
+      when_to_use: >
+        Gunakan untuk companies yang belum verifikasi legal statusnya dari website.
+        Penting untuk companies yang muncul di expo tapi tidak punya website yang jelas.
+      priority: "optional (legal verification)"
+      output_goes_to: "Company Profile Card (legal_entity field)"
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "requests"
+        - "OpenCorporates API key (gratis untuk research): https://api.opencorporates.com"
+      env_vars:
+        - name: OPENCORPORATES_API_TOKEN
+          description: "API token dari opencorporates.com/users/account (gratis untuk research)"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        OC_TOKEN = os.getenv("OPENCORPORATES_API_TOKEN")
+
+        def search_opencorporates(company_name: str, jurisdiction: str = "id") -> list[dict]:
+            """
+            Search perusahaan di OpenCorporates.
+            jurisdiction: 'id' untuk Indonesia, 'sg' untuk Singapore, dll
+            """
+            params = {
+                "q":                  company_name,
+                "jurisdiction_code":  jurisdiction,
+                "api_token":          OC_TOKEN,
+            }
+            r = requests.get(
+                "https://api.opencorporates.com/v0.4/companies/search",
+                params=params,
+                timeout=15,
+            )
+            r.raise_for_status()
+            companies = r.json()["results"]["companies"]
+            return [c["company"] for c in companies]
+
+        results = search_opencorporates("PT Sinar Logistik", jurisdiction="id")
+        for c in results[:3]:
+            print(f"{c['name']} | {c['company_number']} | {c['current_status']}")
+
+      retro_example: |
+        import requests
+        import os
+        from retro.redis_client import cache_get, cache_set
+        import json
+
+        OC_TOKEN = os.getenv("OPENCORPORATES_API_TOKEN")
+
+        def verify_legal_entity(company_name: str, country_code: str = "id") -> dict:
+            """
+            Verifikasi legal entity perusahaan dari OpenCorporates.
+            Return legal entity dict atau {"verified": False} jika tidak ditemukan.
+            """
+            cache_key = f"opencorp:{country_code}:{company_name[:30].lower().replace(' ', '_')}"
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            try:
+                params = {
+                    "q":                 company_name,
+                    "jurisdiction_code": country_code,
+                    "api_token":         OC_TOKEN,
+                }
+                if not OC_TOKEN:
+                    params.pop("api_token")
+
+                r = requests.get(
+                    "https://api.opencorporates.com/v0.4/companies/search",
+                    params=params,
+                    timeout=15,
+                )
+                if r.status_code == 429:
+                    return {"verified": False, "reason": "rate_limited"}
+
+                r.raise_for_status()
+                companies = r.json()["results"]["companies"]
+
+                if not companies:
+                    result = {"verified": False, "reason": "not_found"}
+                else:
+                    best = companies[0]["company"]  # Most relevant result
+                    result = {
+                        "verified":           True,
+                        "registered_name":    best.get("name"),
+                        "company_number":     best.get("company_number"),
+                        "status":             best.get("current_status"),
+                        "incorporated_on":    best.get("incorporation_date"),
+                        "jurisdiction":       best.get("jurisdiction_code"),
+                        "opencorporates_url": best.get("opencorporates_url"),
+                    }
+
+                cache_set(cache_key, json.dumps(result), ttl_seconds=30 * 86400)  # 30 hari
+                return result
+
+            except requests.exceptions.RequestException as e:
+                return {"verified": False, "reason": str(e)}
+
+      expected_output: |
+        {
+          "verified":        true,
+          "registered_name": "PT SINAR LOGISTIK NUSANTARA",
+          "company_number":  "AHU-012345.AH.01.01.2019",
+          "status":          "Active",
+          "incorporated_on": "2019-03-15",
+          "jurisdiction":    "id",
+          "opencorporates_url": "https://opencorporates.com/companies/id/AHU-012345..."
+        }
+
+    notes:
+      - "Indonesia (id) coverage di OpenCorporates cukup baik tapi tidak selengkap US atau UK"
+      - "Tanpa API token, rate limit sangat ketat. Token gratis research lebih generous"
+      - "Cache 30 hari, data registrasi perusahaan jarang berubah"
+      - "Gunakan nama resmi perusahaan (PT XXXX) bukan nama brand untuk pencarian lebih akurat"
+    pitfalls:
+      - "Indonesia company names sering punya variasi PT/CV yang banyak, validasi manual masih diperlukan"
+      - "JANGAN assume company tidak valid hanya karena tidak ada di OpenCorporates, coverage tidak 100%"
+
+  - id: crunchbase
+    name: "Crunchbase"
+    category: "Startup & Business Intelligence"
+    description: >
+      Crunchbase adalah platform intelligence untuk startup dan perusahaan teknologi.
+      Data meliputi: funding rounds, investors, team size (approximate), product
+      description, founded year, dan executive team. Sangat berguna untuk RETRO
+      dalam profiling startup dan tech companies yang sering menjadi exhibitor
+      di expo teknologi. Crunchbase API memerlukan subscription berbayar.
+      Data basic bisa di-scrape dari halaman publik dengan rate limiting yang ketat.
+    specific_function: >
+      Funding dan team intelligence untuk startup companies. Crunchbase memperkaya
+      Company Profile dengan: total funding, last round (Series A/B/C, Seed),
+      investors, dan approximate headcount. Berguna untuk segment companies:
+      well-funded startup lebih likely jadi partner aktif.
+    language: "Python (requests, Crunchbase API atau web scraping)"
+    pricing: "Basic data: gratis via web. API: $30/bulan minimum"
+    last_updated: "2025"
+    url: "https://crunchbase.com"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Funding intelligence"
+      role: >
+        Funding dan scale intelligence. Companies yang sudah dapat Series A+ funding
+        memiliki resources untuk actual partnership. Memprioritaskan companies dengan
+        recent funding sebagai high-value targets.
+      when_to_use: >
+        Cek Crunchbase untuk startup dan tech companies yang menjadi exhibitor.
+        Untuk traditional companies (logistik, manufacturing old-school), Crunchbase
+        jarang punya data.
+      priority: "optional (startup profiling)"
+      output_goes_to: "Company Profile Card (funding_info field)"
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "requests"
+        - "Crunchbase API key (berbayar) atau web scraping dengan rate limiting"
+      env_vars:
+        - name: CRUNCHBASE_API_KEY
+          description: "API key dari Crunchbase (berbayar, mulai $30/bulan)"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        CB_KEY = os.getenv("CRUNCHBASE_API_KEY")
+
+        def search_crunchbase(company_name: str) -> dict | None:
+            """Cari company di Crunchbase dan return funding info."""
+            if not CB_KEY:
+                print("[Crunchbase] No API key, skipping")
+                return None
+
+            r = requests.get(
+                "https://api.crunchbase.com/api/v4/entities/organizations",
+                params={
+                    "user_key":      CB_KEY,
+                    "field_ids":     "short_description,funding_total,last_funding_type,num_funding_rounds,num_employees_enum",
+                    "query":         company_name,
+                    "limit":         1,
+                },
+                timeout=15,
+            )
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            entities = data.get("entities", [])
+            if not entities:
+                return None
+
+            props = entities[0].get("properties", {})
+            return {
+                "funding_total":        props.get("funding_total", {}).get("value_usd"),
+                "last_funding_type":    props.get("last_funding_type"),
+                "num_funding_rounds":   props.get("num_funding_rounds"),
+                "employee_range":       props.get("num_employees_enum"),
+                "short_description":    props.get("short_description"),
+            }
+
+      retro_example: |
+        import requests
+        import os
+        from retro.redis_client import cache_get, cache_set
+        import json
+
+        CB_KEY = os.getenv("CRUNCHBASE_API_KEY")
+
+        def get_funding_intel(company_name: str, domain: str) -> dict:
+            """Get funding intelligence dari Crunchbase."""
+            cache_key = f"crunchbase:{domain}"
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            if not CB_KEY:
+                return {"funding_available": False, "reason": "no_api_key"}
+
+            try:
+                r = requests.get(
+                    "https://api.crunchbase.com/api/v4/entities/organizations",
+                    params={
+                        "user_key":  CB_KEY,
+                        "field_ids": "funding_total,last_funding_type,num_employees_enum,founded_on",
+                        "query":     company_name,
+                        "limit":     1,
+                    },
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    return {"funding_available": False}
+
+                entities = r.json().get("entities", [])
+                if not entities:
+                    return {"funding_available": False, "reason": "not_found"}
+
+                props = entities[0]["properties"]
+                funding_usd = props.get("funding_total", {}).get("value_usd")
+
+                result = {
+                    "funding_available":  True,
+                    "funding_usd":        funding_usd,
+                    "funding_stage":      props.get("last_funding_type"),
+                    "funding_rounds":     props.get("num_funding_rounds"),
+                    "employee_range":     props.get("num_employees_enum"),
+                    "founded_on":         props.get("founded_on", {}).get("value"),
+                    "partnership_signal": "high" if funding_usd and funding_usd > 1_000_000 else "medium",
+                }
+
+                cache_set(cache_key, json.dumps(result), ttl_seconds=7 * 86400)
+                return result
+
+            except Exception as e:
+                return {"funding_available": False, "reason": str(e)}
+
+      expected_output: |
+        {
+          "funding_available":  true,
+          "funding_usd":        5200000,
+          "funding_stage":      "series_a",
+          "funding_rounds":     2,
+          "employee_range":     "51_100",
+          "founded_on":         "2019-03-01",
+          "partnership_signal": "high"
+        }
+        # Interpretation: Series A funded ($5.2M), 51-100 employees -> established startup, high priority
+
+    notes:
+      - "Crunchbase API berbayar ($30/bulan minimum), evaluasi apakah worth it berdasarkan use case"
+      - "Data Crunchbase lebih lengkap untuk US/Western startups, kurang untuk Indonesia-only companies"
+      - "partnership_signal=high jika funding > $1M: company punya resources untuk actual partnership"
+      - "employee_range enum: '1_10', '11_50', '51_100', '101_250', '251_500', '501_1000', '1001_5000'"
+    pitfalls:
+      - "JANGAN scrape Crunchbase tanpa rate limiting, ToS mereka melarang scraping"
+      - "Funding data bisa outdated, selalu tambahkan last_updated check"
+
+  - id: wayback_machine
+    name: "Wayback Machine CDX API"
+    category: "Historical Web Data"
+    description: >
+      Wayback Machine dari Internet Archive menyimpan snapshots historis website.
+      CDX API (free, tidak butuh authentication) memungkinkan query riwayat crawls:
+      kapan pertama kali website di-index, berapa kali di-snapshot, dan URL mana
+      yang pernah ada. Berguna untuk RETRO dalam profiling company history: kapan
+      website diluncurkan (indikator company age), apakah ada perubahan major
+      (pivot, rebranding), dan apa konten website di masa lalu.
+    specific_function: >
+      Company history intelligence. Dari Wayback Machine, RETRO bisa tau: domain
+      pertama kali aktif tahun berapa (proxy untuk company founding), apakah
+      ada perubahan konten major (pivot dari B2C ke B2B, perubahan produk), dan
+      historical contact information yang mungkin tidak ada di website sekarang.
+    language: "Python (requests)"
+    pricing: "Gratis (tidak butuh API key)"
+    last_updated: "2025"
+    url: "https://archive.org/help/wayback_api.php"
+    retro:
+      phase: "Phase 3 (Company Profiling) - History intelligence"
+      role: >
+        Company history enrichment. Menambahkan field: first_seen_year (proxy
+        for company age), last_snapshot, pivot_detected (jika konten berubah major).
+      when_to_use: >
+        Cek Wayback Machine untuk companies yang tidak jelas founding year-nya.
+        Juga berguna untuk detect apakah company masih aktif (last snapshot recent).
+      priority: "optional (history intel)"
+      output_goes_to: "Company Profile Card (history field)"
+    setup:
+      install: "pip install requests  # Tidak butuh library khusus"
+      requirements:
+        - "requests"
+      env_vars: []
+    usage:
+      basic_example: |
+        import requests
+
+        def query_wayback_cdx(domain: str, limit: int = 10) -> list[dict]:
+            """Query Wayback Machine CDX API untuk history domain."""
+            r = requests.get(
+                "http://web.archive.org/cdx/search/cdx",
+                params={
+                    "url":      f"{domain}/*",
+                    "output":   "json",
+                    "limit":    limit,
+                    "fl":       "timestamp,original,statuscode",
+                    "filter":   "statuscode:200",
+                    "collapse": "timestamp:6",  # Deduplicate by month
+                },
+                timeout=15,
+            )
+            if r.status_code != 200 or not r.json():
+                return []
+            rows = r.json()[1:]  # Skip header row
+            return [{"timestamp": row[0], "url": row[1], "status": row[2]} for row in rows]
+
+        history = query_wayback_cdx("sinarlogistik.co.id")
+        if history:
+            first = history[0]
+            print(f"First snapshot: {first['timestamp'][:4]}")  # Year only
+
+      retro_example: |
+        import requests
+        from retro.redis_client import cache_get, cache_set
+        import json
+
+        def get_domain_history(domain: str) -> dict:
+            """Get domain history dari Wayback Machine."""
+            cache_key = f"wayback:{domain}"
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            try:
+                r = requests.get(
+                    "http://web.archive.org/cdx/search/cdx",
+                    params={
+                        "url":      f"{domain}",
+                        "output":   "json",
+                        "limit":    100,
+                        "fl":       "timestamp,statuscode",
+                        "filter":   "statuscode:200",
+                        "collapse": "timestamp:7",  # Monthly
+                    },
+                    timeout=20,
+                )
+                if r.status_code != 200:
+                    return {"history_available": False}
+
+                rows = r.json()
+                if len(rows) <= 1:  # Only header or empty
+                    return {"history_available": False, "reason": "never_crawled"}
+
+                timestamps = [row[0] for row in rows[1:]]
+                first_year = timestamps[0][:4] if timestamps else "unknown"
+                last_ts    = timestamps[-1] if timestamps else "unknown"
+                snapshot_count = len(timestamps)
+
+                result = {
+                    "history_available": True,
+                    "first_seen_year":   first_year,
+                    "last_snapshot":     last_ts[:8],  # YYYYMMDD
+                    "total_snapshots":   snapshot_count,
+                    "domain_age_years":  2025 - int(first_year) if first_year.isdigit() else None,
+                    "is_recently_active": last_ts[:6] >= "202501",  # Snapshot di 2025
+                }
+
+                cache_set(cache_key, json.dumps(result), ttl_seconds=7 * 86400)
+                return result
+
+            except Exception as e:
+                return {"history_available": False, "reason": str(e)}
+
+      expected_output: |
+        {
+          "history_available": true,
+          "first_seen_year":   "2019",
+          "last_snapshot":     "20250415",
+          "total_snapshots":   67,
+          "domain_age_years":  6,
+          "is_recently_active": true
+        }
+        # Interpretation: Domain aktif 6 tahun, last snapshot baru April 2025 -> active company
+
+    notes:
+      - "CDX API gratis dan tidak butuh API key, data publik Internet Archive"
+      - "first_seen_year adalah proxy untuk company founding year jika website ada sejak awal"
+      - "collapse=timestamp:7 mengembalikan satu result per bulan, mencegah terlalu banyak rows"
+      - "is_recently_active (snapshot < 90 hari) mengindikasikan website masih diupdate"
+    pitfalls:
+      - "Wayback Machine tidak crawl semua website, terutama yang baru atau punya robots.txt disallow"
+      - "JANGAN cache Wayback results terlalu lama (> 14 hari) karena data updates regularly"
+
+  - id: nominatim_geopy
+    name: "Nominatim & geopy (Geocoding)"
+    category: "Geocoding & Location Intelligence"
+    description: >
+      Nominatim adalah geocoding service dari OpenStreetMap yang gratis dan open-source.
+      geopy adalah Python library yang abstraksi berbagai geocoding providers termasuk
+      Nominatim. Berguna untuk RETRO dalam mengkonversi alamat perusahaan dari teks
+      ke koordinat (lat/long) untuk keperluan: clustering companies by region,
+      mendeteksi apakah perusahaan ada di kota/negara yang match dengan RETRO target
+      markets, dan visualisasi peta distribution perusahaan per expo.
+    specific_function: >
+      Geocoding alamat perusahaan ke koordinat. Untuk RETRO, berguna untuk:
+      (1) cluster analysis - perusahaan mana yang ada di Jakarta vs Surabaya vs Singapore,
+      (2) regional targeting - fokus proposal ke companies di region tertentu,
+      (3) expo proximity - perusahaan di kota expo lebih likely hadir secara fisik.
+    language: "Python"
+    pricing: "Nominatim gratis (rate limit 1 req/detik), Google Maps Geocoding: $5/1000 requests"
+    last_updated: "2025"
+    url: "https://nominatim.openstreetmap.org"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Location intelligence"
+      role: >
+        Geocode alamat perusahaan ke koordinat untuk regional analysis. Menambahkan
+        field: latitude, longitude, city, region untuk filtering dan clustering.
+      when_to_use: >
+        Gunakan geocoding ketika alamat perusahaan tersedia di website atau dari
+        database registrasi. Rate limit Nominatim: 1 req/detik, cache aggressively.
+      priority: "optional (location intel)"
+      output_goes_to: "Company Profile Card (location field)"
+    setup:
+      install: "pip install geopy"
+      requirements:
+        - "geopy>=2.3.0"
+      env_vars:
+        - name: GEOCODING_USER_AGENT
+          description: "User agent string untuk Nominatim: 'retro-intelligence/1.0 (contact@retro.id)'"
+    usage:
+      basic_example: |
+        from geopy.geocoders import Nominatim
+        from geopy.exc import GeocoderTimedOut
+        import time
+        import os
+
+        geolocator = Nominatim(
+            user_agent=os.getenv("GEOCODING_USER_AGENT", "retro-pipeline/1.0"),
+        )
+
+        def geocode_address(address: str) -> dict | None:
+            """Geocode teks alamat ke koordinat."""
+            try:
+                time.sleep(1.1)  # Nominatim rate limit: 1 req/detik
+                location = geolocator.geocode(address, language="en", timeout=10)
+                if location:
+                    return {
+                        "lat":      location.latitude,
+                        "lng":      location.longitude,
+                        "formatted": location.address,
+                    }
+            except GeocoderTimedOut:
+                pass
+            return None
+
+        result = geocode_address("Kawasan Industri MM2100, Bekasi, Indonesia")
+        print(result)
+
+      retro_example: |
+        from geopy.geocoders import Nominatim
+        from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+        from retro.redis_client import cache_get, cache_set
+        import json
+        import time
+        import os
+
+        _geolocator = None
+
+        def get_geolocator():
+            global _geolocator
+            if _geolocator is None:
+                _geolocator = Nominatim(
+                    user_agent=os.getenv("GEOCODING_USER_AGENT", "retro-pipeline/1.0 contact@retro.id"),
+                )
+            return _geolocator
+
+        def geocode_company_address(address: str, country: str = "Indonesia") -> dict:
+            """
+            Geocode company address ke coordinates.
+            Rate limit: satu request per detik (Nominatim policy).
+            """
+            if not address:
+                return {}
+
+            cache_key = f"geocode:{address[:50].lower().replace(' ', '_')}"
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            geo = get_geolocator()
+            full_address = f"{address}, {country}" if country and country not in address else address
+
+            try:
+                time.sleep(1.1)  # Respect Nominatim rate limit
+                location = geo.geocode(full_address, language="en", timeout=15)
+                if not location:
+                    return {"geocoded": False}
+
+                # Extract city dan region dari address components
+                raw = location.raw.get("address", {}) if hasattr(location, "raw") else {}
+                result = {
+                    "geocoded":  True,
+                    "lat":       location.latitude,
+                    "lng":       location.longitude,
+                    "city":      raw.get("city") or raw.get("town") or raw.get("village"),
+                    "province":  raw.get("state"),
+                    "country":   raw.get("country"),
+                    "formatted": location.address,
+                }
+
+                cache_set(cache_key, json.dumps(result), ttl_seconds=30 * 86400)
+                return result
+
+            except (GeocoderTimedOut, GeocoderServiceError) as e:
+                return {"geocoded": False, "reason": str(e)}
+
+        def classify_region(lat: float, lng: float) -> str:
+            """
+            Classify koordinat ke region RETRO target market.
+            Simple bounding box classification.
+            """
+            # Indonesia (rough bounds)
+            if -11 <= lat <= 6 and 95 <= lng <= 141:
+                if -7 <= lat <= -5 and 106 <= lng <= 107.5:
+                    return "Jakarta Metro"
+                elif -8 <= lat <= -7 and 112 <= lng <= 113:
+                    return "Surabaya"
+                elif 1 <= lat <= 2 and 103 <= lng <= 104:
+                    return "Singapore"
+                return "Indonesia"
+            elif 1 <= lat <= 2 and 103 <= lng <= 104:
+                return "Singapore"
+            elif 2 <= lat <= 8 and 100 <= lng <= 119:
+                return "Malaysia"
+            return "International"
+
+      expected_output: |
+        geocode_company_address("Jl. Raya Kelapa Hybrida Blok QJ2 No.16, Jakarta Utara"):
+        {
+          "geocoded":  true,
+          "lat":       -6.1481,
+          "lng":       106.9124,
+          "city":      "North Jakarta",
+          "province":  "Jakarta",
+          "country":   "Indonesia",
+          "formatted": "Jalan Raya Kelapa Hybrida, Kelapa Gading, North Jakarta, Jakarta, Indonesia"
+        }
+
+        classify_region(-6.1481, 106.9124) -> "Jakarta Metro"
+
+    notes:
+      - "Nominatim rate limit WAJIB 1 request/detik, tambahkan time.sleep(1.1) sebelum setiap request"
+      - "Cache geocoding results aggressively (30 hari), alamat jarang berubah"
+      - "User-Agent harus informatif dan include kontak: Nominatim policy requirement"
+      - "Untuk volume tinggi atau accuracy lebih baik, pertimbangkan Google Maps Geocoding API ($5/1000)"
+    pitfalls:
+      - "JANGAN batch geocode tanpa sleep, Nominatim akan block IP jika rate limit dilanggar"
+      - "Indonesian addresses sering tidak standar, hasil geocoding mungkin tidak akurat 100%"
+
+  - id: sec_edgar
+    name: "SEC EDGAR"
+    category: "Public Company Financial Data (US)"
+    description: >
+      SEC EDGAR (Electronic Data Gathering, Analysis, and Retrieval) adalah database
+      mandatory filing dari Securities and Exchange Commission (US). Semua perusahaan
+      publik yang listed di US stock exchange wajib submit filings: 10-K (annual report),
+      10-Q (quarterly report), 8-K (major events), dan banyak lagi. API gratis dan
+      tidak memerlukan autentikasi. Untuk RETRO, berguna jika target companies adalah
+      US-listed companies atau subsidiaries dari US public companies.
+    specific_function: >
+      Financial intelligence untuk US-listed atau US-regulated companies. Revenue,
+      profit, company size, dan major business developments dari official SEC filings.
+      Untuk RETRO yang target expo internasional dengan US companies.
+    language: "Python (requests)"
+    pricing: "Gratis (US government API)"
+    last_updated: "2025"
+    url: "https://www.sec.gov/developer"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Financial intelligence untuk US companies"
+      role: >
+        Official financial data untuk US-listed companies. Revenue dan headcount
+        dari 10-K filing lebih akurat dari Crunchbase untuk public companies.
+      when_to_use: >
+        Gunakan untuk US-listed companies yang menjadi exhibitor di international expo.
+        Tidak relevan untuk private Indonesia companies.
+      priority: "optional (US company profiling)"
+      output_goes_to: "Company Profile Card (financial_data field)"
+    setup:
+      install: "pip install requests"
+      requirements:
+        - "requests"
+        - "User-Agent header dengan contact info (SEC requirement)"
+      env_vars:
+        - name: SEC_USER_AGENT
+          description: "Required header: 'Company Name email@domain.com'"
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        SEC_HEADERS = {
+            "User-Agent": os.getenv("SEC_USER_AGENT", "RETRO Pipeline contact@retro.id"),
+        }
+
+        def search_sec_company(company_name: str) -> list[dict]:
+            """Search company di SEC EDGAR company search."""
+            r = requests.get(
+                "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&dateRange=custom&startdt=2020-01-01&forms=10-K".format(
+                    company_name.replace(" ", "+")
+                ),
+                headers=SEC_HEADERS,
+                timeout=15,
+            )
+            return r.json().get("hits", {}).get("hits", [])
+
+        def get_company_facts(cik: str) -> dict:
+            """Get company financial facts dari EDGAR company facts API."""
+            r = requests.get(
+                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik.zfill(10)}.json",
+                headers=SEC_HEADERS,
+                timeout=20,
+            )
+            return r.json()
+
+        results = search_sec_company("Maersk")
+        for hit in results[:3]:
+            print(hit["_source"]["entity_name"], hit["_source"]["file_date"])
+
+      retro_example: |
+        import requests
+        import os
+
+        SEC_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "RETRO contact@retro.id")}
+
+        def get_us_company_revenue(company_name: str) -> dict:
+            """Get latest annual revenue dari SEC EDGAR 10-K filing."""
+            try:
+                # Search untuk CIK
+                r = requests.get(
+                    "https://www.sec.gov/cgi-bin/browse-edgar",
+                    params={
+                        "company":    company_name,
+                        "action":     "getcompany",
+                        "type":       "10-K",
+                        "dateb":      "",
+                        "owner":      "include",
+                        "count":      "1",
+                        "search_text": "",
+                        "output":     "atom",
+                    },
+                    headers=SEC_HEADERS,
+                    timeout=15,
+                )
+                # Parse response untuk CIK... (simplified)
+                return {"source": "sec_edgar", "status": "available"}
+            except Exception as e:
+                return {"source": "sec_edgar", "status": "unavailable"}
+
+      expected_output: |
+        # SEC EDGAR search result:
+        Company: MAERSK LINE AS
+        Filing: 10-K (2024-03-15)
+        Revenue (from facts): $81.5B (2023)
+
+    notes:
+      - "SEC EDGAR API gratis tapi butuh User-Agent header dengan contact info, wajib diisi"
+      - "Rate limit: 10 requests/detik, sangat generous untuk riset normal"
+      - "Hanya relevan untuk US public companies, private companies tidak filing di SEC"
+    pitfalls:
+      - "JANGAN gunakan SEC EDGAR untuk Indonesia companies, tidak ada coverage sama sekali"
+      - "CIK number format harus 10 digit dengan leading zeros: CIK0000012345"
+
+  - id: wikidata_sparql
+    name: "Wikidata SPARQL (Company Facts)"
+    category: "Open Knowledge Graph"
+    description: >
+      Wikidata adalah knowledge base yang bisa di-query dengan SPARQL. Berisi informasi
+      terstruktur tentang perusahaan: founding date, headquarters, CEO, parent company,
+      subsidiaries, industry classification (Freebase/Wikidata IDs), dan stock ticker.
+      Gratis, tidak butuh autentikasi. Berguna untuk mendapatkan structured facts
+      tentang companies yang cukup prominent untuk memiliki Wikidata entry.
+    specific_function: >
+      Structured company facts dari Wikidata. Berguna untuk companies dengan Wikipedia
+      entry: founding date verified, headquarters country, parent company, industry
+      classification. Memperkaya Company Profile dengan verified facts.
+    language: "Python (requests, SPARQLWrapper)"
+    pricing: "Gratis"
+    last_updated: "2025"
+    url: "https://query.wikidata.org"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Structured facts"
+      role: "Structured company facts untuk prominent companies dengan Wikipedia entry"
+      when_to_use: >
+        Gunakan untuk large/prominent companies. UKM dan startup kecil sangat jarang
+        punya Wikidata entry.
+      priority: "optional (prominent companies)"
+      output_goes_to: "Company Profile Card enrichment"
+    setup:
+      install: "pip install SPARQLWrapper"
+      requirements:
+        - "SPARQLWrapper>=2.0.0"
+      env_vars: []
+    usage:
+      basic_example: |
+        from SPARQLWrapper import SPARQLWrapper, JSON
+
+        sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+        sparql.addCustomHttpHeader("User-Agent", "RETRO Pipeline/1.0 contact@retro.id")
+
+        def query_company_wikidata(company_name: str) -> list[dict]:
+            """Query Wikidata untuk informasi perusahaan."""
+            query = f"""
+            SELECT ?company ?companyLabel ?founded ?headquarters ?headLabel ?industry ?industryLabel WHERE {{
+              ?company rdfs:label "{company_name}"@en .
+              ?company wdt:P571 ?founded . OPTIONAL {{ ?company wdt:P159 ?headquarters . }}
+              OPTIONAL {{ ?company wdt:P452 ?industry . }}
+              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
+            }}
+            LIMIT 5
+            """
+            sparql.setQuery(query)
+            sparql.setReturnFormat(JSON)
+            results = sparql.query().convert()
+            return results["results"]["bindings"]
+
+        results = query_company_wikidata("Maersk")
+        for r in results:
+            print(r.get("companyLabel", {}).get("value"), r.get("founded", {}).get("value"))
+
+      retro_example: |
+        from SPARQLWrapper import SPARQLWrapper, JSON
+        import time
+
+        sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+        sparql.addCustomHttpHeader("User-Agent", "RETRO Pipeline/1.0 contact@retro.id")
+
+        def enrich_with_wikidata(company_name: str) -> dict:
+            """Enrich company profile dengan Wikidata facts."""
+            query = f"""
+            SELECT ?companyLabel ?founded ?headquartersLabel ?parentLabel ?ceo ?ceoLabel WHERE {{
+              ?company rdfs:label "{company_name}"@en ;
+                       wdt:P31 wd:Q4830453 .
+              OPTIONAL {{ ?company wdt:P571 ?founded . }}
+              OPTIONAL {{ ?company wdt:P159 ?headquarters . }}
+              OPTIONAL {{ ?company wdt:P749 ?parent . }}
+              OPTIONAL {{ ?company wdt:P169 ?ceo . }}
+              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+            }} LIMIT 1
+            """
+            try:
+                time.sleep(1)
+                sparql.setQuery(query)
+                sparql.setReturnFormat(JSON)
+                results = sparql.query().convert()
+                bindings = results["results"]["bindings"]
+                if not bindings:
+                    return {}
+                r = bindings[0]
+                return {
+                    "wikidata_name":   r.get("companyLabel", {}).get("value"),
+                    "founded":         r.get("founded", {}).get("value", "")[:4],
+                    "headquarters":    r.get("headquartersLabel", {}).get("value"),
+                    "parent_company":  r.get("parentLabel", {}).get("value"),
+                    "ceo":             r.get("ceoLabel", {}).get("value"),
+                }
+            except Exception:
+                return {}
+
+      expected_output: |
+        {
+          "wikidata_name":   "Maersk",
+          "founded":         "1904",
+          "headquarters":    "Copenhagen",
+          "parent_company":  null,
+          "ceo":             "Vincent Clerc"
+        }
+
+    notes:
+      - "SPARQL endpoint Wikidata bisa lambat (2-10 detik per query), cache results"
+      - "Wikidata label search case-sensitive, gunakan nama resmi perusahaan"
+      - "Rate limit Wikidata: jangan kirim lebih dari 1 request/detik"
+    pitfalls:
+      - "Kebanyakan perusahaan kecil dan startup tidak ada di Wikidata, jangan expect 100% coverage"
+      - "SPARQL query complex bisa timeout di Wikidata, sederhanakan jika timeout"
+
+  - id: metagoofil_exiftool
+    name: "Metagoofil & ExifTool (Metadata Extraction)"
+    category: "Document Metadata OSINT"
+    description: >
+      Metagoofil adalah tool untuk mencari dan download public documents (PDF, DOCX,
+      PPTX) dari domain target menggunakan Google search, kemudian mengekstrak metadata
+      dari dokumen tersebut. ExifTool adalah tool universal untuk baca metadata dari
+      berbagai format file: PDF author, MS Office last edited by, GPS coordinates
+      di gambar, creation date, dan software used. Berguna untuk RETRO untuk
+      menemukan nama karyawan perusahaan dari dokumen publik mereka.
+    specific_function: >
+      Extract nama karyawan perusahaan dari metadata dokumen publik (PDF brochures,
+      PPTX presentations). PDF yang didownload dari expo website seringkali mengandung
+      metadata: author name, company name, creator software. Data ini bisa digunakan
+      untuk email discovery (nama + domain = possible email format).
+    language: "Python (subprocess untuk ExifTool) + metagoofil CLI"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://github.com/laramies/metagoofil"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Document metadata OSINT"
+      role: >
+        Extract author names dan company info dari PDF metadata. Berguna untuk
+        menemukan nama karyawan yang mungkin jadi kontak email.
+      when_to_use: >
+        Gunakan untuk companies yang sudah download brochure PDF-nya. Extract metadata
+        PDF sebelum konten (metadata extraction cepat, konten extraction lambat).
+      priority: "optional (metadata enrichment)"
+      output_goes_to: "Email discovery pipeline (nama untuk email pattern guessing)"
+    setup:
+      install: |
+        pip install pyexiftool
+        # Install ExifTool binary:
+        # Linux: sudo apt-get install exiftool
+        # macOS: brew install exiftool
+        # Windows: Download dari https://exiftool.org/
+      requirements:
+        - "pyexiftool>=0.5.0"
+        - "ExifTool binary installed di system"
+      env_vars: []
+    usage:
+      basic_example: |
+        import exiftool
+        import json
+
+        def extract_pdf_metadata(pdf_path: str) -> dict:
+            """Extract metadata dari PDF file."""
+            with exiftool.ExifToolHelper() as et:
+                metadata = et.get_metadata(pdf_path)
+                if metadata:
+                    m = metadata[0]
+                    return {
+                        "author":   m.get("XMP:Creator") or m.get("PDF:Author"),
+                        "creator":  m.get("PDF:Creator"),
+                        "producer": m.get("PDF:Producer"),
+                        "subject":  m.get("PDF:Subject"),
+                        "title":    m.get("PDF:Title"),
+                        "created":  m.get("PDF:CreateDate"),
+                        "company":  m.get("XMP:CreatorTool"),
+                    }
+            return {}
+
+        meta = extract_pdf_metadata("/tmp/company_brochure.pdf")
+        print(meta)
+
+      retro_example: |
+        import exiftool
+        import os
+        import re
+
+        def extract_pdf_author_for_email(pdf_path: str, domain: str) -> dict | None:
+            """
+            Extract PDF author name untuk email pattern guessing.
+            Jika PDF author = "Budi Santoso", email candidates:
+            - budi.santoso@domain.com
+            - b.santoso@domain.com
+            - budi@domain.com
+            """
+            try:
+                with exiftool.ExifToolHelper() as et:
+                    meta = et.get_metadata(pdf_path)
+                    if not meta:
+                        return None
+                    m = meta[0]
+                    author_raw = (
+                        m.get("XMP:Creator") or
+                        m.get("PDF:Author") or
+                        m.get("XMP:Description") or
+                        ""
+                    )
+
+                    if not author_raw:
+                        return None
+
+                    # Clean author string
+                    author = author_raw.strip()
+                    parts  = author.split()
+
+                    if len(parts) >= 2:
+                        first = parts[0].lower()
+                        last  = parts[-1].lower()
+                        email_patterns = [
+                            f"{first}.{last}@{domain}",
+                            f"{first[0]}.{last}@{domain}",
+                            f"{first}@{domain}",
+                        ]
+                        return {
+                            "author_name":    author,
+                            "email_patterns": email_patterns,
+                        }
+            except Exception:
+                pass
+            return None
+
+        def extract_bulk_metadata(pdf_paths: list[str]) -> list[dict]:
+            """Batch extract metadata dari multiple PDFs secara efisien."""
+            try:
+                with exiftool.ExifToolHelper() as et:
+                    all_meta = et.get_metadata(pdf_paths)
+                    results  = []
+                    for m in all_meta:
+                        results.append({
+                            "file":    m.get("SourceFile"),
+                            "author":  m.get("XMP:Creator") or m.get("PDF:Author"),
+                            "company": m.get("XMP:Company"),
+                            "title":   m.get("PDF:Title"),
+                        })
+                    return results
+            except Exception:
+                return []
+
+      expected_output: |
+        {
+          "author_name":    "Budi Santoso",
+          "email_patterns": [
+            "budi.santoso@sinarlogistik.co.id",
+            "b.santoso@sinarlogistik.co.id",
+            "budi@sinarlogistik.co.id"
+          ]
+        }
+        # Email patterns ini kemudian divalidasi dengan email-validator (09_email_discovery.yaml)
+
+    notes:
+      - "ExifTool batch mode (multiple files sekaligus) jauh lebih efisien dari per-file calls"
+      - "PDF metadata author sering berisi nama creator dokumen, tidak selalu nama kontak"
+      - "Gunakan kombinasi: PDF author name + domain + email pattern guessing + email validator"
+      - "JANGAN gunakan data dari dokumen confidential/private yang tidak dimaksudkan untuk publik"
+    pitfalls:
+      - "Banyak PDF modern tidak punya author metadata (digenerate dari web form, tidak dari Word)"
+      - "Author metadata bisa berisi nama software ('Adobe Acrobat') bukan nama orang"
+      - "ExifTool binary harus terinstall di sistem, tidak hanya pip install pyexiftool"
+
+  - id: spiderfoot_bbot
+    name: "SpiderFoot & BBOT (Automated OSINT Frameworks)"
+    category: "Automated OSINT Frameworks"
+    description: >
+      SpiderFoot adalah framework OSINT open-source yang mengotomasi pengumpulan
+      data dari ratusan sources untuk satu target (domain atau IP). BBOT (Bug Bounty
+      Orchestration Tool) adalah modern alternative SpiderFoot yang lebih cepat dan
+      modular. Keduanya bisa digunakan untuk comprehensive OSINT collection: email,
+      employees, social media, tech stack, subdomains, cloud assets. Untuk RETRO,
+      berguna untuk deep profiling top-priority targets sebelum mengirim proposal.
+    specific_function: >
+      Comprehensive automated OSINT untuk top priority companies. Jalankan SpiderFoot
+      atau BBOT untuk mendapatkan semua informasi publik tentang company target:
+      emails, employees, social profiles, tech stack, subdomains dalam satu scan.
+    language: "Python (CLI + Python API)"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://www.spiderfoot.net"
+    retro:
+      phase: "Phase 3 (Company Profiling) - Deep OSINT untuk top targets"
+      role: >
+        Automated comprehensive OSINT untuk top-priority companies. Dijalankan
+        setelah Synthesis Agent memilih top 5-10 candidates untuk deep profiling
+        sebelum proposal dikirim.
+      when_to_use: >
+        Gunakan SpiderFoot/BBOT hanya untuk top priority candidates (collaboration_potential=high
+        + Synthesis Agent top-ranked). Terlalu berat untuk semua companies.
+      priority: "optional (deep OSINT)"
+      output_goes_to: "Enriched company profile"
+    setup:
+      install: |
+        # SpiderFoot
+        pip install spiderfoot
+        # atau: docker pull spiderfoot/spiderfoot
+
+        # BBOT (modern alternative, lebih aktif dikembangkan)
+        pip install bbot
+      requirements:
+        - "spiderfoot>=4.0 atau bbot>=2.0"
+        - "API keys untuk enrichment modules (VirusTotal, Shodan, Hunter, dll)"
+      env_vars: []
+    usage:
+      basic_example: |
+        # SpiderFoot via CLI
+        # python sf.py -s "sinarlogistik.co.id" -t INTERNET_NAME -m all -q -o table
+
+        # BBOT via CLI (lebih modern)
+        # bbot -t sinarlogistik.co.id -f safe -o /tmp/bbot_results
+
+        # Python API SpiderFoot
+        import subprocess
+        import json
+        import os
+
+        def run_spiderfoot(target: str, output_dir: str = "/tmp/sf_output") -> dict:
+            """Run SpiderFoot OSINT scan untuk target domain."""
+            os.makedirs(output_dir, exist_ok=True)
+            result = subprocess.run(
+                [
+                    "python",
+                    "sf.py",
+                    "-s", target,
+                    "-t", "INTERNET_NAME",
+                    "-m", "sfp_emailcrawlr,sfp_hunter,sfp_shodan",
+                    "-q",
+                    "-o", "json",
+                    "-F", "EMAILADDR,PHONE_NUMBER,SOCIAL_MEDIA",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            try:
+                return json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return {}
+
+      retro_example: |
+        import subprocess
+        import json
+        import os
+
+        def run_bbot_scan(target_domain: str, timeout_seconds: int = 300) -> dict:
+            """
+            Run BBOT OSINT scan untuk deep profiling.
+            Gunakan hanya untuk top-priority targets.
+            """
+            output_dir = f"/tmp/bbot_{target_domain.replace('.', '_')}"
+
+            result = subprocess.run(
+                [
+                    "bbot",
+                    "-t", target_domain,
+                    "-f", "safe",      # Hanya modules yang aman (tidak aggressive)
+                    "--ignore-failed-deps",
+                    "-o", output_dir,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+
+            # Parse JSON events dari BBOT output
+            emails = set()
+            subdomains = set()
+
+            output_json = os.path.join(output_dir, f"{target_domain}.json")
+            if os.path.exists(output_json):
+                with open(output_json) as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line)
+                            if event.get("type") == "EMAIL_ADDRESS":
+                                emails.add(event["data"])
+                            elif event.get("type") == "DNS_NAME":
+                                subdomains.add(event["data"])
+                        except json.JSONDecodeError:
+                            continue
+
+            return {
+                "target":     target_domain,
+                "emails":     list(emails),
+                "subdomains": list(subdomains),
+                "scan_dir":   output_dir,
+            }
+
+      expected_output: |
+        BBOT scan for sinarlogistik.co.id (completed in 4m 32s):
+        {
+          "target": "sinarlogistik.co.id",
+          "emails": [
+            "budi.santoso@sinarlogistik.co.id",
+            "info@sinarlogistik.co.id",
+            "hr@sinarlogistik.co.id"
+          ],
+          "subdomains": [
+            "api.sinarlogistik.co.id",
+            "dashboard.sinarlogistik.co.id",
+            "mail.sinarlogistik.co.id"
+          ]
+        }
+
+    notes:
+      - "BBOT lebih aktif dikembangkan dan lebih modular dari SpiderFoot, prefer BBOT untuk project baru"
+      - "-f safe flag di BBOT hanya jalankan passive/non-intrusive modules (tidak ada port scanning, dll)"
+      - "Scan bisa lambat (5-30 menit per target tergantung modules yang aktif)"
+      - "Gunakan hanya untuk top 5-10 priority targets untuk conserve resources"
+    pitfalls:
+      - "JANGAN jalankan aggressive modules (port scanning, brute force) tanpa izin explicit"
+      - "BBOT dan SpiderFoot bisa generate traffic yang cukup besar ke target, bisa di-detect"
+      - "JANGAN run parallel scans untuk banyak targets sekaligus, bisa block IP"

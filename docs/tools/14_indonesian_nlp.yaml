@@ -1,0 +1,698 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Indonesian NLP & Language Processing
+# File: 14_indonesian_nlp.yaml
+# Purpose: Tools khusus untuk memproses teks Bahasa Indonesia dalam pipeline RETRO.
+#          Indonesia adalah primary target market RETRO — mayoritas company profile,
+#          company website, dan expo brochure ditulis dalam Bahasa Indonesia.
+#          spaCy generik tidak cukup untuk NER Bahasa Indonesia.
+#
+# RETRO INDONESIAN NLP STRATEGY:
+#   1. Detect bahasa (lingua-py) — apakah teks Indo, Inggris, atau mixed
+#   2. Jika Indo atau mixed -> IndoBERT untuk NER (ORG, PERSON, LOC, PRODUCT)
+#   3. Jika perlu translate untuk LLM context -> deep-translator
+#   4. IndoNLU untuk fine-tuning jika domain industri sangat spesifik (konstruksi, logistik)
+#
+# POSITIONING:
+#   IndoBERT   = production NER untuk teks Indonesia (HuggingFace pretrained)
+#   IndoNLU    = dataset + benchmark untuk fine-tuning model custom
+#   lingua-py  = language detector (lebih akurat dari langdetect untuk teks pendek)
+#   deep-translator = translate Indo -> Inggris untuk LLM synthesis
+
+tools:
+
+  - id: indobert
+    name: "IndoBERT"
+    category: "Indonesian NLP - NER & Text Classification"
+    description: >
+      IndoBERT adalah model BERT yang di-pretrain khusus untuk Bahasa Indonesia
+      menggunakan corpus native Indonesian: Wikipedia Indonesia (74M tokens), news articles
+      (55M tokens), dan Twitter Indonesia (30M tokens). Tersedia di HuggingFace dari
+      indobenchmark organization. Jauh lebih akurat dari model multilingual generik
+      (XLM-RoBERTa, mBERT) untuk NER Bahasa Indonesia karena understanding terhadap
+      konteks bahasa Indonesia seperti "PT", "CV", "Tbk", "persero", "Kementerian", dll.
+      Model tersedia: indobert-base-p1, indobert-base-p2, indobert-large-p1, indobert-large-p2.
+    specific_function: >
+      NER untuk mengekstrak entitas dari teks Indonesia: nama perusahaan (ORG),
+      nama orang (PERSON), lokasi (LOC/GPE), event (EVENT). Kritisnya untuk RETRO:
+      mengenali "PT Maju Jaya Abadi" sebagai satu ORG entity, bukan tiga kata terpisah.
+      Juga bisa fine-tune untuk klasifikasi industri: konstruksi, manufaktur, teknologi.
+    language: "Python"
+    pricing: "Gratis & open-source (model di HuggingFace, self-hosted)"
+    last_updated: "2024"
+    url: "https://huggingface.co/indobenchmark/indobert-base-p1"
+
+    retro:
+      phase: "Phase 1 dan Phase 3 - Discovery dan Knowledge Brain"
+      role: >
+        Primary NER engine untuk teks Bahasa Indonesia. Dipanggil setelah crawling
+        website company Indonesia dan parsing PDF expo brochure berbahasa Indonesia.
+        Menggantikan spaCy untuk teks Indonesia. Output berupa list entitas yang
+        kemudian di-merge dengan output spaCy (untuk teks Inggris) sebelum masuk
+        Company Profile Card.
+      when_to_use: >
+        Gunakan IndoBERT ketika teks terdeteksi sebagai Bahasa Indonesia oleh lingua-py.
+        Prioritaskan untuk: website .co.id, .id, company description dari KADIN,
+        brochure expo Indonesia, dan press release berbahasa Indonesia.
+        Jangan gunakan untuk teks Inggris — spaCy lebih baik untuk itu.
+      priority: "primary untuk teks Indonesia"
+      output_goes_to: "company_entities table di PostgreSQL, lalu Company Profile Card"
+
+    setup:
+      install: |
+        pip install transformers torch
+        # Model didownload otomatis saat pertama kali dipakai (~500MB)
+        # Untuk pre-download:
+        python -c "from transformers import pipeline; pipeline('ner', model='indobenchmark/indobert-base-p1')"
+
+        # Untuk GPU support (opsional, lebih cepat):
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+      requirements:
+        - "Python 3.8+"
+        - "RAM minimal 4GB (model base)"
+        - "Disk 500MB untuk model weights"
+        - "transformers>=4.30.0"
+        - "torch>=2.0.0"
+        - "Internet untuk download model pertama kali"
+      env_vars:
+        - name: TRANSFORMERS_CACHE
+          description: "Path untuk cache model, default ~/.cache/huggingface. Set ke /app/models untuk Docker."
+        - name: HF_TOKEN
+          description: "HuggingFace token (opsional, hanya untuk model private/gated)"
+
+    usage:
+      basic_example: |
+        from transformers import pipeline
+
+        # Load pipeline sekali (simpan di global variable untuk efisiensi)
+        ner_pipeline = pipeline(
+            "ner",
+            model="indobenchmark/indobert-base-p1",
+            aggregation_strategy="simple",  # Gabungkan token jadi entity utuh
+            device=-1  # CPU, ganti ke 0 untuk GPU
+        )
+
+        text = "PT Telkom Indonesia mengumumkan kerjasama strategis dengan Huawei Technologies di Jakarta Selatan pada Maret 2024."
+
+        entities = ner_pipeline(text)
+        for e in entities:
+            print(f"{e['entity_group']:10} | score={e['score']:.2f} | '{e['word']}'")
+
+        # Output:
+        # ORG        | score=0.98 | 'PT Telkom Indonesia'
+        # ORG        | score=0.95 | 'Huawei Technologies'
+        # LOC        | score=0.97 | 'Jakarta Selatan'
+
+      retro_example: |
+        from transformers import pipeline
+        from typing import Optional
+        import re
+
+        # Global model cache — load sekali per process
+        _INDO_NER = None
+
+        def get_indo_ner():
+            global _INDO_NER
+            if _INDO_NER is None:
+                _INDO_NER = pipeline(
+                    "ner",
+                    model="indobenchmark/indobert-base-p1",
+                    aggregation_strategy="simple",
+                    device=-1
+                )
+            return _INDO_NER
+
+        def extract_indonesian_entities(text: str) -> dict:
+            """
+            Ekstrak entitas dari teks Bahasa Indonesia.
+            Return: dict dengan keys 'organizations', 'persons', 'locations'
+            """
+            ner = get_indo_ner()
+
+            # IndoBERT max 512 tokens — truncate panjang teks
+            if len(text) > 2000:
+                text = text[:2000]
+
+            raw_entities = ner(text)
+
+            result = {
+                "organizations": [],
+                "persons": [],
+                "locations": [],
+                "raw": raw_entities
+            }
+
+            for entity in raw_entities:
+                word = entity["word"].strip()
+                score = entity["score"]
+                label = entity["entity_group"]
+
+                # Filter low-confidence dan noise
+                if score < 0.75 or len(word) < 2:
+                    continue
+
+                # Bersihkan artifact tokenizer (## prefix dari subword tokenization)
+                word = re.sub(r'\s?##', '', word).strip()
+
+                if label == "ORG" and word not in result["organizations"]:
+                    result["organizations"].append(word)
+                elif label == "PER" and word not in result["persons"]:
+                    result["persons"].append(word)
+                elif label in ("LOC", "GPE") and word not in result["locations"]:
+                    result["locations"].append(word)
+
+            return result
+
+        # Contoh penggunaan di RETRO crawling pipeline
+        def enrich_company_profile_indo(company_text: str, existing_profile: dict) -> dict:
+            """
+            Tambahkan entitas Indo ke profile yang sudah ada dari spaCy (Inggris).
+            """
+            indo_entities = extract_indonesian_entities(company_text)
+
+            # Merge dengan existing profile (dedup)
+            all_orgs = list(set(
+                existing_profile.get("related_entities", []) +
+                indo_entities["organizations"]
+            ))
+
+            existing_profile["related_entities"] = all_orgs
+            existing_profile["key_persons"].extend([
+                p for p in indo_entities["persons"]
+                if p not in existing_profile.get("key_persons", [])
+            ])
+            existing_profile["locations_mentioned"] = indo_entities["locations"]
+
+            return existing_profile
+
+      expected_output: |
+        {
+          "organizations": ["PT Telkom Indonesia", "Huawei Technologies", "Direktorat Jenderal Pajak"],
+          "persons": ["Ririek Adriansyah", "Budi Arie Setiadi"],
+          "locations": ["Jakarta Selatan", "Bandung", "Surabaya"],
+          "raw": [
+            {"entity_group": "ORG", "score": 0.98, "word": "PT Telkom Indonesia", "start": 0, "end": 20},
+            ...
+          ]
+        }
+
+    notes: >
+      IndoBERT menggunakan WordPiece tokenizer yang sama dengan BERT. Teks Indonesia
+      dengan kata serapan Inggris (teknologi, internet, digital) ditangani dengan baik.
+      Singkatan umum Indonesia (PT, CV, Tbk, Kab., Kec.) sudah dalam training corpus.
+      Untuk akurasi lebih tinggi pada domain industri spesifik, fine-tune menggunakan
+      IndoNLU dataset (lihat tool berikutnya).
+
+    pitfalls:
+      - issue: "Model load lambat (~5 detik pertama kali)"
+        fix: "Gunakan global _INDO_NER variable dan load sekali di startup, bukan per-request"
+      - issue: "IndoBERT base-p1 vs base-p2 — mana yang lebih baik?"
+        fix: "p2 (phase 2, whole-word masking) lebih akurat untuk NER. p1 lebih baik untuk sentence tasks. Gunakan p2 untuk RETRO NER."
+      - issue: "Teks campur Indo-Inggris (code-switching)"
+        fix: "Jalankan IndoBERT untuk seluruh teks, tapi supplement dengan spaCy en_core_web_lg untuk entitas Inggris. Merge hasil keduanya."
+      - issue: "Memory error di server 2GB RAM"
+        fix: "Gunakan model quantized atau switch ke indobert-lite dari IndoNLP community"
+      - issue: "Token limit 512 tokens"
+        fix: "Chunk teks menjadi bagian 400 token dengan 50 token overlap, merge entities dari setiap chunk"
+
+  - id: indonlu
+    name: "IndoNLU"
+    category: "Indonesian NLP - Benchmark & Fine-tuning Dataset"
+    description: >
+      IndoNLU (Indonesian Natural Language Understanding) adalah benchmark dan dataset
+      collection untuk evaluasi dan fine-tuning model NLP Bahasa Indonesia. Terdiri dari
+      12 tasks dan 10+ datasets native Indonesia: NER (Named Entity Recognition),
+      sentiment analysis, text classification, entailment, question answering, dan lainnya.
+      Tersedia di HuggingFace datasets sebagai "indonlp/NER_JNLP", "indonlp/smsa", dll.
+      Dikelola oleh IndoNLP community (gabungan researcher dari UI, ITB, ITS).
+    specific_function: >
+      Sumber dataset untuk fine-tuning IndoBERT pada domain industri spesifik yang relevan
+      untuk RETRO: e.g., NER untuk sektor konstruksi, manufaktur, logistik Indonesia.
+      Juga sebagai benchmark untuk membandingkan akurasi model sebelum deploy ke production.
+      Dataset NER sudah dilabeli dengan entitas bisnis Indonesia.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/IndoNLP/indonlu"
+
+    retro:
+      phase: "Pre-Phase (model preparation) — sebelum pipeline production dijalankan"
+      role: >
+        Digunakan untuk fine-tune IndoBERT agar lebih akurat pada domain bisnis Indonesia.
+        Default IndoBERT sudah bagus, tapi jika RETRO fokus pada sektor tertentu
+        (e.g., hanya konstruksi dan manufaktur), fine-tuning dengan IndoNLU dataset
+        bisa meningkatkan NER accuracy dari ~80% ke ~90%+.
+      when_to_use: >
+        Gunakan IndoNLU ketika:
+        1. IndoBERT default sering miss entitas spesifik industri
+        2. Perlu klasifikasi teks ke kategori industri custom
+        3. Butuh sentiment analysis terhadap company reputation dari berita Indo
+        Jangan gunakan jika default IndoBERT sudah cukup akurat (F1 > 85%).
+      priority: "secondary (fine-tuning dan evaluasi, bukan primary pipeline)"
+      output_goes_to: "Fine-tuned model disimpan lokal, digunakan sebagai pengganti IndoBERT default"
+
+    setup:
+      install: |
+        pip install transformers datasets torch
+        # datasets library dari HuggingFace untuk load IndoNLU
+      requirements:
+        - "Python 3.8+"
+        - "datasets>=2.0.0"
+        - "transformers>=4.30.0"
+        - "torch>=2.0.0"
+        - "GPU sangat disarankan untuk fine-tuning (CPU bisa tapi lambat)"
+      env_vars:
+        - name: HF_TOKEN
+          description: "HuggingFace token untuk download dataset"
+
+    usage:
+      basic_example: |
+        from datasets import load_dataset
+        from transformers import (
+            AutoTokenizer, AutoModelForTokenClassification,
+            TrainingArguments, Trainer
+        )
+
+        # Load dataset NER Indonesia dari IndoNLU
+        dataset = load_dataset("indonlp/NER_JNLP")
+        print(dataset["train"][0])
+        # Output:
+        # {
+        #   'tokens': ['PT', 'Telkom', 'Indonesia', 'mengumumkan', ...],
+        #   'ner_tags': [3, 4, 4, 0, ...]  # 3=B-ORG, 4=I-ORG, 0=O
+        # }
+
+        # Label map
+        label_list = dataset["train"].features["ner_tags"].feature.names
+        print(label_list)
+        # ['O', 'B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC']
+
+      retro_example: |
+        from datasets import load_dataset, concatenate_datasets
+        from transformers import (
+            AutoTokenizer, AutoModelForTokenClassification,
+            TrainingArguments, Trainer, DataCollatorForTokenClassification
+        )
+        import numpy as np
+        from seqeval.metrics import f1_score
+
+        # Fine-tune IndoBERT untuk NER domain bisnis Indonesia
+        MODEL_NAME = "indobenchmark/indobert-base-p2"
+        OUTPUT_DIR = "./models/indobert-retro-ner"
+
+        # Load dataset
+        dataset = load_dataset("indonlp/NER_JNLP")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+        label_list = dataset["train"].features["ner_tags"].feature.names
+        label2id = {l: i for i, l in enumerate(label_list)}
+        id2label = {i: l for i, l in enumerate(label_list)}
+
+        def tokenize_and_align_labels(examples):
+            tokenized = tokenizer(
+                examples["tokens"],
+                truncation=True,
+                is_split_into_words=True,
+                max_length=256
+            )
+            labels = []
+            for i, label in enumerate(examples["ner_tags"]):
+                word_ids = tokenized.word_ids(batch_index=i)
+                aligned = []
+                prev_word_id = None
+                for word_id in word_ids:
+                    if word_id is None:
+                        aligned.append(-100)  # Special token
+                    elif word_id != prev_word_id:
+                        aligned.append(label[word_id])
+                    else:
+                        aligned.append(-100)  # Subword token
+                    prev_word_id = word_id
+                labels.append(aligned)
+            tokenized["labels"] = labels
+            return tokenized
+
+        tokenized_dataset = dataset.map(tokenize_and_align_labels, batched=True)
+
+        model = AutoModelForTokenClassification.from_pretrained(
+            MODEL_NAME,
+            num_labels=len(label_list),
+            id2label=id2label,
+            label2id=label2id
+        )
+
+        training_args = TrainingArguments(
+            output_dir=OUTPUT_DIR,
+            num_train_epochs=3,
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset["train"],
+            eval_dataset=tokenized_dataset["validation"],
+            tokenizer=tokenizer,
+            data_collator=DataCollatorForTokenClassification(tokenizer),
+        )
+
+        trainer.train()
+        trainer.save_model(OUTPUT_DIR)
+        print(f"Fine-tuned model saved to {OUTPUT_DIR}")
+
+        # Setelah fine-tuning, gunakan model custom:
+        # ner_pipeline = pipeline("ner", model="./models/indobert-retro-ner")
+
+      expected_output: |
+        # Training output:
+        # Epoch 1: {'eval_f1': 0.821, 'eval_loss': 0.234}
+        # Epoch 2: {'eval_f1': 0.867, 'eval_loss': 0.198}
+        # Epoch 3: {'eval_f1': 0.891, 'eval_loss': 0.181}
+        # Model saved to ./models/indobert-retro-ner
+
+    notes: >
+      IndoNLU dataset NER_JNLP mengandung entitas dari domain umum (news, Wikipedia).
+      Untuk domain bisnis Indonesia yang lebih spesifik, tambahkan training data custom
+      dengan contoh dari sektor target (KBLI codes yang relevan). Labeling tool: Label
+      Studio (open-source, self-hosted) atau Doccano.
+
+    pitfalls:
+      - issue: "Fine-tuning butuh GPU, tidak ada di laptop"
+        fix: "Gunakan Google Colab (free T4 GPU) atau Kaggle Notebook. Fine-tuning 3 epoch biasanya < 2 jam di T4."
+      - issue: "Dataset IndoNLU versi lama"
+        fix: "Cek HuggingFace datasets untuk versi terbaru: load_dataset('indonlp/NER_JNLP', trust_remote_code=True)"
+      - issue: "Tidak tahu dataset mana yang paling cocok"
+        fix: "Untuk NER bisnis: NER_JNLP. Untuk sentiment company: SmSA. Untuk klasifikasi industri: IndoNLI."
+
+  - id: lingua_py
+    name: "lingua-py"
+    category: "Language Detection"
+    description: >
+      lingua-py adalah library Python untuk deteksi bahasa teks yang paling akurat
+      untuk teks pendek dan campur. Mendukung 75 bahasa termasuk Bahasa Indonesia.
+      Dibangun di atas model probabilistik yang trained khusus untuk menangani
+      teks pendek (1-3 kata) dan code-switching (campuran Indo-Inggris yang umum
+      di company description Indonesia). 1100x lebih cepat dari langdetect (Java-based)
+      dan jauh lebih akurat untuk bahasa-bahasa Asia Tenggara.
+    specific_function: >
+      Deteksi bahasa otomatis sebelum memilih NER engine yang tepat. Jika teks
+      terdeteksi Indonesia -> gunakan IndoBERT. Jika Inggris -> gunakan spaCy.
+      Jika mixed -> gunakan keduanya. Ini critical karena banyak company website
+      Indonesia menggunakan campuran Indo-Inggris.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/pemistahl/lingua-py"
+
+    retro:
+      phase: "Phase 1 dan Phase 3 - sebelum NER processing"
+      role: >
+        Language routing gate. Dipanggil pada setiap teks sebelum NER.
+        Output berupa language code (ID, EN, dll) yang menentukan NER pipeline mana
+        yang akan digunakan. Menghindari spaCy dipakai untuk teks Indo (hasil buruk)
+        dan IndoBERT dipakai untuk teks Inggris (waste resource).
+      when_to_use: >
+        Panggil di awal setiap text processing. Khususnya penting untuk:
+        1. Website company dengan bahasa tidak jelas
+        2. PDF expo brochure yang campuran Indo-Inggris
+        3. Company description dari database yang belum tahu bahasanya
+      priority: "primary (preprocessing gate)"
+      output_goes_to: "Menentukan NER pipeline yang digunakan, tidak disimpan langsung"
+
+    setup:
+      install: |
+        pip install lingua-language-detector
+      requirements:
+        - "Python 3.8+"
+        - "RAM ~50MB (model ringan)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from lingua import Language, LanguageDetectorBuilder
+
+        # Build detector untuk bahasa yang relevan (lebih ringan daripada semua 75 bahasa)
+        detector = LanguageDetectorBuilder.from_languages(
+            Language.INDONESIAN,
+            Language.ENGLISH,
+            Language.MALAY,
+            Language.DUTCH,  # Belanda (kadang ada di dokumen legacy Indonesia)
+        ).build()
+
+        text1 = "PT Maju Jaya bergerak di bidang konstruksi dan manufaktur."
+        text2 = "ABC Technology provides IoT solutions for smart cities."
+        text3 = "PT Digital Nusantara provides cloud computing solutions untuk enterprise."
+
+        print(detector.detect_language_of(text1))  # Language.INDONESIAN
+        print(detector.detect_language_of(text2))  # Language.ENGLISH
+        print(detector.detect_language_of(text3))  # Language.INDONESIAN (dominant)
+
+        # Confidence scores untuk setiap bahasa
+        confidences = detector.compute_language_confidence_values(text3)
+        for lang, conf in confidences:
+            print(f"{lang.name}: {conf:.3f}")
+
+      retro_example: |
+        from lingua import Language, LanguageDetectorBuilder
+        from enum import Enum
+
+        class TextLanguage(Enum):
+            INDONESIAN = "id"
+            ENGLISH = "en"
+            MIXED = "mixed"
+            UNKNOWN = "unknown"
+
+        # Build sekali di global scope
+        _DETECTOR = LanguageDetectorBuilder.from_languages(
+            Language.INDONESIAN, Language.ENGLISH, Language.MALAY
+        ).with_minimum_relative_distance(0.9).build()
+
+        def detect_text_language(text: str) -> TextLanguage:
+            """
+            Detect dominant language. Return TextLanguage enum.
+            Threshold 0.9 berarti harus sangat yakin sebelum label sebagai satu bahasa.
+            """
+            if not text or len(text.strip()) < 5:
+                return TextLanguage.UNKNOWN
+
+            # Get confidence scores
+            confidences = _DETECTOR.compute_language_confidence_values(text[:500])
+            scores = {lang: conf for lang, conf in confidences}
+
+            indo_score = scores.get(Language.INDONESIAN, 0)
+            en_score = scores.get(Language.ENGLISH, 0)
+
+            # Jika salah satu dominan (>70%), label sebagai bahasa itu
+            if indo_score >= 0.70:
+                return TextLanguage.INDONESIAN
+            elif en_score >= 0.70:
+                return TextLanguage.ENGLISH
+            elif indo_score > 0.30 and en_score > 0.30:
+                return TextLanguage.MIXED
+            else:
+                return TextLanguage.UNKNOWN
+
+        def route_ner_pipeline(text: str) -> dict:
+            """
+            Routing: deteksi bahasa -> pilih NER engine yang tepat.
+            """
+            lang = detect_text_language(text)
+
+            if lang == TextLanguage.INDONESIAN:
+                from retro.nlp.indo import extract_indonesian_entities
+                return {"source": "indobert", **extract_indonesian_entities(text)}
+
+            elif lang == TextLanguage.ENGLISH:
+                from retro.nlp.english import extract_english_entities
+                return {"source": "spacy", **extract_english_entities(text)}
+
+            elif lang == TextLanguage.MIXED:
+                from retro.nlp.indo import extract_indonesian_entities
+                from retro.nlp.english import extract_english_entities
+                indo = extract_indonesian_entities(text)
+                eng = extract_english_entities(text)
+                # Merge dan dedup
+                return {
+                    "source": "both",
+                    "organizations": list(set(indo["organizations"] + eng["organizations"])),
+                    "persons": list(set(indo["persons"] + eng["persons"])),
+                    "locations": list(set(indo["locations"] + eng["locations"])),
+                }
+
+            else:
+                # Fallback: coba spaCy dulu
+                from retro.nlp.english import extract_english_entities
+                return {"source": "fallback_spacy", **extract_english_entities(text)}
+
+      expected_output: |
+        # detect_text_language("PT Maju Jaya bergerak di bidang konstruksi")
+        TextLanguage.INDONESIAN
+
+        # detect_text_language("ABC Corp provides cloud solutions")
+        TextLanguage.ENGLISH
+
+        # detect_text_language("PT Digital Corp provides solusi cloud untuk enterprise Indonesia")
+        TextLanguage.MIXED
+
+    notes: >
+      lingua-py lebih akurat dari langdetect (library lama) dan fasttext language ID
+      untuk teks pendek < 20 kata. Sangat penting untuk company description yang
+      sering hanya 2-3 kalimat. with_minimum_relative_distance(0.9) membuat
+      deteksi lebih konservatif — lebih baik return MIXED daripada salah label.
+
+    pitfalls:
+      - issue: "Bahasa Melayu (Malaysia) sering terdeteksi sebagai Indonesia"
+        fix: "Ini normal karena keduanya sangat mirip. Untuk RETRO, bedanya tidak signifikan karena NER treatment sama."
+      - issue: "Teks sangat pendek (< 5 kata) sering UNKNOWN"
+        fix: "Untuk teks pendek, gunakan default ke INDONESIAN jika domain .co.id atau .id"
+      - issue: "Import error: 'lingua' tidak ditemukan"
+        fix: "Install: pip install lingua-language-detector (bukan 'lingua', itu package berbeda)"
+
+  - id: deep_translator
+    name: "deep-translator"
+    category: "Machine Translation"
+    description: >
+      deep-translator adalah Python library untuk machine translation yang mendukung
+      multiple translation services sekaligus: Google Translate, DeepL, Microsoft Translator,
+      Yandex, LibreTranslate (self-hosted), dan lainnya. Lebih reliable dari googletrans
+      (yang sering break karena API changes Google) karena mendukung fallback ke service lain.
+      Free tier: Google Translate 500K karakter/bulan.
+    specific_function: >
+      Translate company description, company name, product description, dan expo announcement
+      dari Bahasa Indonesia ke Inggris sebelum dikirim ke LLM synthesis agent. LLM Claude/GPT
+      bekerja lebih baik dalam Bahasa Inggris untuk nuanced synthesis dan proposal writing.
+      Juga translate output proposal dari Inggris ke Indonesia untuk final delivery.
+    language: "Python"
+    pricing: "Gratis (Google Translate 500K chars/bulan), DeepL Free tier 500K chars/bulan"
+    last_updated: "2024"
+    url: "https://github.com/nidhaloff/deep-translator"
+
+    retro:
+      phase: "Phase 3 (Knowledge Brain) — sebelum LLM synthesis"
+      role: >
+        Translation layer antara raw Indonesian text dan LLM synthesis agent.
+        Opsi: translate semua data ke Inggris sebelum masuk LLM (consistent quality),
+        atau biarkan LLM baca teks Indonesia langsung (hemat translate cost tapi
+        LLM bisa lebih tidak akurat). Untuk Claude Sonnet 4.6, biarkan Indo langsung
+        umumnya sudah cukup baik. Gunakan deep-translator hanya jika LLM output
+        kualitasnya kurang untuk teks Indonesia.
+      when_to_use: >
+        Gunakan translation untuk:
+        1. Teks Indonesia yang sangat panjang dan kompleks sebelum Context Agent
+        2. Translate proposal Inggris -> Indonesia untuk klien
+        3. Translate headline news Indo untuk export ke report Inggris
+        Tidak perlu translate jika LLM yang digunakan sudah bagus untuk Bahasa Indonesia.
+      priority: "secondary (opsional berdasarkan LLM quality)"
+      output_goes_to: "translated_text field di company_profiles table, atau langsung ke LLM prompt"
+
+    setup:
+      install: |
+        pip install deep-translator
+      requirements:
+        - "Python 3.6+"
+        - "Internet connection untuk cloud translation services"
+      env_vars:
+        - name: DEEPL_API_KEY
+          description: "DeepL API key untuk translation berkualitas tinggi (opsional, ada free tier)"
+        - name: MICROSOFT_TRANSLATOR_KEY
+          description: "Azure Translator key (opsional, alternative Google)"
+
+    usage:
+      basic_example: |
+        from deep_translator import GoogleTranslator
+
+        translator = GoogleTranslator(source='id', target='en')
+
+        text = "PT Maju Jaya Abadi bergerak di bidang konstruksi dan menyediakan beton siap pakai, baja tulangan, dan jasa kontraktor untuk proyek infrastruktur."
+
+        translated = translator.translate(text)
+        print(translated)
+        # "PT Maju Jaya Abadi is engaged in construction and provides ready-mix concrete,
+        #  reinforcing steel, and contractor services for infrastructure projects."
+
+      retro_example: |
+        from deep_translator import GoogleTranslator, DeepLTranslator
+        from deep_translator.exceptions import TranslationNotFoundException
+        import time
+
+        class RetroTranslator:
+            """
+            Translation dengan fallback: Google -> DeepL -> return original.
+            """
+            def __init__(self):
+                self.google = GoogleTranslator(source='auto', target='en')
+
+            def translate_to_english(self, text: str, source_lang: str = 'id') -> str:
+                """
+                Translate teks ke Inggris. Fallback ke original jika gagal.
+                """
+                if not text or len(text.strip()) < 10:
+                    return text
+
+                # Google Translate limit: 5000 chars per request
+                if len(text) > 4500:
+                    chunks = [text[i:i+4500] for i in range(0, len(text), 4500)]
+                    translated_chunks = [self._translate_single(chunk, source_lang) for chunk in chunks]
+                    return " ".join(translated_chunks)
+
+                return self._translate_single(text, source_lang)
+
+            def _translate_single(self, text: str, source_lang: str) -> str:
+                try:
+                    translator = GoogleTranslator(source=source_lang, target='en')
+                    result = translator.translate(text)
+                    time.sleep(0.1)  # Gentle rate limiting
+                    return result or text
+                except Exception:
+                    return text  # Return original jika gagal
+
+            def translate_company_profile(self, profile: dict) -> dict:
+                """
+                Translate field tertentu dari company profile untuk LLM context.
+                """
+                fields_to_translate = ['description', 'products_services', 'tagline']
+                translated = profile.copy()
+
+                for field in fields_to_translate:
+                    if field in profile and profile[field]:
+                        translated[f"{field}_en"] = self.translate_to_english(profile[field])
+
+                return translated
+
+        # Contoh penggunaan
+        translator = RetroTranslator()
+        profile = {
+            "company_name": "PT Maju Jaya Abadi",
+            "description": "Bergerak di bidang konstruksi dan penyediaan material bangunan berkualitas tinggi untuk proyek infrastruktur nasional.",
+            "products_services": "Beton siap pakai, baja tulangan, jasa kontraktor"
+        }
+        enriched = translator.translate_company_profile(profile)
+        print(enriched["description_en"])
+        # "Engaged in construction and provision of high-quality building materials for national infrastructure projects."
+
+      expected_output: |
+        # Input (Indonesian):
+        "PT Maju Jaya bergerak di bidang konstruksi dan manufaktur."
+
+        # Output (English):
+        "PT Maju Jaya is engaged in construction and manufacturing."
+
+    notes: >
+      Untuk production RETRO dengan volume tinggi (100+ company/hari), pertimbangkan
+      LibreTranslate self-hosted (gratis, privat, tidak ada limit). Docker:
+      docker run -p 5000:5000 libretranslate/libretranslate.
+      Kualitas LibreTranslate lebih rendah dari Google untuk pasangan indo-inggris,
+      tapi sudah cukup untuk preprocessing sebelum LLM.
+
+    pitfalls:
+      - issue: "Google Translate block IP setelah request banyak dalam waktu singkat"
+        fix: "Tambah time.sleep(0.1-0.5) antar request. Untuk volume tinggi gunakan DeepL API atau LibreTranslate self-hosted."
+      - issue: "Nama perusahaan Indo (PT, CV, Tbk) ditranslate dengan aneh"
+        fix: "Pre-process: extract company name terlebih dahulu, jangan translate company name — hanya translate description. Company name selalu pakai versi original."
+      - issue: "deep-translator error: 'NoneType object has no attribute...'"
+        fix: "Selalu cek apakah text tidak None/empty sebelum translate. Tambahkan guard: if not text or len(text) < 3: return text"

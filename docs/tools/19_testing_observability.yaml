@@ -1,0 +1,996 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Testing, Observability, Logging & Advanced Crawling
+# File: 19_testing_observability.yaml
+# Purpose: Tools untuk memastikan RETRO pipeline reliable, observable, dan testable.
+#          Pipeline production yang berjalan harian TANPA monitoring = blind flying.
+#          Pipeline TANPA tests = regresi tidak terdeteksi saat ada perubahan.
+#
+# OBSERVABILITY STACK RETRO (rekomendasi):
+#   Structured Logging:  structlog (JSON logs ke file/stdout)
+#   LLM Tracing:         Langfuse (sudah di file 07) + structlog
+#   Metrics:             prometheus-client -> Grafana (optional, untuk scale)
+#   Error Alerting:      Telegram Bot (sudah di file 12) untuk pipeline errors
+#
+# TESTING STACK RETRO (rekomendasi):
+#   Unit Tests:          pytest + pytest-asyncio
+#   HTTP Mocking:        respx (untuk httpx), responses (untuk requests)
+#   Test Fixtures:       factory_boy
+#   Coverage:            pytest-cov
+#
+# ADVANCED CRAWLING:
+#   curl_cffi: bypass Cloudflare / anti-bot protection
+#   aiohttp:   alternative async HTTP client
+
+tools:
+
+  - id: pytest
+    name: "pytest + pytest-asyncio"
+    category: "Testing Framework"
+    description: >
+      pytest adalah Python testing framework paling populer. pytest-asyncio adalah
+      plugin untuk testing async functions (asyncio). RETRO pipeline sangat async-heavy:
+      async crawlers, async DB operations, async LLM calls. pytest-asyncio memungkinkan
+      test async code dengan clean syntax @pytest.mark.asyncio.
+      pytest juga support: fixtures (reusable setup), parametrize (multiple test cases),
+      coverage report, dan plugin ecosystem yang luas.
+    specific_function: >
+      Test semua komponen RETRO secara isolated: crawler functions, NLP extraction,
+      LLM response parsing, email validation, PDF generation. Mencegah regresi
+      ketika ada perubahan kode. Juga berguna untuk TDD (test-driven development)
+      saat develop fitur baru.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://docs.pytest.org/"
+
+    retro:
+      phase: "Development & CI/CD — bukan production pipeline"
+      role: >
+        Quality assurance untuk semua kode RETRO. Jalankan sebelum setiap deploy:
+        pytest tests/ --cov=retro --cov-report=html.
+        Khususnya penting untuk: entity extraction functions (mudah regress),
+        email scoring logic, dan domain normalization.
+      when_to_use: >
+        Tulis test untuk:
+        1. Setiap utility function (domain normalize, email score, phone validate)
+        2. Data transformation functions (crawl raw -> staging)
+        3. Critical business logic (email scoring, dedup logic, collaboration scoring)
+        4. LLM response parsing (untuk catch prompt regression)
+        Tidak perlu test untuk: infrastructure setup, docker config, one-off scripts.
+      priority: "high (untuk production reliability)"
+      output_goes_to: "Test results ke CI/CD (GitHub Actions, dll)"
+
+    setup:
+      install: |
+        pip install pytest pytest-asyncio pytest-cov respx factory_boy
+        # Untuk test coverage report:
+        pip install pytest-cov
+      requirements:
+        - "Python 3.8+"
+        - "pytest>=7.0.0"
+        - "pytest-asyncio>=0.21.0"
+      env_vars:
+        - name: PYTEST_ASYNCIO_MODE
+          description: "Set ke 'auto' untuk auto-mark semua async test. Atau gunakan @pytest.mark.asyncio per function."
+
+    usage:
+      basic_example: |
+        # tests/test_domain_utils.py
+        import pytest
+        from retro.utils.domain import normalize_domain, is_same_company_domain
+
+        # Test synchronous function
+        def test_normalize_domain_removes_https():
+            assert normalize_domain("https://www.majujaya.co.id/about") == "majujaya.co.id"
+
+        def test_normalize_domain_handles_none():
+            assert normalize_domain(None) is None
+            assert normalize_domain("") is None
+
+        def test_normalize_domain_rejects_gmail():
+            assert normalize_domain("gmail.com") is None  # Generic email provider
+
+        @pytest.mark.parametrize("url1,url2,expected", [
+            ("https://www.telkom.co.id/about", "http://telkom.co.id", True),
+            ("https://telkom.co.id", "https://indosat.com", False),
+            ("https://www.sub.company.co.id", "https://company.co.id", True),
+        ])
+        def test_is_same_company_domain(url1, url2, expected):
+            assert is_same_company_domain(url1, url2) == expected
+
+        # Test async function
+        @pytest.mark.asyncio
+        async def test_crawl_company_page():
+            from retro.crawler import crawl_company_page
+            import respx, httpx
+
+            with respx.mock:
+                respx.get("https://example.co.id").mock(
+                    return_value=httpx.Response(200, text="<html><title>PT Example</title></html>")
+                )
+                content = await crawl_company_page("https://example.co.id")
+                assert "PT Example" in content
+
+      retro_example: |
+        # tests/conftest.py — shared fixtures
+        import pytest
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        @pytest.fixture
+        def sample_company_data():
+            """Sample company data untuk tests."""
+            return {
+                "company_name": "PT Maju Jaya Abadi",
+                "domain": "majujaya.co.id",
+                "industry": "konstruksi",
+                "products_services": ["beton siap pakai", "baja tulangan"],
+                "email": "info@majujaya.co.id",
+                "company_size": "medium",
+                "confidence_score": 0.85,
+            }
+
+        @pytest.fixture
+        def mock_llm_response():
+            """Mock LLM response untuk avoid actual API calls di tests."""
+            return {
+                "company_name": "PT Maju Jaya Abadi",
+                "industry": "konstruksi",
+                "products_services": ["beton", "baja"],
+                "company_size": "medium",
+                "tech_maturity": "traditional",
+                "collaboration_potential": ["distribusi material"],
+                "red_flags": [],
+                "confidence_score": 0.85,
+            }
+
+        # tests/test_email_scoring.py
+        import pytest
+        from retro.email_discovery import score_email_contact
+
+        class TestEmailScoring:
+            def test_ceo_email_gets_highest_score(self):
+                contact = {"name": "Budi", "title": "CEO", "email": "budi@company.co.id"}
+                score = score_email_contact(contact)
+                assert score >= 70, f"CEO email score too low: {score}"
+
+            def test_generic_info_email_gets_low_score(self):
+                contact = {"name": None, "title": None, "email": "info@company.co.id"}
+                score = score_email_contact(contact)
+                assert score <= 20, f"Generic email score too high: {score}"
+
+            def test_procurement_email_medium_score(self):
+                contact = {"name": "Sari", "title": "Procurement Manager", "email": "sari@company.co.id"}
+                score = score_email_contact(contact)
+                assert 30 <= score <= 60
+
+        # tests/test_company_profiling.py
+        import pytest
+        from unittest.mock import patch, MagicMock
+        from retro.agents.context_agent import profile_company
+
+        class TestCompanyProfiling:
+            @patch("retro.agents.context_agent.client")
+            def test_profile_company_returns_card(self, mock_client, sample_company_data, mock_llm_response):
+                """Test bahwa profiling berhasil return CompanyProfileCard."""
+                mock_client.messages.create.return_value = MagicMock(
+                    model_dump=lambda: mock_llm_response
+                )
+
+                result = profile_company("PT Maju Jaya Abadi", "sample company text")
+
+                assert result.company_name == "PT Maju Jaya Abadi"
+                assert result.industry == "konstruksi"
+                assert 0.0 <= result.confidence_score <= 1.0
+
+            @patch("retro.agents.context_agent.client")
+            def test_profile_company_handles_llm_error(self, mock_client):
+                """Test bahwa profiling gracefully handle LLM error."""
+                mock_client.messages.create.side_effect = Exception("LLM timeout")
+
+                result = profile_company("PT Test Company", "text")
+                assert result is None or result.confidence_score < 0.5
+
+        # tests/test_validation.py — test pandera schemas
+        import pytest
+        import pandas as pd
+        import pandera as pa
+        from retro.validation import CompanyStagingSchema
+
+        def test_staging_schema_rejects_empty_name():
+            df = pd.DataFrame([{"company_name": "", "source_url": "https://test.com", "is_processed": False}])
+            with pytest.raises(pa.errors.SchemaErrors):
+                CompanyStagingSchema.validate(df, lazy=True)
+
+        def test_staging_schema_accepts_valid_data():
+            df = pd.DataFrame([{
+                "company_name": "PT Maju Jaya",
+                "domain": "majujaya.co.id",
+                "source_url": "https://expo.com",
+                "is_processed": False,
+            }])
+            validated = CompanyStagingSchema.validate(df)
+            assert len(validated) == 1
+
+      expected_output: |
+        # pytest tests/ output:
+        =================== test session starts ====================
+        collected 24 items
+
+        tests/test_domain_utils.py ........          [33%]
+        tests/test_email_scoring.py .....            [54%]
+        tests/test_company_profiling.py ..           [62%]
+        tests/test_validation.py ...                 [75%]
+        ...
+        =================== 24 passed in 3.42s ====================
+
+        # pytest --cov=retro --cov-report=term-missing:
+        Name                              Stmts   Miss  Cover
+        -----------------------------------------------------
+        retro/utils/domain.py                25      2    92%
+        retro/email_discovery.py             48      5    90%
+        retro/agents/context_agent.py        62      8    87%
+
+    notes: >
+      Gunakan pytest.ini atau pyproject.toml untuk konfigurasi pytest:
+      [tool.pytest.ini_options]
+      asyncio_mode = "auto"
+      testpaths = ["tests"]
+      addopts = "-v --tb=short"
+      Untuk test yang hit external API (Hunter, Apollo), gunakan environment variable
+      RETRO_TESTING=1 untuk skip integration tests di CI: @pytest.mark.skipif(os.environ.get("RETRO_TESTING")=="1", reason="skip external API tests")
+
+    pitfalls:
+      - issue: "Event loop error di pytest-asyncio: 'Event loop is closed'"
+        fix: "Set asyncio_mode='auto' di pytest.ini. Atau tambahkan @pytest.fixture(scope='session') def event_loop() untuk shared event loop."
+      - issue: "Test order dependency (test A harus jalan sebelum test B)"
+        fix: "Setiap test harus isolated dan independent. Gunakan fixtures untuk setup/teardown. Gunakan pytest-randomly untuk detect order dependencies."
+      - issue: "Test sangat lambat karena ada real network calls"
+        fix: "Mock semua external calls: respx untuk httpx, responses untuk requests, unittest.mock.patch untuk function calls."
+
+  - id: structlog
+    name: "structlog"
+    category: "Structured Logging"
+    description: >
+      structlog adalah Python logging library yang menghasilkan log dalam format
+      structured (JSON atau key=value). Berbeda dari logging stdlib yang output
+      plain text, structlog output bisa di-parse oleh log aggregator (ELK, Loki,
+      Datadog, CloudWatch). Setiap log entry punya context fields: timestamp, level,
+      event, plus any custom fields (company_name, pipeline_stage, expo_name).
+      Di production pipeline yang process ratusan company, structured logs sangat
+      penting untuk debugging: "kenapa company X gagal di-profile?"
+    specific_function: >
+      Logging untuk semua stage RETRO pipeline dengan context yang rich.
+      Setiap log entry menyertakan: pipeline_stage, company_domain, expo_name,
+      processing_time. Memudahkan debugging ketika ada company yang gagal:
+      filter log berdasarkan company_domain untuk lihat full trace.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://www.structlog.org/"
+
+    retro:
+      phase: "Semua phase — observability layer"
+      role: >
+        Structured logging untuk semua komponen RETRO. Replace semua print() dan
+        logging.info() dengan structlog. Output JSON ke file dan/atau stdout.
+        Di production, log JSON bisa di-ingest ke ELK stack atau Loki + Grafana
+        untuk query dan alerting.
+      when_to_use: >
+        Gunakan structlog untuk semua logging di RETRO. Set up sekali di startup,
+        gunakan logger = structlog.get_logger() di setiap module. Bind context
+        data (expo_name, company_domain) untuk setiap processing context.
+      priority: "high — wajib untuk production observability"
+      output_goes_to: "Log file, stdout, atau log aggregator (ELK, Loki)"
+
+    setup:
+      install: |
+        pip install structlog
+        # Untuk integrasi dengan Python stdlib logging:
+        pip install structlog colorama  # colorama untuk colored output di development
+      requirements:
+        - "Python 3.8+"
+      env_vars:
+        - name: LOG_LEVEL
+          description: "Logging level: DEBUG/INFO/WARNING/ERROR. Default: INFO"
+        - name: LOG_FORMAT
+          description: "Output format: json (production) atau console (development)"
+
+    usage:
+      basic_example: |
+        import structlog
+        import logging
+        import os
+
+        # Setup di awal application (sekali saja, di main.py atau __init__.py)
+        def configure_logging():
+            level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+            log_format = os.environ.get("LOG_FORMAT", "console")  # "console" atau "json"
+
+            processors = [
+                structlog.contextvars.merge_contextvars,
+                structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"),
+            ]
+
+            if log_format == "json":
+                processors.append(structlog.processors.JSONRenderer())
+            else:
+                processors.append(structlog.dev.ConsoleRenderer(colors=True))
+
+            structlog.configure(
+                processors=processors,
+                wrapper_class=structlog.make_filtering_bound_logger(
+                    getattr(logging, level_name, logging.INFO)
+                ),
+                logger_factory=structlog.PrintLoggerFactory(),
+            )
+
+        configure_logging()
+
+        # Penggunaan di setiap module
+        logger = structlog.get_logger()
+
+        logger.info("crawl_started", url="https://expo.com", expo="BuildTech 2024")
+        logger.warning("rate_limit_hit", service="hunter_io", retry_after=60)
+        logger.error("company_profile_failed", company="PT Test", error="LLM timeout")
+
+      retro_example: |
+        import structlog
+        import time
+        from contextlib import contextmanager
+        from typing import Optional
+        import os
+
+        logger = structlog.get_logger()
+
+        @contextmanager
+        def pipeline_context(stage: str, expo_name: str = "", company_domain: str = ""):
+            """
+            Context manager yang bind pipeline context ke semua log dalam block.
+            Semua log di dalam block akan punya fields: stage, expo_name, company_domain.
+            """
+            structlog.contextvars.bind_contextvars(
+                stage=stage,
+                expo_name=expo_name,
+                company_domain=company_domain,
+            )
+            start_time = time.time()
+            try:
+                yield
+                elapsed = time.time() - start_time
+                logger.info("stage_completed", elapsed_seconds=round(elapsed, 2))
+            except Exception as e:
+                elapsed = time.time() - start_time
+                logger.error(
+                    "stage_failed",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    elapsed_seconds=round(elapsed, 2)
+                )
+                raise
+            finally:
+                structlog.contextvars.unbind_contextvars("stage", "expo_name", "company_domain")
+
+        class RetroPipelineLogger:
+            """
+            High-level logger untuk RETRO pipeline events.
+            Semua critical events dilog dengan consistent structure.
+            """
+
+            @staticmethod
+            def crawl_start(expo_name: str, url: str):
+                logger.info("crawl_started", expo=expo_name, url=url)
+
+            @staticmethod
+            def crawl_complete(expo_name: str, companies_found: int, duration_sec: float):
+                logger.info(
+                    "crawl_completed",
+                    expo=expo_name,
+                    companies_found=companies_found,
+                    duration_sec=round(duration_sec, 2)
+                )
+
+            @staticmethod
+            def company_profiled(domain: str, success: bool, score: float = 0.0, error: str = ""):
+                if success:
+                    logger.info("company_profiled", domain=domain, confidence=round(score, 2))
+                else:
+                    logger.warning("company_profile_failed", domain=domain, reason=error)
+
+            @staticmethod
+            def email_found(domain: str, source: str, email: str, score: int):
+                # Redact email untuk privacy di logs (optional)
+                email_parts = email.split("@") if email else ["", ""]
+                redacted = f"{email_parts[0][:3]}***@{email_parts[-1]}" if len(email_parts) == 2 else email
+                logger.info("email_discovered", domain=domain, source=source,
+                           email_redacted=redacted, score=score)
+
+            @staticmethod
+            def proposal_sent(company: str, email_hash: str, expo: str):
+                logger.info("proposal_sent", company=company, email_hash=email_hash, expo=expo)
+
+            @staticmethod
+            def pipeline_error(component: str, error: str, company: str = "", recoverable: bool = True):
+                log_level = logger.warning if recoverable else logger.error
+                log_level(
+                    "pipeline_error",
+                    component=component,
+                    error=error,
+                    company=company,
+                    recoverable=recoverable
+                )
+
+        # Contoh penggunaan di pipeline
+        def process_expo_companies(expo_name: str, companies: list) -> list:
+            results = []
+            RetroPipelineLogger.crawl_start(expo_name, f"https://expo/{expo_name}")
+
+            for company in companies:
+                with pipeline_context("profiling", expo_name, company.get("domain", "")):
+                    try:
+                        logger.debug("profiling_company", company_name=company.get("company_name"))
+                        # ... profiling logic ...
+                        profile = {"confidence_score": 0.85}  # Placeholder
+                        RetroPipelineLogger.company_profiled(
+                            company["domain"], success=True, score=profile["confidence_score"]
+                        )
+                        results.append(profile)
+                    except Exception as e:
+                        RetroPipelineLogger.pipeline_error(
+                            "context_agent", str(e), company.get("domain", ""), recoverable=True
+                        )
+
+            return results
+
+      expected_output: |
+        # Development output (console format):
+        2024-03-15 08:30:01 [info     ] crawl_started     expo=BuildTech 2024 url=https://buildtech.com
+        2024-03-15 08:30:05 [info     ] crawl_completed   expo=BuildTech 2024 companies_found=47 duration_sec=4.23
+        2024-03-15 08:31:00 [info     ] company_profiled  domain=majujaya.co.id confidence=0.85
+        2024-03-15 08:31:01 [warning  ] company_profile_failed domain=noDomain.com reason=LLM timeout
+
+        # Production output (JSON format):
+        {"timestamp": "2024-03-15T08:30:01Z", "level": "info", "event": "crawl_started", "expo": "BuildTech 2024", "url": "..."}
+
+    notes: >
+      structlog contextvars (bind_contextvars) adalah cara paling clean untuk
+      attach context ke logs tanpa pass logger argument kemana-mana.
+      Untuk integrasi dengan Python stdlib logging (untuk third-party libraries):
+      structlog.configure(logger_factory=structlog.stdlib.LoggerFactory()).
+      Di Docker, output JSON ke stdout dan collect dengan fluentd/vector ke ELK.
+
+    pitfalls:
+      - issue: "structlog tidak integrate dengan stdlib logging (third-party lib logs hilang)"
+        fix: "Setup logging.basicConfig() terpisah untuk stdlib, dan configure structlog dengan wrapper_class=structlog.stdlib.BoundLogger"
+      - issue: "Log terlalu verbose di development"
+        fix: "Set LOG_LEVEL=WARNING untuk suppress INFO logs. Atau filter per-module: structlog.get_logger().bind(level='WARNING')"
+
+  - id: curl_cffi
+    name: "curl_cffi"
+    category: "Anti-Bot HTTP Client"
+    description: >
+      curl_cffi adalah Python binding untuk curl-impersonate yang bisa impersonate
+      browser TLS fingerprint (JA3 fingerprint). Cloudflare, PerimeterX, DataDome,
+      dan anti-bot sistem lainnya sering detect scraper dari TLS fingerprint yang
+      tidak match browser asli. curl_cffi solve ini dengan exactly impersonating
+      Chrome, Firefox, atau Safari TLS handshake. Syntax mirip dengan httpx/requests.
+      Lebih efektif dari playwright untuk non-JavaScript heavy sites.
+    specific_function: >
+      Bypass Cloudflare protection dan anti-bot detection untuk trade show websites
+      yang menggunakan Cloudflare CDN. Banyak expo Indonesia menggunakan Cloudflare
+      yang block scraper standard. curl_cffi bisa bypass ini tanpa launch browser.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://github.com/lexiforest/curl_cffi"
+
+    retro:
+      phase: "Phase 1 — Web Crawling"
+      role: >
+        Fallback HTTP client ketika httpx dan requests di-block oleh Cloudflare.
+        Pipeline RETRO menggunakan httpx sebagai primary, dan curl_cffi sebagai
+        fallback untuk URL yang return 403 Cloudflare challenge.
+      when_to_use: >
+        Gunakan curl_cffi ketika:
+        1. httpx mendapat 403 dari Cloudflare (response HTML ada "Checking your browser")
+        2. Website target punya bot protection (Datadome, PerimeterX)
+        3. Expo website yang punya strict rate limiting berdasarkan fingerprint
+        Jangan gunakan untuk semua requests — lebih lambat dari httpx untuk normal sites.
+      priority: "medium (fallback untuk Cloudflare-protected sites)"
+      output_goes_to: "Page HTML ke text extraction pipeline"
+
+    setup:
+      install: |
+        pip install curl-cffi
+        # Note: package name adalah curl-cffi (dengan dash), bukan curl_cffi
+      requirements:
+        - "Python 3.8+"
+        - "curl_cffi>=0.5.0"
+        - "libcurl dengan TLS support (biasanya sudah include di binary)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from curl_cffi import requests as cf_requests
+
+        # Impersonate Chrome 120 untuk bypass Cloudflare
+        response = cf_requests.get(
+            "https://cloudflare-protected-expo.com/exhibitors",
+            impersonate="chrome120",  # atau "safari17", "firefox121"
+            timeout=30
+        )
+        print(response.status_code)  # 200 (bukan 403)
+        print(response.text[:500])
+
+      retro_example: |
+        from curl_cffi import requests as cf_requests
+        import httpx
+        from typing import Optional
+        import random
+
+        BROWSER_FINGERPRINTS = [
+            "chrome120", "chrome119", "chrome116",
+            "safari17", "safari15_3",
+            "firefox120",
+        ]
+
+        def fetch_with_cloudflare_bypass(
+            url: str,
+            headers: dict = None,
+            timeout: int = 30
+        ) -> Optional[str]:
+            """
+            Fetch URL dengan anti-bot bypass menggunakan curl_cffi.
+            Rotate browser fingerprint untuk variasi.
+            """
+            impersonate = random.choice(BROWSER_FINGERPRINTS)
+
+            default_headers = {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+            }
+
+            if headers:
+                default_headers.update(headers)
+
+            try:
+                response = cf_requests.get(
+                    url,
+                    impersonate=impersonate,
+                    headers=default_headers,
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+
+                if response.status_code == 200:
+                    return response.text
+                elif response.status_code in (403, 429, 503):
+                    # Cloudflare block — log dan return None
+                    return None
+                else:
+                    response.raise_for_status()
+                    return response.text
+
+            except Exception:
+                return None
+
+        async def smart_fetch(url: str) -> Optional[str]:
+            """
+            Smart fetcher: coba httpx dulu, fallback ke curl_cffi jika di-block.
+            """
+            # 1. Coba httpx dulu (lebih cepat)
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        return response.text
+                    elif response.status_code == 403:
+                        # Possible Cloudflare block — check response body
+                        if "cloudflare" in response.text.lower() or "cf-ray" in str(response.headers):
+                            pass  # Fall through ke curl_cffi
+                        else:
+                            return None  # Real 403, bukan Cloudflare
+            except Exception:
+                pass  # Fall through ke curl_cffi
+
+            # 2. Fallback ke curl_cffi untuk Cloudflare bypass
+            return fetch_with_cloudflare_bypass(url)
+
+      expected_output: |
+        # httpx mendapat 403 dari Cloudflare:
+        # <Response [403 Forbidden]> HTML: "Please enable JavaScript..."
+
+        # curl_cffi bypass mendapat 200:
+        # <Response [200 OK]> HTML: "<html><title>Expo Exhibitor List</title>..."
+
+    notes: >
+      curl_cffi adalah solusi terbaik saat ini (2025) untuk bypass Cloudflare
+      tanpa browser. Lebih ringan dari Playwright (tidak perlu Chromium).
+      Jika curl_cffi gagal (Cloudflare sudah update detection), fallback ke
+      Playwright dengan stealth plugin atau layanan proxy premium (BrightData).
+      PENTING: Selalu respek robots.txt dan Terms of Service website yang di-crawl.
+
+    pitfalls:
+      - issue: "curl_cffi tidak tersedia di semua platform (terutama ARM)"
+        fix: "Cek releases di GitHub untuk binary yang tersedia. Untuk Docker, gunakan base image amd64."
+      - issue: "Masih di-block meskipun pakai curl_cffi"
+        fix: "Coba rotate impersonate browser. Atau tambahkan rotating proxy: cf_requests.get(url, impersonate='chrome120', proxies={'https': 'http://proxy:port'})"
+
+  - id: aiohttp
+    name: "aiohttp"
+    category: "Async HTTP Client"
+    description: >
+      aiohttp adalah Python library untuk async HTTP client dan server.
+      Alternatif dari httpx untuk use cases yang membutuhkan connection pooling
+      lebih agresif atau streaming response untuk large files.
+      aiohttp mendukung: WebSocket, streaming, connection pooling,
+      custom SSL context, dan middleware.
+    specific_function: >
+      Async HTTP client untuk concurrent company website crawling.
+      Ketika crawl 50+ company URL secara parallel, aiohttp dengan
+      connector pool sangat efisien. Juga berguna untuk download PDF besar
+      dari trade show websites secara streaming (tidak perlu load ke memory sekaligus).
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://docs.aiohttp.org/"
+
+    retro:
+      phase: "Phase 1 — Web Crawling (concurrent)"
+      role: >
+        Concurrent HTTP client untuk batch crawling. Ketika RETRO crawl daftar
+        100 company URL sekaligus, aiohttp dengan asyncio.gather() bisa
+        handle semua concurrent tanpa blocking. Complement httpx yang lebih
+        cocok untuk single requests dengan retry.
+      when_to_use: >
+        Gunakan aiohttp ketika:
+        1. Crawl banyak URL secara concurrent (50+)
+        2. Download file besar dengan streaming
+        3. WebSocket connection (real-time expo data jika tersedia)
+        Gunakan httpx untuk: single requests, retry logic (httpx punya retry transport),
+        sync context yang butuh async compatibility.
+      priority: "medium (httpx sudah cover most cases)"
+      output_goes_to: "Page content ke text extraction pipeline"
+
+    setup:
+      install: |
+        pip install aiohttp
+        # Untuk SSL support dan performance:
+        pip install aiohttp[speedups]  # Include cchardet, aiodns
+      requirements:
+        - "Python 3.8+"
+        - "aiohttp>=3.9.0"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import aiohttp
+        import asyncio
+        from typing import Optional
+
+        async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+            """Fetch single URL dengan existing session."""
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    return None
+            except Exception:
+                return None
+
+        async def batch_crawl_companies(urls: list[str]) -> list[Optional[str]]:
+            """Crawl multiple URLs concurrently dengan shared session."""
+            connector = aiohttp.TCPConnector(
+                limit=20,          # Max 20 concurrent connections
+                limit_per_host=2,  # Max 2 concurrent ke satu host
+                ssl=False          # Skip SSL verify untuk speed (opsional)
+            )
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; RETROBot/1.0; research)",
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+            }
+
+            async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+                tasks = [fetch_url(session, url) for url in urls]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            return [r if isinstance(r, (str, type(None))) else None for r in results]
+
+      retro_example: |
+        import aiohttp
+        import asyncio
+        from typing import Optional, List, Dict
+        import time
+
+        async def concurrent_company_crawl(
+            companies: List[Dict],
+            max_concurrent: int = 10,
+            delay_between_batches: float = 1.0
+        ) -> List[Dict]:
+            """
+            Crawl company websites secara concurrent dengan rate limiting.
+            """
+            connector = aiohttp.TCPConnector(
+                limit=max_concurrent,
+                limit_per_host=1,       # Max 1 req per host untuk politeness
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
+            )
+
+            timeout = aiohttp.ClientTimeout(connect=10, total=20)
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; RETRO-Intel/1.0; +https://yourdomain.com/bot)",
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+            }
+
+            results = []
+
+            async with aiohttp.ClientSession(
+                connector=connector,
+                headers=headers,
+                timeout=timeout
+            ) as session:
+                # Process dalam batch untuk avoid overwhelming servers
+                batch_size = max_concurrent
+                for i in range(0, len(companies), batch_size):
+                    batch = companies[i:i + batch_size]
+
+                    tasks = []
+                    for company in batch:
+                        url = company.get("website", f"https://{company.get('domain', '')}")
+                        if url and url.startswith("http"):
+                            tasks.append(fetch_company_content(session, company, url))
+                        else:
+                            tasks.append(asyncio.coroutine(lambda c=company: {**c, "crawl_failed": True})())
+
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            results.append({"crawl_failed": True, "error": str(result)})
+                        else:
+                            results.append(result)
+
+                    # Delay antar batch untuk politeness
+                    if i + batch_size < len(companies):
+                        await asyncio.sleep(delay_between_batches)
+
+            return results
+
+        async def fetch_company_content(
+            session: aiohttp.ClientSession,
+            company: Dict,
+            url: str
+        ) -> Dict:
+            """Fetch content dari satu company website."""
+            try:
+                async with session.get(url, allow_redirects=True, max_redirects=5) as resp:
+                    if resp.status == 200:
+                        content_type = resp.content_type or ""
+                        if "text" in content_type or "html" in content_type:
+                            text = await resp.text(errors="replace")
+                            return {
+                                **company,
+                                "raw_html": text[:100000],  # Limit 100KB
+                                "final_url": str(resp.url),
+                                "crawl_status": resp.status,
+                                "crawl_failed": False,
+                            }
+                    return {**company, "crawl_failed": True, "crawl_status": resp.status}
+
+            except aiohttp.ClientConnectorError:
+                return {**company, "crawl_failed": True, "error": "connection_refused"}
+            except asyncio.TimeoutError:
+                return {**company, "crawl_failed": True, "error": "timeout"}
+            except Exception as e:
+                return {**company, "crawl_failed": True, "error": str(e)}
+
+        # Stream large PDF file
+        async def download_expo_pdf_stream(url: str, output_path: str) -> bool:
+            """Download PDF besar secara streaming — tidak load ke memory sekaligus."""
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    if resp.status != 200:
+                        return False
+
+                    with open(output_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+
+            return True
+
+      expected_output: |
+        # concurrent_company_crawl([...]) dengan 50 companies:
+        # Selesai dalam ~5-8 detik (vs ~50 detik jika sequential)
+        [
+          {"company_name": "PT Maju Jaya", "raw_html": "<html>...", "crawl_status": 200, "crawl_failed": False},
+          {"company_name": "ABC Corp", "crawl_failed": True, "error": "timeout"},
+          ...
+        ]
+
+    notes: >
+      aiohttp TCPConnector limit_per_host=1 adalah setting politeness untuk menghindari
+      DDoS accidental ke satu server. Naikan ke 2-3 hanya untuk crawl yang sudah
+      di-approve atau internal. Untuk production RETRO, kombinasikan dengan
+      robots.txt check sebelum crawl.
+
+    pitfalls:
+      - issue: "aiohttp session tidak ditutup setelah use (resource leak)"
+        fix: "Selalu gunakan async with aiohttp.ClientSession() as session. Atau panggil session.close() di finally block."
+      - issue: "SSL certificate error untuk website Indonesia dengan cert expired"
+        fix: "TCPConnector(ssl=False) untuk disable SSL verification. Hanya untuk internal crawling — tidak untuk production yang expose ke internet."
+      - issue: "Memory error saat crawl ribuan URL sekaligus"
+        fix: "Gunakan semaphore untuk limit concurrent: asyncio.Semaphore(20). Atau proses dalam batch seperti contoh di atas."
+
+  - id: loguru
+    name: "loguru"
+    category: "Simplified Logging"
+    description: >
+      loguru adalah logging library Python yang sangat mudah digunakan dengan zero
+      configuration. Satu import, langsung bisa logging dengan color, exception tracing,
+      rotation, compression, dan async support. Alternatif dari structlog yang lebih
+      simple untuk development dan small projects.
+    specific_function: >
+      Quick logging untuk RETRO development phase. Tanpa konfigurasi verbose seperti
+      structlog. Sangat berguna untuk: log ke file dengan auto-rotation, beautiful
+      exception traceback di terminal, dan async-safe logging.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/Delgan/loguru"
+
+    retro:
+      phase: "Development phase — semua stage"
+      role: >
+        Simple logging untuk development. Ketika prototyping, loguru lebih cepat
+        di-setup dari structlog. Upgrade ke structlog untuk production ketika
+        butuh JSON output dan log aggregation.
+      when_to_use: >
+        Gunakan loguru untuk:
+        1. Development dan debugging cepat
+        2. Small deployment tanpa log aggregator
+        3. Ketika butuh file rotation otomatis tanpa setup rumit
+        Upgrade ke structlog untuk production dengan ELK/Loki integration.
+      priority: "medium (development convenience)"
+      output_goes_to: "Console + rotated log files"
+
+    setup:
+      install: |
+        pip install loguru
+      requirements:
+        - "Python 3.5+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from loguru import logger
+        import sys
+
+        # Setup: log ke file dengan rotation (tanpa konfigurasi kompleks)
+        logger.remove()  # Hapus default handler
+        logger.add(sys.stderr, level="INFO", colorize=True)  # Console
+        logger.add(
+            "logs/retro_{time:YYYY-MM-DD}.log",
+            rotation="1 day",      # Rotate setiap hari
+            retention="7 days",    # Simpan 7 hari
+            compression="zip",     # Compress old logs
+            level="DEBUG",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}",
+        )
+
+        # Penggunaan langsung
+        logger.info("Pipeline started", expo="BuildTech 2024")  # Tidak perlu {}
+        logger.debug("Company found: PT Maju Jaya, domain: majujaya.co.id")
+        logger.warning("Rate limit hit: Hunter.io, retry in 60s")
+        logger.error("Company profile failed: {domain}", domain="bad-domain.co.id")
+
+        # Exception dengan full traceback
+        try:
+            raise ValueError("LLM response invalid JSON")
+        except Exception:
+            logger.exception("Failed to parse LLM response")
+            # Otomatis include full traceback yang color-coded dan readable
+
+      retro_example: |
+        from loguru import logger
+        import sys
+        import os
+
+        def setup_loguru(log_dir: str = "logs", level: str = "INFO"):
+            """Setup loguru untuk RETRO development."""
+            os.makedirs(log_dir, exist_ok=True)
+
+            logger.remove()
+
+            # Console: INFO+
+            logger.add(
+                sys.stderr,
+                level=level,
+                colorize=True,
+                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> | <level>{message}</level>"
+            )
+
+            # File: DEBUG+ dengan rotation
+            logger.add(
+                f"{log_dir}/retro_{{time:YYYY-MM-DD}}.log",
+                rotation="1 day",
+                retention="14 days",
+                compression="zip",
+                level="DEBUG",
+                format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}",
+                enqueue=True,  # Async-safe logging
+            )
+
+            # Error-only file untuk alerting monitoring
+            logger.add(
+                f"{log_dir}/retro_errors.log",
+                rotation="1 week",
+                retention="1 month",
+                level="ERROR",
+                enqueue=True,
+            )
+
+            return logger
+
+        # Pipeline logging helpers
+        class RetroLog:
+            @staticmethod
+            def expo_crawl(expo_name: str, url: str, companies_found: int):
+                logger.info(f"Expo crawled: {expo_name} | Found: {companies_found} companies | URL: {url}")
+
+            @staticmethod
+            def company_profiled(domain: str, score: float):
+                logger.info(f"Profiled: {domain} | confidence={score:.2f}")
+
+            @staticmethod
+            def email_found(domain: str, source: str):
+                logger.info(f"Email found for {domain} via {source}")
+
+            @staticmethod
+            def proposal_sent(company: str, expo: str):
+                logger.success(f"Proposal sent to {company} (expo: {expo})")  # logger.success = green
+
+            @staticmethod
+            def error(msg: str, exc: Exception = None):
+                if exc:
+                    logger.opt(exception=exc).error(msg)
+                else:
+                    logger.error(msg)
+
+        setup_loguru()
+        RetroLog.expo_crawl("BuildTech 2024", "https://buildtech.co.id", 47)
+        RetroLog.company_profiled("majujaya.co.id", 0.85)
+        RetroLog.proposal_sent("PT Maju Jaya", "BuildTech 2024")
+
+      expected_output: |
+        # Console output (colorized):
+        08:30:01 | INFO     | retro.crawler | Expo crawled: BuildTech 2024 | Found: 47 companies
+        08:31:00 | INFO     | retro.agents  | Profiled: majujaya.co.id | confidence=0.85
+        08:32:15 | SUCCESS  | retro.email   | Proposal sent to PT Maju Jaya (expo: BuildTech 2024)
+
+        # Error dengan traceback (colorized, much more readable than stdlib):
+        08:35:00 | ERROR    | retro.agents  | Failed to parse LLM response
+        Traceback (most recent call last):
+          File "agents/context.py", line 45, in profile_company
+            data = json.loads(response)
+        ValueError: LLM response invalid JSON
+
+    notes: >
+      loguru.logger adalah module-level singleton — tidak perlu instantiate.
+      enqueue=True penting untuk async code (thread-safe dan async-safe).
+      logger.success() adalah level antara INFO dan WARNING — perfect untuk
+      "proposal sent" events yang ingin visible tapi bukan warning.
+
+    pitfalls:
+      - issue: "loguru tidak compatible dengan standard logging library"
+        fix: "Gunakan loguru.logger.intercept untuk redirect stdlib logging ke loguru. Atau gunakan PropagateHandler."
+      - issue: "Log file terlalu besar tanpa rotation"
+        fix: "Selalu set rotation parameter: rotation='100 MB' atau rotation='1 day'. Jangan skip ini di production."

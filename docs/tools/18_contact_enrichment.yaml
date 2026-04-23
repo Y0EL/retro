@@ -1,0 +1,951 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: B2B Contact Enrichment & Validation
+# File: 18_contact_enrichment.yaml
+# Purpose: Tools untuk enrichment data kontak company target RETRO.
+#          Setelah company di-profile, RETRO perlu menemukan:
+#          1. Email decision-maker yang tepat (bukan info@generic)
+#          2. Validasi bahwa domain punya MX record (email bisa diterima)
+#          3. Data enrichment tambahan: LinkedIn, funding, team size
+#          4. Logo dan branding company untuk proposal PDF
+#
+# PIPELINE EMAIL DISCOVERY RETRO (updated dengan tools baru):
+#   1. Hunter.io domain search (25 free/bulan, paling akurat)
+#   2. Apollo.io people search (50 credits/bulan free, paling banyak data)
+#   3. Snov.io domain search (150 free/bulan)
+#   4. Proxycurl LinkedIn lookup (premium, $0.01/credit)
+#   5. theHarvester OSINT (gratis, scraping)
+#   6. Website scraping + regex (gratis, manual)
+#   -- Setelah menemukan email candidate --
+#   7. dnspython MX record validation (WAJIB sebelum send)
+#   8. email-validator format check
+
+tools:
+
+  - id: apollo_io
+    name: "Apollo.io API"
+    category: "B2B Contact Database"
+    description: >
+      Apollo.io adalah platform B2B intelligence dengan database 275M+ contacts
+      dan 73M+ perusahaan. API menyediakan: people search (cari kontak berdasarkan
+      company, jabatan, lokasi), email finding (temukan email berdasarkan nama + domain),
+      company enrichment (funding, employee count, technographics, keywords).
+      Apollo sangat strong untuk pasar global termasuk Indonesia — lebih lengkap dari
+      Hunter.io untuk Asia Tenggara. Free tier: 50 email credits/bulan tanpa kartu kredit.
+    specific_function: >
+      Primary B2B contact discovery untuk RETRO setelah company di-profile.
+      Search people di Apollo berdasarkan company name dan jabatan target (CEO, CTO,
+      Business Development, Partnership Manager, Procurement Manager).
+      Apollo memberikan email langsung atau "reveal" email (gunakan 1 credit).
+      Juga memberikan company data enrichment: employee count, industry, funding.
+    language: "Python"
+    pricing: "Free: 50 email credits/bulan. Basic: $49/bulan (unlimited email reveal). Pro: $99/bulan."
+    last_updated: "2025"
+    url: "https://apolloio.github.io/apollo-api-docs/"
+
+    retro:
+      phase: "Phase 4 — Email Discovery"
+      role: >
+        Primary atau secondary email discovery tool. Digunakan setelah Hunter.io
+        karena quota free Hunter sangat terbatas (25/bulan). Apollo memiliki
+        lebih banyak data untuk company Indonesia dan ASEAN vs Hunter.
+        Juga digunakan untuk validate jabatan — pastikan email yang ditemukan
+        adalah dari decision maker, bukan staff biasa.
+      when_to_use: >
+        Gunakan Apollo.io ketika:
+        1. Hunter.io tidak menemukan email untuk domain tersebut
+        2. Butuh filter by jabatan (CEO, Partnership Manager, Procurement)
+        3. Butuh data enrichment company (employee count, funding stage)
+        4. Company yang di-target adalah company B2B Indonesia ukuran medium-large
+        Tidak perlu untuk company sangat kecil (< 10 karyawan) yang jarang di Apollo.
+      priority: "primary dalam email discovery waterfall"
+      output_goes_to: "Email + jabatan ke company_profiles, company data ke enrichment fields"
+
+    setup:
+      install: |
+        pip install requests
+        # Tidak ada Python SDK resmi — gunakan requests langsung
+        # Daftar free tier di: https://app.apollo.io/login#/register
+        # Tidak butuh kartu kredit untuk 50 credits/bulan
+      requirements:
+        - "requests>=2.28.0"
+        - "Apollo.io API key (gratis dari dashboard)"
+      env_vars:
+        - name: APOLLO_API_KEY
+          description: "Apollo.io API key dari Settings > API Keys di dashboard"
+
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        api_key = os.environ.get("APOLLO_API_KEY")
+
+        # People search: cari kontak dari company tertentu dengan jabatan target
+        response = requests.post(
+            "https://api.apollo.io/api/v1/people/search",
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json"
+            },
+            json={
+                "organization_name": "PT Telkom Indonesia",
+                "titles": ["CEO", "CTO", "Chief Technology Officer", "VP Business Development"],
+                "contact_email_status": ["verified", "likely to engage"],
+                "per_page": 5,
+                "page": 1
+            },
+            timeout=30
+        )
+
+        data = response.json()
+        for contact in data.get("people", []):
+            print(f"Name:  {contact.get('name')}")
+            print(f"Title: {contact.get('title')}")
+            print(f"Email: {contact.get('email')}")  # Mungkin masked: r***@telkom.co.id
+            print(f"LinkedIn: {contact.get('linkedin_url')}")
+            print()
+
+      retro_example: |
+        import requests
+        import os
+        import time
+        from typing import Optional, List
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+        APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
+        APOLLO_BASE_URL = "https://api.apollo.io/api/v1"
+
+        # Jabatan yang menjadi target RETRO (sorted by priority)
+        TARGET_TITLES = [
+            # Tier 1 — decision makers
+            "CEO", "Chief Executive Officer", "Founder", "Co-Founder", "President Director",
+            "Managing Director", "Direktur Utama",
+            # Tier 2 — business development
+            "Business Development", "VP Business Development", "Head of Business Development",
+            "Partnership Manager", "Alliance Manager", "BD Manager",
+            # Tier 3 — procurement dan commercial
+            "Procurement Manager", "Purchasing Manager", "Commercial Director",
+            "VP Sales", "Chief Commercial Officer",
+            # Tier 4 — tech (untuk tech collaboration)
+            "CTO", "Chief Technology Officer", "VP Engineering", "Head of Technology",
+        ]
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, min=5, max=30),
+            retry=retry_if_exception_type((requests.HTTPError, requests.Timeout)),
+        )
+        def apollo_people_search(
+            company_name: str,
+            titles: List[str] = None,
+            per_page: int = 5
+        ) -> List[dict]:
+            """
+            Search people dari Apollo.io berdasarkan company name.
+            Return: list contact dicts dengan name, title, email, linkedin_url
+            """
+            if not APOLLO_API_KEY:
+                return []
+
+            response = requests.post(
+                f"{APOLLO_BASE_URL}/people/search",
+                headers={"x-api-key": APOLLO_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "organization_name": company_name,
+                    "titles": titles or TARGET_TITLES[:10],  # Max 10 titles
+                    "contact_email_status": ["verified", "likely to engage", "unavailable"],
+                    "per_page": per_page,
+                    "page": 1,
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("people", [])
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, min=5, max=30),
+            retry=retry_if_exception_type((requests.HTTPError, requests.Timeout)),
+        )
+        def apollo_enrich_company(domain: str) -> Optional[dict]:
+            """
+            Enrich company data dari Apollo berdasarkan domain.
+            Return company info: employee_count, funding, industry, keywords.
+            """
+            if not APOLLO_API_KEY or not domain:
+                return None
+
+            response = requests.post(
+                f"{APOLLO_BASE_URL}/organizations/enrich",
+                headers={"x-api-key": APOLLO_API_KEY, "Content-Type": "application/json"},
+                json={"domain": domain},
+                timeout=30
+            )
+
+            if response.status_code == 404:
+                return None  # Company tidak ada di Apollo
+
+            response.raise_for_status()
+            org = response.json().get("organization", {})
+
+            return {
+                "employee_count": org.get("estimated_num_employees"),
+                "employee_range": org.get("num_employees_range"),
+                "funding_total": org.get("total_funding"),
+                "last_funding_type": org.get("latest_funding_stage"),
+                "industry": org.get("industry"),
+                "keywords": org.get("keywords", []),
+                "linkedin_url": org.get("linkedin_url"),
+                "founded_year": org.get("founded_year"),
+            }
+
+        def score_contact_for_retro(contact: dict) -> int:
+            """
+            Score contact 0-100 berdasarkan suitability untuk RETRO outreach.
+            Lebih tinggi = lebih prioritas untuk email proposal.
+            """
+            score = 0
+            title = (contact.get("title") or "").lower()
+
+            # Jabatan scoring
+            if any(kw in title for kw in ["ceo", "chief executive", "founder", "direktur utama", "president director"]):
+                score += 50
+            elif any(kw in title for kw in ["business development", "partnership", "alliance", "bd "]):
+                score += 40
+            elif any(kw in title for kw in ["procurement", "purchasing", "commercial"]):
+                score += 30
+            elif any(kw in title for kw in ["cto", "chief technology", "vp engineering"]):
+                score += 25
+            elif any(kw in title for kw in ["manager", "director", "head"]):
+                score += 15
+
+            # Email availability
+            email = contact.get("email", "")
+            if email and "@" in email and "***" not in email:
+                score += 30  # Full email tersedia (sudah reveal)
+            elif email and "***" in email:
+                score += 10  # Partial email (perlu reveal credit)
+
+            # LinkedIn tersedia
+            if contact.get("linkedin_url"):
+                score += 10
+
+            return min(score, 100)
+
+        def discover_contacts_apollo(
+            company_name: str,
+            domain: str,
+            max_results: int = 3
+        ) -> List[dict]:
+            """
+            Full Apollo discovery: search contacts + enrichment + scoring.
+            Return: list contact yang sudah di-score, sorted by priority.
+            """
+            contacts = apollo_people_search(company_name, per_page=10)
+            time.sleep(0.5)  # Rate limiting
+
+            if not contacts:
+                return []
+
+            # Score dan filter
+            scored = []
+            for contact in contacts:
+                score = score_contact_for_retro(contact)
+                if score >= 15:  # Minimum threshold
+                    scored.append({
+                        "name": contact.get("name"),
+                        "title": contact.get("title"),
+                        "email": contact.get("email"),
+                        "email_partial": "***" in (contact.get("email") or ""),
+                        "linkedin_url": contact.get("linkedin_url"),
+                        "source": "apollo",
+                        "confidence_score": score / 100,
+                    })
+
+            return sorted(scored, key=lambda x: x["confidence_score"], reverse=True)[:max_results]
+
+      expected_output: |
+        # discover_contacts_apollo("PT Telkom Indonesia", "telkom.co.id"):
+        [
+          {
+            "name": "Ririek Adriansyah",
+            "title": "President Director & CEO",
+            "email": "ririek.adriansyah@telkom.co.id",
+            "email_partial": False,
+            "linkedin_url": "https://www.linkedin.com/in/ririek-adriansyah",
+            "source": "apollo",
+            "confidence_score": 0.90
+          }
+        ]
+
+    notes: >
+      Apollo free tier memberikan email dalam format partial masked (r***@telkom.co.id).
+      Untuk "reveal" email lengkap, gunakan 1 email credit. Dengan free tier 50 credits/bulan,
+      prioritaskan untuk company dengan collaboration score tinggi saja. Apollo rate limit:
+      ~1 request/detik untuk free tier. Jangan burst request berurutan.
+
+    pitfalls:
+      - issue: "Email dari Apollo kadang tidak akurat (bounced)"
+        fix: "Selalu validate dengan dnspython MX check SEBELUM send. Apollo tidak guarantee email akurasi 100%."
+      - issue: "Company Indonesia kecil tidak ada di Apollo"
+        fix: "Apollo lebih lengkap untuk company medium-large. Untuk company kecil, fallback ke theHarvester atau website scraping."
+      - issue: "Rate limit 429 dari Apollo free tier"
+        fix: "Tambahkan time.sleep(1) antar request. Apollo free tier limit: 50 req/menit."
+
+  - id: dnspython
+    name: "dnspython + MX Validation"
+    category: "DNS & Email Domain Validation"
+    description: >
+      dnspython adalah library DNS Python yang comprehensive. Untuk konteks RETRO,
+      digunakan terutama untuk MX record validation: memastikan domain target
+      punya mail server yang aktif sebelum mengirim email proposal. Domain tanpa
+      MX record = email pasti bounce = merusak sender reputation.
+      Alternatif gratis dari MXToolbox API (yang membutuhkan API key).
+    specific_function: >
+      Pre-send validation: cek apakah domain email target punya MX record aktif.
+      Jika tidak ada MX record atau MX record mengarah ke null route, jangan kirim.
+      Ini wajib untuk menjaga sender reputation dan deliverability email RETRO.
+      Juga bisa resolve A record untuk validate domain existance.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://www.dnspython.org/"
+
+    retro:
+      phase: "Phase 4 — Email Validation sebelum Phase 5 (Email Sending)"
+      role: >
+        Final validation gate sebelum email dikirim. Setelah email ditemukan dari
+        Hunter/Apollo/theHarvester, cek MX record domain-nya. Jika tidak valid,
+        drop email tersebut dan log ke failed_contacts. Jangan skip step ini —
+        bounce rate tinggi bisa blacklist domain pengirim RETRO.
+      when_to_use: >
+        WAJIB dipanggil untuk setiap email yang akan dikirim.
+        Juga bisa digunakan saat email discovery untuk filter domain dead sebelum
+        menggunakan email credit (Hunter/Apollo) pada domain yang tidak aktif.
+      priority: "critical — tanpa ini bounce rate tinggi"
+      output_goes_to: "Boolean pass/fail -> lanjut send atau mark as invalid di DB"
+
+    setup:
+      install: |
+        pip install dnspython
+      requirements:
+        - "Python 3.8+"
+        - "Internet access untuk DNS query"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import dns.resolver
+        from typing import Optional, List
+
+        def check_mx_record(domain: str) -> bool:
+            """
+            Cek apakah domain punya MX record aktif.
+            Return True jika ada MX record, False jika tidak.
+            """
+            try:
+                mx_records = dns.resolver.resolve(domain, 'MX')
+                return len(mx_records) > 0
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.Timeout):
+                return False
+            except Exception:
+                return False
+
+        # Test
+        print(check_mx_record("gmail.com"))       # True
+        print(check_mx_record("telkom.co.id"))    # True
+        print(check_mx_record("parked-domain-xyz.com"))  # False (parked domain)
+
+      retro_example: |
+        import dns.resolver
+        import socket
+        from typing import Optional, List, Tuple
+        from dataclasses import dataclass
+
+        @dataclass
+        class DomainValidationResult:
+            domain: str
+            has_mx: bool
+            mx_records: List[str]
+            has_a_record: bool
+            validation_passed: bool
+            failure_reason: Optional[str]
+
+        def validate_email_domain(email: str) -> DomainValidationResult:
+            """
+            Full domain validation untuk email sebelum send.
+            Checks: MX record, A record (domain exist), basic format.
+            """
+            if not email or "@" not in email:
+                return DomainValidationResult(
+                    domain="", has_mx=False, mx_records=[],
+                    has_a_record=False, validation_passed=False,
+                    failure_reason="Invalid email format (no @)"
+                )
+
+            domain = email.split("@")[-1].lower().strip()
+
+            # Check MX record
+            mx_records = []
+            has_mx = False
+            try:
+                mx_answers = dns.resolver.resolve(domain, 'MX', lifetime=10)
+                mx_records = [str(r.exchange).rstrip('.') for r in mx_answers]
+                has_mx = True
+            except dns.resolver.NXDOMAIN:
+                return DomainValidationResult(
+                    domain=domain, has_mx=False, mx_records=[],
+                    has_a_record=False, validation_passed=False,
+                    failure_reason=f"Domain {domain} tidak exist (NXDOMAIN)"
+                )
+            except (dns.resolver.NoAnswer, dns.exception.Timeout):
+                has_mx = False
+            except Exception:
+                has_mx = False
+
+            # Check A record (domain at least exist, even without MX)
+            has_a = False
+            try:
+                dns.resolver.resolve(domain, 'A', lifetime=10)
+                has_a = True
+            except Exception:
+                pass
+
+            # Check for null-route MX (e.g., 0 .)
+            null_mx_indicators = ["0 .", "localhost", "127.0.0.1", "invalid"]
+            is_null_mx = any(
+                any(indicator in mx.lower() for indicator in null_mx_indicators)
+                for mx in mx_records
+            )
+
+            if is_null_mx:
+                return DomainValidationResult(
+                    domain=domain, has_mx=True, mx_records=mx_records,
+                    has_a_record=has_a, validation_passed=False,
+                    failure_reason="Domain punya null-route MX (email rejection active)"
+                )
+
+            validation_passed = has_mx and not is_null_mx
+
+            return DomainValidationResult(
+                domain=domain,
+                has_mx=has_mx,
+                mx_records=mx_records,
+                has_a_record=has_a,
+                validation_passed=validation_passed,
+                failure_reason=None if validation_passed else "No MX record found"
+            )
+
+        def filter_valid_emails(emails: List[str]) -> Tuple[List[str], List[str]]:
+            """
+            Filter list email: return (valid_emails, invalid_emails).
+            Cache domain results untuk avoid redundant DNS queries.
+            """
+            domain_cache = {}
+            valid = []
+            invalid = []
+
+            for email in emails:
+                if "@" not in email:
+                    invalid.append(email)
+                    continue
+
+                domain = email.split("@")[-1].lower()
+
+                # Cache domain validation result
+                if domain not in domain_cache:
+                    result = validate_email_domain(email)
+                    domain_cache[domain] = result.validation_passed
+
+                if domain_cache[domain]:
+                    valid.append(email)
+                else:
+                    invalid.append(email)
+
+            return valid, invalid
+
+        # Contoh penggunaan di RETRO pre-send validation
+        emails_to_validate = [
+            "ceo@majujaya.co.id",
+            "info@parked-domain-xyz.com",
+            "budi@telkom.co.id",
+            "contact@invalid-domain-12345.net",
+        ]
+
+        valid_emails, invalid_emails = filter_valid_emails(emails_to_validate)
+        print(f"Valid: {valid_emails}")
+        print(f"Invalid: {invalid_emails}")
+
+      expected_output: |
+        # filter_valid_emails([...]):
+        Valid:   ["ceo@majujaya.co.id", "budi@telkom.co.id"]
+        Invalid: ["info@parked-domain-xyz.com", "contact@invalid-domain-12345.net"]
+
+        # validate_email_domain("ceo@majujaya.co.id"):
+        DomainValidationResult(
+            domain="majujaya.co.id",
+            has_mx=True,
+            mx_records=["mail.majujaya.co.id"],
+            has_a_record=True,
+            validation_passed=True,
+            failure_reason=None
+        )
+
+    notes: >
+      DNS query memerlukan internet access. Untuk high-volume validation (1000+ emails),
+      cache domain results untuk avoid redundant queries — satu domain biasanya punya
+      banyak email. Gunakan lifetime=10 untuk timeout reasonable (default bisa lambat).
+      Resolver default menggunakan DNS dari system (8.8.8.8 di Docker jika tidak di-configure).
+      Alternatif untuk validasi lebih dalam: checkdmarc library untuk SPF/DKIM/DMARC check.
+
+    pitfalls:
+      - issue: "DNS query timeout untuk semua domain (network issue)"
+        fix: "Set custom nameserver: resolver = dns.resolver.Resolver(); resolver.nameservers = ['8.8.8.8', '1.1.1.1']"
+      - issue: "False negative: MX record ada tapi email tetap bounce"
+        fix: "MX validation hanya cek domain-level. Email bounce bisa karena: mailbox full, email blocked, user tidak exist. Untuk RETRO, MX check sudah cukup sebagai pre-filter."
+      - issue: "Rate limiting dari DNS server untuk high-volume check"
+        fix: "Implementasi domain-level cache dan limit ke max 10 unique domain checks per detik."
+
+  - id: proxycurl
+    name: "Proxycurl"
+    category: "LinkedIn & Professional Network Data"
+    description: >
+      Proxycurl adalah API service untuk scraping LinkedIn data secara legal
+      (menggunakan LinkedIn public data). Menyediakan: company profile (employee count,
+      funding, industry, specialties), people profile (contact info, work history),
+      employee search (daftar karyawan berdasarkan jabatan).
+      Credit-based pricing: $0.01/credit, minimal purchase $10 (1000 credits).
+      Sangat berguna untuk validasi jabatan CEO/decision-maker dari LinkedIn sebelum outreach.
+    specific_function: >
+      Enrich company data dengan LinkedIn company profile dan temukan kontak spesifik.
+      Untuk RETRO: validate bahwa kontak yang ditemukan Apollo/Hunter memang masih
+      menjabat di posisi tersebut (LinkedIn current position), dan find additional
+      decision makers yang tidak ada di Apollo/Hunter.
+    language: "Python"
+    pricing: "$0.01/credit. Company profile: 1 credit. Person profile: 1 credit. Employee search: 3 credits."
+    last_updated: "2025"
+    url: "https://nubela.co/proxycurl/"
+
+    retro:
+      phase: "Phase 4 — Email Discovery & Contact Enrichment (premium tier)"
+      role: >
+        Premium enrichment layer setelah Apollo/Hunter. Digunakan ketika:
+        1. Perlu confirm jabatan current dari kontak yang ditemukan
+        2. Apollo tidak menemukan kontak untuk company target
+        3. Company memiliki collaboration_score sangat tinggi (> 0.85) sehingga
+           worth-it untuk spend credit lebih
+        Jangan gunakan untuk semua company — hanya high-priority targets.
+      when_to_use: >
+        Gunakan Proxycurl hemat — hanya untuk company dengan match score > 0.8.
+        Prioritaskan: company yang sudah ada company_linkedin_url dari crawling,
+        tidak perlu search LinkedIn URL dulu (search = 2 credits extra).
+        Jangan gunakan untuk company kecil yang tidak punya LinkedIn presence.
+      priority: "secondary-premium (gunakan hanya untuk high-value targets)"
+      output_goes_to: "LinkedIn data ke company_profiles.linkedin_data JSONB field"
+
+    setup:
+      install: |
+        pip install proxycurl-py
+        # Atau tanpa library, gunakan requests langsung
+        pip install requests
+      requirements:
+        - "requests atau proxycurl-py"
+        - "Proxycurl API key dari dashboard nubela.co"
+        - "Budget: minimal $10 untuk 1000 credits"
+      env_vars:
+        - name: PROXYCURL_API_KEY
+          description: "API key dari https://nubela.co/proxycurl/dashboard"
+
+    usage:
+      basic_example: |
+        import requests
+        import os
+
+        api_key = os.environ.get("PROXYCURL_API_KEY")
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        # Lookup company profile LinkedIn
+        response = requests.get(
+            "https://nubela.co/proxycurl/api/linkedin/company",
+            headers=headers,
+            params={"url": "https://www.linkedin.com/company/telkom-indonesia/"},
+            timeout=30
+        )
+        company = response.json()
+        print(f"Company: {company.get('name')}")
+        print(f"Employees: {company.get('company_size_on_linkedin')}")
+        print(f"Specialties: {company.get('specialities')[:3]}")
+
+        # Lookup employee list (employee search)
+        response2 = requests.get(
+            "https://nubela.co/proxycurl/api/linkedin/company/employees/",
+            headers=headers,
+            params={
+                "linkedin_company_profile_url": "https://www.linkedin.com/company/telkom-indonesia/",
+                "role_search": "Business Development",
+                "page_size": 5,
+            },
+            timeout=60
+        )
+        employees = response2.json().get("employees", [])
+        for emp in employees:
+            print(f"{emp.get('first_name')} {emp.get('last_name')} - {emp.get('title')}")
+
+      retro_example: |
+        import requests
+        import os
+        import time
+        from typing import Optional, List
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+        PROXYCURL_KEY = os.environ.get("PROXYCURL_API_KEY", "")
+        PROXYCURL_BASE = "https://nubela.co/proxycurl/api"
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=15),
+            retry=retry_if_exception_type((requests.HTTPError, requests.Timeout)),
+        )
+        def get_company_linkedin_profile(linkedin_url: str) -> Optional[dict]:
+            """
+            Fetch LinkedIn company profile. Cost: 1 credit.
+            Return: company data dict atau None jika tidak ditemukan.
+            """
+            if not PROXYCURL_KEY or not linkedin_url:
+                return None
+
+            response = requests.get(
+                f"{PROXYCURL_BASE}/linkedin/company",
+                headers={"Authorization": f"Bearer {PROXYCURL_KEY}"},
+                params={"url": linkedin_url},
+                timeout=30
+            )
+
+            if response.status_code in (404, 400):
+                return None  # Company tidak ditemukan di LinkedIn
+
+            response.raise_for_status()
+            data = response.json()
+
+            return {
+                "linkedin_url": linkedin_url,
+                "employee_count_linkedin": data.get("company_size_on_linkedin"),
+                "follower_count": data.get("follower_count"),
+                "specialties": data.get("specialities", [])[:5],
+                "company_type": data.get("company_type"),  # PUBLIC, PRIVATE, etc.
+                "headquarters": data.get("headquarters"),
+                "founded": data.get("founded", {}).get("year"),
+                "website": data.get("website"),
+                "description": (data.get("description") or "")[:500],  # Truncate
+            }
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, min=5, max=30),
+            retry=retry_if_exception_type((requests.HTTPError, requests.Timeout)),
+        )
+        def search_decision_makers(
+            linkedin_company_url: str,
+            roles: List[str] = None,
+            max_per_role: int = 2
+        ) -> List[dict]:
+            """
+            Search decision makers di company via Proxycurl employee search.
+            Cost: 3 credits per call.
+            """
+            if not PROXYCURL_KEY or not linkedin_company_url:
+                return []
+
+            default_roles = ["CEO", "Business Development", "Partnership", "Procurement"]
+            search_roles = roles or default_roles
+
+            all_contacts = []
+
+            for role in search_roles[:3]:  # Max 3 role queries untuk hemat credits
+                response = requests.get(
+                    f"{PROXYCURL_BASE}/linkedin/company/employees/",
+                    headers={"Authorization": f"Bearer {PROXYCURL_KEY}"},
+                    params={
+                        "linkedin_company_profile_url": linkedin_company_url,
+                        "role_search": role,
+                        "page_size": max_per_role,
+                    },
+                    timeout=60
+                )
+
+                if response.status_code == 404:
+                    continue
+
+                response.raise_for_status()
+                employees = response.json().get("employees", [])
+
+                for emp in employees:
+                    profile_url = emp.get("profile_url")
+                    if profile_url and profile_url not in [c.get("linkedin_url") for c in all_contacts]:
+                        all_contacts.append({
+                            "name": f"{emp.get('first_name', '')} {emp.get('last_name', '')}".strip(),
+                            "title": emp.get("title"),
+                            "linkedin_url": profile_url,
+                            "source": "proxycurl",
+                        })
+
+                time.sleep(1)  # Rate limiting
+
+            return all_contacts
+
+        def enrich_high_priority_company(
+            company_profile: dict,
+            budget_credits: int = 5
+        ) -> dict:
+            """
+            Enrich company dengan LinkedIn data. Use credits wisely.
+            budget_credits: max credits yang boleh digunakan untuk company ini.
+            """
+            linkedin_url = company_profile.get("linkedin_url")
+            if not linkedin_url:
+                return company_profile  # Tidak bisa enrichment tanpa LinkedIn URL
+
+            enriched = company_profile.copy()
+            credits_used = 0
+
+            # Company profile (1 credit)
+            if credits_used < budget_credits:
+                linkedin_data = get_company_linkedin_profile(linkedin_url)
+                if linkedin_data:
+                    enriched["linkedin_data"] = linkedin_data
+                    if not enriched.get("employee_count") and linkedin_data.get("employee_count_linkedin"):
+                        enriched["employee_count"] = linkedin_data["employee_count_linkedin"]
+                    credits_used += 1
+                    time.sleep(1)
+
+            # Decision maker search (3 credits)
+            if credits_used + 3 <= budget_credits:
+                contacts = search_decision_makers(linkedin_url, max_per_role=2)
+                if contacts:
+                    enriched["linkedin_contacts"] = contacts
+                    credits_used += 3
+
+            enriched["proxycurl_credits_used"] = credits_used
+            return enriched
+
+      expected_output: |
+        # get_company_linkedin_profile("https://www.linkedin.com/company/telkom-indonesia/"):
+        {
+          "linkedin_url": "https://www.linkedin.com/company/telkom-indonesia/",
+          "employee_count_linkedin": "10001+",
+          "follower_count": 125000,
+          "specialties": ["Telecommunications", "ICT", "Digital Services"],
+          "company_type": "PUBLIC",
+          "founded": 1991,
+          "website": "https://www.telkom.co.id"
+        }
+
+    notes: >
+      Proxycurl mewajibkan LinkedIn URL — tidak bisa search by company name saja.
+      Untuk mendapatkan LinkedIn URL dari company name, gunakan Google search atau
+      Apollo.io yang biasanya include linkedin_url di company enrichment response.
+      Simpan semua Proxycurl data ke cache (Redis 7 hari) untuk avoid re-spending credits.
+
+    pitfalls:
+      - issue: "Credit habis lebih cepat dari perkiraan"
+        fix: "Track credits di Redis counter. Buat PROXYCURL_BUDGET_PER_DAY env var dan enforce di pipeline. Log setiap credit yang digunakan."
+      - issue: "LinkedIn blocking Proxycurl untuk company tertentu"
+        fix: "Proxycurl handle LinkedIn blocking di belakang layar. Jika 403, tunggu dan retry setelah 24 jam."
+      - issue: "Employee list tidak update real-time"
+        fix: "LinkedIn data di Proxycurl bisa stale beberapa hari. Untuk RETRO, ini acceptable — jabatan orang jarang berubah dalam hitungan hari."
+
+  - id: brandfetch
+    name: "Brandfetch + logo.dev"
+    category: "Company Branding & Visual Data"
+    description: >
+      Brandfetch adalah API untuk mendapatkan brand assets company: logo (SVG/PNG),
+      warna brand, deskripsi, industry, domain. logo.dev adalah CDN untuk logo company
+      berdasarkan domain — response instantly, tidak perlu API key.
+      Berguna untuk membuat proposal PDF yang profesional dengan logo company target.
+      Proposal dengan logo company target = lebih personal dan professional.
+    specific_function: >
+      Fetch logo company target untuk dimasukkan ke proposal PDF RETRO.
+      logo.dev adalah cara tercepat: satu URL dengan domain = dapat logo PNG.
+      Brandfetch memberikan data lebih lengkap: warna brand, multiple logo formats,
+      tagline, dan description company.
+    language: "Python"
+    pricing: "logo.dev: gratis tanpa API key. Brandfetch: 500 req/bulan gratis."
+    last_updated: "2025"
+    url: "https://logo.dev"
+
+    retro:
+      phase: "Phase 5 — PDF Generation"
+      role: >
+        Fetch logo company target untuk di-embed ke proposal PDF.
+        Logo di header proposal = kesan "kami sudah research perusahaan Anda".
+        Ini small touch yang significantly meningkatkan professionalism proposal.
+      when_to_use: >
+        Gunakan saat generate proposal PDF. Fetch logo berdasarkan domain company target.
+        Jika logo tidak ditemukan (domain tidak di-index), gunakan placeholder atau skip.
+        Jangan block PDF generation hanya karena logo tidak ada.
+      priority: "low-medium (nice to have untuk proposal quality)"
+      output_goes_to: "Logo PNG/SVG bytes ke proposal PDF template via Jinja2"
+
+    setup:
+      install: |
+        pip install requests pillow
+        # Tidak ada Python library khusus — gunakan requests langsung
+        # logo.dev: tidak perlu API key, langsung akses via URL
+        # Brandfetch: daftar di brandfetch.com/developers untuk free API key
+      requirements:
+        - "requests>=2.28.0"
+        - "pillow (untuk image processing opsional)"
+      env_vars:
+        - name: BRANDFETCH_API_KEY
+          description: "Brandfetch API key (opsional, untuk data lebih lengkap)"
+
+    usage:
+      basic_example: |
+        import requests
+        from io import BytesIO
+        import base64
+
+        def get_logo_from_logo_dev(domain: str, size: int = 128) -> Optional[bytes]:
+            """
+            Fetch company logo dari logo.dev. Gratis, no API key needed.
+            size: pixel size (64, 128, 256, 512)
+            """
+            try:
+                url = f"https://img.logo.dev/{domain}?token=pk_free&size={size}&format=png"
+                response = requests.get(url, timeout=10)
+
+                if response.status_code == 200 and response.headers.get("content-type", "").startswith("image/"):
+                    return response.content
+
+                return None
+            except Exception:
+                return None
+
+        def logo_to_base64(logo_bytes: bytes) -> str:
+            """Convert logo bytes ke base64 untuk embed di HTML/PDF."""
+            return base64.b64encode(logo_bytes).decode("utf-8")
+
+        # Fetch dan embed
+        logo = get_logo_from_logo_dev("telkom.co.id")
+        if logo:
+            b64_logo = logo_to_base64(logo)
+            html_img = f'<img src="data:image/png;base64,{b64_logo}" height="50" alt="Logo">'
+
+      retro_example: |
+        import requests
+        import os
+        import base64
+        from typing import Optional
+        from io import BytesIO
+
+        def fetch_company_branding(domain: str) -> dict:
+            """
+            Fetch company branding: logo + brand colors.
+            Try logo.dev first (fast, free), fallback to Brandfetch (more data).
+            Return: {logo_b64, logo_url, primary_color, description}
+            """
+            result = {
+                "logo_b64": None,
+                "logo_url": None,
+                "primary_color": "#1a1a2e",  # Default dark color
+                "description": None,
+            }
+
+            # 1. Try logo.dev (cepat, gratis, no rate limit)
+            logo_url = f"https://img.logo.dev/{domain}?token=pk_free&size=128&format=png"
+            try:
+                logo_resp = requests.get(logo_url, timeout=8)
+                if logo_resp.status_code == 200 and "image" in logo_resp.headers.get("content-type", ""):
+                    result["logo_b64"] = base64.b64encode(logo_resp.content).decode()
+                    result["logo_url"] = logo_url
+            except Exception:
+                pass
+
+            # 2. Try Brandfetch untuk data lebih lengkap (jika punya API key)
+            brandfetch_key = os.environ.get("BRANDFETCH_API_KEY")
+            if brandfetch_key and not result["logo_b64"]:
+                try:
+                    bf_resp = requests.get(
+                        f"https://api.brandfetch.io/v2/brands/{domain}",
+                        headers={"Authorization": f"Bearer {brandfetch_key}"},
+                        timeout=15
+                    )
+                    if bf_resp.status_code == 200:
+                        brand = bf_resp.json()
+
+                        # Extract logo
+                        logos = brand.get("logos", [])
+                        for logo_data in logos:
+                            for fmt in logo_data.get("formats", []):
+                                if fmt.get("format") == "png" and fmt.get("src"):
+                                    logo_src = fmt["src"]
+                                    img_resp = requests.get(logo_src, timeout=10)
+                                    if img_resp.status_code == 200:
+                                        result["logo_b64"] = base64.b64encode(img_resp.content).decode()
+                                        result["logo_url"] = logo_src
+                                    break
+                            if result["logo_b64"]:
+                                break
+
+                        # Extract primary color
+                        colors = brand.get("colors", [])
+                        brand_colors = [c for c in colors if c.get("type") == "brand"]
+                        if brand_colors:
+                            result["primary_color"] = brand_colors[0].get("hex", "#1a1a2e")
+
+                        # Description
+                        result["description"] = brand.get("description")
+
+                except Exception:
+                    pass  # Gagal silently, logo tidak critical
+
+            return result
+
+        # Contoh embed ke proposal PDF template
+        def prepare_proposal_context(company_profile: dict) -> dict:
+            """
+            Prepare full context untuk Jinja2 template proposal PDF.
+            Include logo company target.
+            """
+            domain = company_profile.get("domain", "")
+            branding = fetch_company_branding(domain) if domain else {}
+
+            return {
+                **company_profile,
+                "target_logo_b64": branding.get("logo_b64"),
+                "target_logo_available": bool(branding.get("logo_b64")),
+                "target_brand_color": branding.get("primary_color", "#1a1a2e"),
+                "target_description_brandfetch": branding.get("description"),
+            }
+
+        # Di Jinja2 template (proposal.html.j2):
+        # {% if target_logo_available %}
+        # <img src="data:image/png;base64,{{ target_logo_b64 }}" height="50" alt="{{ company_name }} Logo">
+        # {% else %}
+        # <div class="company-name-header">{{ company_name }}</div>
+        # {% endif %}
+
+      expected_output: |
+        # fetch_company_branding("telkom.co.id"):
+        {
+          "logo_b64": "iVBORw0KGgoAAAANS...",  # Base64 PNG
+          "logo_url": "https://img.logo.dev/telkom.co.id?token=pk_free&size=128&format=png",
+          "primary_color": "#e30613",  # Telkom red
+          "description": "Indonesia's largest telecommunications company"
+        }
+
+    notes: >
+      logo.dev token "pk_free" adalah public free token dengan rate limit.
+      Untuk production volume tinggi, daftar di logo.dev untuk paid API key.
+      Tidak semua domain Indonesia ada di logo.dev database — coverage ~60-70%
+      untuk company besar, lebih rendah untuk company kecil. Selalu handle
+      case dimana logo tidak tersedia (jangan crash PDF generation).
+
+    pitfalls:
+      - issue: "Logo.dev return default placeholder untuk domain yang tidak dikenali"
+        fix: "Check content-type response: harus 'image/png'. Cek file size > 1KB (placeholder biasanya < 500 bytes)."
+      - issue: "Logo JPEG/PNG terlalu besar untuk embed ke PDF"
+        fix: "Resize dengan Pillow sebelum base64 encode: img.thumbnail((128, 128), Image.LANCZOS)"
+      - issue: "Brandfetch free tier 500 req/bulan habis"
+        fix: "Cache semua Brandfetch responses di Redis selama 30 hari. Satu domain hanya perlu di-fetch sekali."

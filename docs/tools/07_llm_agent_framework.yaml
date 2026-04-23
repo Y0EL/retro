@@ -1,0 +1,1473 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: LLM, Agent Framework & Observability
+# File: 07_llm_agent_framework.yaml
+# Purpose: Semua tools yang berkaitan dengan Large Language Model calls, agent orchestration,
+#          prompt management, memory, dan observability (tracing, monitoring).
+#
+# RETRO LLM ARCHITECTURE (3 distinct agents):
+#   Context Agent  --> per-company profiling (one LLM call per company)
+#   Synthesis Agent --> matchmaking & ranking (one LLM call per expo batch)
+#   Proposal Writer --> proposal generation (one LLM call per proposal)
+#
+# KEY PRINCIPLE: LLM digunakan HANYA untuk synthesis dan generation.
+#   Crawling, scheduling, dedup, OCR = NON-LLM (deterministic tools)
+#   Context/Synthesis/Writing = LLM (generative, flexible)
+#
+# RECOMMENDED STACK (RETRO):
+#   LLM Router:       LiteLLM (switch Claude/OpenAI/Groq tanpa ubah kode)
+#   Primary LLM:      Claude Sonnet 4.6 via Anthropic API
+#   Fast/Cheap LLM:   Groq (Llama 3.1 70B, gratis, sangat cepat untuk prototyping)
+#   Local LLM:        Ollama (untuk data confidential, offline mode)
+#   Agent Framework:  PydanticAI (type-safe, structured output, ringan)
+#   Observability:    Langfuse (self-hosted, trace semua LLM calls dengan biaya)
+
+tools:
+
+  - id: litellm
+    name: "LiteLLM"
+    category: "LLM Router / Unified API"
+    description: >
+      LiteLLM adalah library Python yang menyediakan satu unified interface untuk
+      100+ LLM providers: Anthropic Claude, OpenAI GPT, Google Gemini, Groq, Mistral,
+      Ollama (local), Azure OpenAI, AWS Bedrock, dan banyak lagi. Dengan LiteLLM,
+      RETRO dapat switch antara providers hanya dengan mengubah satu string model name
+      di environment variable. LiteLLM juga menyediakan: load balancing antar API keys,
+      fallback ke provider lain jika primary down, cost tracking, dan proxy server mode.
+      Mendukung streaming, function calling, vision, dan embedding.
+    specific_function: >
+      Unified LLM interface untuk semua tiga agent RETRO. Context Agent, Synthesis Agent,
+      dan Proposal Writer semuanya memanggil litellm.completion() dengan model dari
+      env variable. Untuk switch dari Claude ke GPT-4o atau ke Groq Llama, cukup ubah
+      LLM_MODEL env variable tanpa ubah satu baris kode pun di logic agent.
+    language: "Python"
+    pricing: "Free (open-source router, biaya sesuai provider yang dipilih)"
+    last_updated: "2025"
+    url: "https://litellm.ai"
+    retro:
+      phase: "Phase 3, 4, 5 (semua LLM calls)"
+      role: >
+        Single entry point untuk semua LLM calls di RETRO. Abstraksi provider-specific
+        API differences. Enables A/B testing: jalankan Context Agent dengan Claude
+        dan Groq secara bergantian untuk compare quality. Juga handles retry dan
+        fallback otomatis jika provider timeout.
+      when_to_use: >
+        Gunakan LiteLLM untuk SETIAP LLM call di RETRO. Jangan panggil Anthropic SDK
+        atau OpenAI SDK secara langsung. Semua harus melalui LiteLLM agar bisa
+        di-switch dan di-monitor secara terpusat.
+      priority: "primary (LLM interface layer)"
+      output_goes_to: "Context Agent output, Synthesis Agent output, Proposal Writer output"
+    setup:
+      install: "pip install litellm"
+      requirements:
+        - "litellm>=1.0.0"
+        - "API keys untuk providers yang digunakan"
+      env_vars:
+        - name: LLM_MODEL
+          description: "Model untuk RETRO agents, e.g., 'claude-sonnet-4-6', 'groq/llama-3.1-70b-versatile', 'ollama/llama3.2'"
+        - name: ANTHROPIC_API_KEY
+          description: "API key Anthropic untuk Claude models"
+        - name: OPENAI_API_KEY
+          description: "API key OpenAI untuk GPT models"
+        - name: GROQ_API_KEY
+          description: "API key Groq (gratis di free tier) untuk Llama/Mixtral"
+        - name: LITELLM_LOG
+          description: "Set ke 'DEBUG' untuk melihat semua request/response detail"
+    usage:
+      basic_example: |
+        import litellm
+        import os
+
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
+
+        # Basic completion
+        response = litellm.completion(
+            model="claude-sonnet-4-6",
+            messages=[
+                {"role": "system", "content": "You are a business intelligence analyst."},
+                {"role": "user",   "content": "Summarize this company in 3 bullet points."},
+            ],
+            max_tokens=500,
+            temperature=0.3,
+        )
+        print(response.choices[0].message.content)
+        print(f"Tokens used: {response.usage.total_tokens}")
+        print(f"Cost: ${response._hidden_params.get('response_cost', 0):.6f}")
+
+        # Streaming
+        for chunk in litellm.completion(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Write a proposal opening."}],
+            stream=True,
+        ):
+            if chunk.choices[0].delta.content:
+                print(chunk.choices[0].delta.content, end="", flush=True)
+
+      retro_example: |
+        import litellm
+        import json
+        import os
+        from typing import Any
+
+        LLM_MODEL   = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+        LLM_FAST    = os.getenv("LLM_FAST", "groq/llama-3.1-70b-versatile")
+
+        # Enable cost tracking
+        litellm.success_callback = []
+        litellm.set_verbose = False
+
+        def call_llm(
+            system_prompt: str,
+            user_prompt: str,
+            model: str | None = None,
+            max_tokens: int = 2000,
+            temperature: float = 0.3,
+            response_format: str = "text",
+        ) -> tuple[str, dict]:
+            """
+            Unified LLM call untuk semua RETRO agents.
+            Return: (content_string, usage_dict)
+            usage_dict berisi: tokens_in, tokens_out, cost_usd
+            """
+            selected_model = model or LLM_MODEL
+
+            kwargs = {
+                "model": selected_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+            # Aktifkan JSON mode jika diminta dan model mendukung
+            if response_format == "json":
+                if "claude" in selected_model:
+                    # Claude: instruksikan via system prompt, tidak ada JSON mode native
+                    kwargs["messages"][0]["content"] += "\n\nOUTPUT MUST BE VALID JSON ONLY. No markdown, no explanation."
+                elif "gpt" in selected_model or "groq" in selected_model:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+            try:
+                response = litellm.completion(**kwargs)
+                content  = response.choices[0].message.content.strip()
+                usage    = {
+                    "tokens_in":  response.usage.prompt_tokens,
+                    "tokens_out": response.usage.completion_tokens,
+                    "cost_usd":   response._hidden_params.get("response_cost", 0),
+                    "model":      selected_model,
+                }
+                return content, usage
+            except litellm.exceptions.RateLimitError as e:
+                print(f"[LLM] Rate limit on {selected_model}, fallback to {LLM_FAST}")
+                # Fallback ke cheaper/faster model
+                kwargs["model"] = LLM_FAST
+                response = litellm.completion(**kwargs)
+                content  = response.choices[0].message.content.strip()
+                usage    = {
+                    "tokens_in":  response.usage.prompt_tokens,
+                    "tokens_out": response.usage.completion_tokens,
+                    "cost_usd":   response._hidden_params.get("response_cost", 0),
+                    "model":      LLM_FAST + " (fallback)",
+                }
+                return content, usage
+            except litellm.exceptions.Timeout:
+                raise RuntimeError(f"LLM timeout after 60s on model {selected_model}")
+
+        def call_llm_json(
+            system_prompt: str,
+            user_prompt: str,
+            expected_keys: list[str],
+            model: str | None = None,
+        ) -> dict:
+            """
+            LLM call yang mengembalikan parsed JSON dict.
+            Retry parsing jika JSON tidak valid.
+            """
+            content, usage = call_llm(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                response_format="json",
+                temperature=0.1,  # Lower temperature untuk JSON consistency
+            )
+            print(f"[LLM] {usage['model']} | in={usage['tokens_in']} out={usage['tokens_out']} cost=${usage['cost_usd']:.5f}")
+
+            # Clean dan parse JSON
+            try:
+                # Hapus markdown code block jika ada
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
+                data = json.loads(content)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"LLM returned invalid JSON: {e}\nContent: {content[:500]}")
+
+            # Validasi expected keys ada di response
+            missing = [k for k in expected_keys if k not in data]
+            if missing:
+                raise ValueError(f"LLM response missing keys: {missing}")
+
+            return data
+
+        # Model selection guide untuk RETRO:
+        # - Context Agent (per-company profiling): LLM_FAST atau LLM_MODEL
+        # - Synthesis Agent (ranking): LLM_MODEL (perlu reasoning yang baik)
+        # - Proposal Writer (generation): LLM_MODEL (perlu kualitas terbaik)
+        # - Testing pipeline: LLM_FAST=groq/llama-3.1-70b-versatile (gratis, cepat)
+
+      expected_output: |
+        [LLM] claude-sonnet-4-6 | in=1247 out=312 cost=$0.00187
+        [LLM] groq/llama-3.1-70b-versatile | in=1247 out=298 cost=$0.00000 (free tier)
+
+        # Contoh model switching via env:
+        # LLM_MODEL=claude-sonnet-4-6          -> Claude Sonnet 4.6 ($3/1M in, $15/1M out)
+        # LLM_MODEL=gpt-4o-mini                -> GPT-4o Mini ($0.15/1M in, $0.60/1M out)
+        # LLM_MODEL=groq/llama-3.1-70b-versatile -> Groq Llama 70B (GRATIS di free tier)
+        # LLM_MODEL=ollama/llama3.2             -> Ollama lokal (GRATIS, butuh GPU)
+
+    notes:
+      - "response._hidden_params.get('response_cost', 0) memberikan cost dalam USD, log ini ke database untuk monitoring"
+      - "LiteLLM secara otomatis format messages ke format yang benar untuk setiap provider (Anthropic vs OpenAI berbeda)"
+      - "Groq free tier sangat berguna untuk development: 14,400 requests/hari untuk Llama 3.1 70B, kualitas hampir setara GPT-4o mini"
+      - "temperature=0.1 untuk JSON generation (butuh konsistensi), temperature=0.5-0.7 untuk proposal writing (butuh variasi)"
+      - "LiteLLM supports async: await litellm.acompletion() untuk non-blocking calls di async pipeline"
+    pitfalls:
+      - "JANGAN parse JSON langsung dari LLM response tanpa strip markdown code block (``` ```)"
+      - "JANGAN assume LLM selalu return valid JSON, selalu wrap parsing dalam try/except"
+      - "LiteLLM timeout default 60s, naikkan untuk proposal writing yang panjang: litellm.request_timeout = 120"
+      - "Cost tracking LiteLLM tidak 100% akurat untuk semua providers, verifikasi dengan dashboard provider"
+      - "JANGAN log raw LLM response ke production log jika berisi data perusahaan sensitif"
+
+  - id: anthropic_sdk
+    name: "Anthropic SDK (Claude)"
+    category: "LLM Provider - Primary"
+    description: >
+      Anthropic SDK adalah Python client resmi untuk Claude API. RETRO menggunakan
+      Claude Sonnet 4.6 sebagai primary LLM untuk Context Agent, Synthesis Agent,
+      dan Proposal Writer. Claude sangat baik untuk: structured output (JSON),
+      long context window (200K tokens), instruction following, dan penulisan
+      profesional dalam Bahasa Indonesia. Catatan PENTING: claude.ai subscription
+      ($100/bulan) BUKAN sama dengan Anthropic API. API memerlukan top-up kredit
+      terpisah di console.anthropic.com.
+    specific_function: >
+      Direct access ke Claude Sonnet 4.6 untuk RETRO agents. Lebih disarankan
+      menggunakan via LiteLLM (litellm.completion dengan model='claude-sonnet-4-6')
+      daripada langsung Anthropic SDK, agar bisa fallback ke provider lain.
+    language: "Python"
+    pricing: "Claude Sonnet 4.6: $3/1M input tokens, $15/1M output tokens (per API)"
+    last_updated: "2025"
+    url: "https://docs.anthropic.com"
+    retro:
+      phase: "Phase 3 (Context Agent) + Phase 4 (Synthesis) + Phase 5 (Proposal Writer)"
+      role: >
+        Primary LLM provider untuk semua synthesis tasks. Context Agent menganalisis
+        company data dan menghasilkan Profile Card JSON. Synthesis Agent meranking
+        kandidat kolaborasi. Proposal Writer menghasilkan teks proposal profesional
+        dalam Bahasa Indonesia atau Inggris.
+      when_to_use: >
+        Claude adalah pilihan utama untuk kualitas tertinggi, terutama untuk
+        Proposal Writer yang menghasilkan output yang akan dikirim ke potential
+        partners. Gunakan Groq/Llama sebagai development/testing fallback untuk
+        menghemat biaya.
+      priority: "primary (quality-critical tasks)"
+      output_goes_to: "PostgreSQL (profile cards, proposals)"
+    setup:
+      install: "pip install anthropic"
+      requirements:
+        - "anthropic>=0.34.0"
+        - "ANTHROPIC_API_KEY dari console.anthropic.com (bukan claude.ai subscription)"
+      env_vars:
+        - name: ANTHROPIC_API_KEY
+          description: "API key dari https://console.anthropic.com, bukan dari claude.ai"
+    usage:
+      basic_example: |
+        from anthropic import Anthropic
+
+        client = Anthropic()  # Reads ANTHROPIC_API_KEY from env
+
+        # Basic completion
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": "Analyze this company: PT Maju Bersama, logistics startup Jakarta"}
+            ]
+        )
+        print(message.content[0].text)
+        print(f"Input tokens:  {message.usage.input_tokens}")
+        print(f"Output tokens: {message.usage.output_tokens}")
+
+        # Dengan system prompt
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system="You are a business intelligence analyst. Always respond in valid JSON only.",
+            messages=[
+                {"role": "user", "content": "Profile this company..."}
+            ]
+        )
+
+      retro_example: |
+        # DIREKOMENDASIKAN: Gunakan LiteLLM wrapper (lihat litellm section).
+        # Kode ini hanya untuk referensi jika ingin direct Anthropic SDK call.
+
+        from anthropic import Anthropic, APIStatusError, APITimeoutError
+        import json
+
+        client = Anthropic()
+
+        CONTEXT_AGENT_SYSTEM = """
+        You are a B2B business intelligence analyst for RETRO, a corporate partnership intelligence platform.
+        Your task: analyze company information and produce a structured Company Profile Card.
+
+        CRITICAL RULES:
+        1. Output ONLY valid JSON, no markdown, no explanation outside JSON
+        2. If information is missing, use null (not empty string)
+        3. Detect language of input and respond in same JSON structure regardless
+        4. Do NOT invent information not present in the source data
+        5. Keywords must be industry-specific, 5-10 terms maximum
+        """
+
+        def run_context_agent_direct(
+            company_name: str,
+            domain: str,
+            raw_content: str,
+            expo_name: str,
+        ) -> dict | None:
+            """
+            Direct Anthropic SDK call untuk Context Agent.
+            Gunakan via LiteLLM lebih disarankan (call_llm_json dari litellm section).
+            """
+            # Truncate content jika terlalu panjang (max ~150K chars untuk konteks)
+            content_truncated = raw_content[:150_000] if len(raw_content) > 150_000 else raw_content
+
+            user_prompt = f"""
+            Analyze the following company and produce a Company Profile Card JSON.
+
+            Company Name: {company_name}
+            Domain: {domain}
+            Expo: {expo_name}
+            Source Content:
+            ---
+            {content_truncated}
+            ---
+
+            Required JSON structure:
+            {{
+              "company_name": "...",
+              "domain": "...",
+              "tagline": "...",
+              "industry": "...",
+              "sub_industry": "...",
+              "products_services": "...",
+              "value_proposition": "...",
+              "target_market": "...",
+              "company_size": "startup|sme|enterprise|unknown",
+              "country": "...",
+              "founded_year": null,
+              "keywords": ["keyword1", "keyword2"],
+              "contact_email": null,
+              "contact_phone": null,
+              "linkedin_url": null,
+              "collaboration_potential": "high|medium|low",
+              "collaboration_reason": "...",
+              "profiled_at": "2025-04-23T10:30:00Z"
+            }}
+            """
+
+            try:
+                message = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=1500,
+                    temperature=0.1,
+                    system=CONTEXT_AGENT_SYSTEM,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                content = message.content[0].text.strip()
+
+                # Parse JSON
+                if "```" in content:
+                    content = content.split("```json")[-1].split("```")[0].strip()
+                return json.loads(content)
+
+            except APIStatusError as e:
+                if e.status_code == 429:
+                    print(f"[Claude] Rate limited, retry after delay")
+                    raise
+                print(f"[Claude] API error {e.status_code}: {e.message}")
+                return None
+            except APITimeoutError:
+                print(f"[Claude] Timeout for {domain}")
+                return None
+            except json.JSONDecodeError as e:
+                print(f"[Claude] Invalid JSON response for {domain}: {e}")
+                return None
+
+      expected_output: |
+        {
+          "company_name": "PT Sinar Logistik Nusantara",
+          "domain": "sinarlogistik.co.id",
+          "tagline": "Connecting Indonesia's Supply Chain",
+          "industry": "Logistics & Supply Chain",
+          "sub_industry": "Last-Mile Delivery Technology",
+          "products_services": "Route optimization SaaS, fleet management, delivery tracking",
+          "value_proposition": "Reduces last-mile delivery costs by 35% using AI route optimization",
+          "target_market": "E-commerce, FMCG, pharmaceutical companies in Indonesia",
+          "company_size": "sme",
+          "country": "Indonesia",
+          "founded_year": 2019,
+          "keywords": ["logistics", "supply chain", "last-mile", "route optimization", "Indonesia", "SaaS"],
+          "contact_email": "partnership@sinarlogistik.co.id",
+          "collaboration_potential": "high",
+          "collaboration_reason": "Complementary technology to RETRO's B2B intelligence platform"
+        }
+        Input tokens: 1,847  Output tokens: 298
+
+    notes:
+      - "Claude Sonnet 4.6 memiliki context window 200K tokens, bisa handle seluruh PDF brochure 100 halaman sekaligus"
+      - "temperature=0.1 untuk Context Agent (JSON extraction, butuh konsistensi), temperature=0.6-0.8 untuk Proposal Writer"
+      - "claude.ai $100/bulan subscription BUKAN API access. Keduanya terpisah, tidak saling mengisi"
+      - "Anthropic API menggunakan per-token billing: Claude Sonnet 4.6 = $3/1M input, $15/1M output (Agustus 2025)"
+      - "Gunakan via LiteLLM (litellm.completion) bukan direct Anthropic SDK untuk flexibility provider switching"
+    pitfalls:
+      - "JANGAN kirim raw HTML crawler ke Claude, strip boilerplate dulu dengan newspaper4k atau BeautifulSoup"
+      - "JANGAN simpan ANTHROPIC_API_KEY di kode atau git, selalu di environment variable atau .env file"
+      - "Context Agent bisa gagal parse JSON jika content input mengandung unescaped special characters, sanitize input"
+      - "Claude API rate limit default: 2000 RPM untuk Tier 1, jika rate limited gunakan exponential backoff"
+
+  - id: groq
+    name: "Groq (Ultra-fast LLM Inference)"
+    category: "LLM Provider - Fast/Free"
+    description: >
+      Groq adalah LPU (Language Processing Unit) inference provider yang menawarkan
+      kecepatan inference sangat tinggi (500-1000 tokens/second vs ~50 tokens/second
+      OpenAI) dan free tier yang generous. Mendukung model open-source: Llama 3.1
+      (8B, 70B, 405B), Mixtral 8x7B, Gemma 2. Groq free tier: ~14,400 requests/hari
+      untuk Llama 3.1 70B. Sangat cocok untuk development dan testing RETRO pipeline
+      tanpa biaya API.
+    specific_function: >
+      Development dan testing LLM untuk RETRO tanpa biaya. Context Agent dan
+      Synthesis Agent bisa ditest menggunakan Groq Llama 3.1 70B yang gratis
+      sebelum di-switch ke Claude untuk production. Groq juga bisa digunakan
+      di production untuk high-volume, low-priority tasks yang tidak butuh
+      kualitas tertinggi (misal: deduplication judgment, URL relevance scoring).
+    language: "Python (via LiteLLM atau groq SDK)"
+    pricing: "Free tier: 14,400 req/hari, 30 req/menit untuk Llama 3.1 70B"
+    last_updated: "2025"
+    url: "https://console.groq.com"
+    retro:
+      phase: "Phase 3, 4 (development mode atau secondary tasks)"
+      role: >
+        Primary LLM untuk development phase (save Claude API credits). Secondary
+        untuk tasks yang butuh speed tinggi tapi tidak butuh kualitas tertinggi.
+        Contoh: initial URL relevance scoring (apakah URL ini relevan untuk di-crawl?)
+        sebelum full Context Agent profiling.
+      when_to_use: >
+        Gunakan Groq ketika: (1) developing dan testing pipeline baru, (2) running
+        quick validasi apakah company URL relevant sebelum full crawl, (3) Claude
+        API credits habis dan perlu fallback, (4) butuh inference cepat untuk
+        realtime filtering.
+      priority: "secondary (dev/testing/speed-critical)"
+      output_goes_to: "Sama dengan Claude (depends on which agent)"
+    setup:
+      install: "pip install groq  # atau gunakan via litellm (lebih disarankan)"
+      requirements:
+        - "groq>=0.8.0"
+        - "GROQ_API_KEY dari https://console.groq.com (gratis)"
+      env_vars:
+        - name: GROQ_API_KEY
+          description: "API key gratis dari https://console.groq.com/keys"
+    usage:
+      basic_example: |
+        # Via LiteLLM (DIREKOMENDASIKAN, konsisten dengan semua providers lain)
+        import litellm
+        import os
+
+        os.environ["GROQ_API_KEY"] = "gsk_..."
+
+        response = litellm.completion(
+            model="groq/llama-3.1-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a business analyst. Output JSON only."},
+                {"role": "user",   "content": "Profile this company..."},
+            ],
+            max_tokens=1000,
+            temperature=0.1,
+        )
+        print(response.choices[0].message.content)
+
+        # Model options di Groq (via LiteLLM prefix "groq/"):
+        # groq/llama-3.1-70b-versatile   -- 70B, gratis, best quality
+        # groq/llama-3.1-8b-instant       -- 8B, gratis, sangat cepat
+        # groq/mixtral-8x7b-32768         -- Mixtral, gratis
+        # groq/gemma2-9b-it               -- Gemma 2 9B, gratis
+
+      retro_example: |
+        import litellm
+        import json
+
+        GROQ_MODELS = {
+            "quality":  "groq/llama-3.1-70b-versatile",
+            "speed":    "groq/llama-3.1-8b-instant",
+        }
+
+        def quick_url_relevance_check(url: str, url_title: str, expo_topic: str) -> bool:
+            """
+            Cek apakah URL relevan untuk di-crawl menggunakan model cepat.
+            Dilakukan SEBELUM full crawling untuk filter irrelevant pages.
+            Menggunakan Groq 8B karena butuh kecepatan, bukan kualitas tertinggi.
+            """
+            prompt = f"""
+            EXPO TOPIC: {expo_topic}
+            URL: {url}
+            PAGE TITLE: {url_title}
+
+            Is this URL likely to contain a company exhibitor profile relevant to the expo topic?
+            Answer with JSON: {{"relevant": true/false, "confidence": 0.0-1.0, "reason": "..."}}
+            """
+            try:
+                response = litellm.completion(
+                    model=GROQ_MODELS["speed"],
+                    messages=[
+                        {"role": "system", "content": "Answer in JSON only. Be conservative - only relevant if clearly a company profile."},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    max_tokens=100,
+                    temperature=0.0,
+                )
+                content = response.choices[0].message.content.strip()
+                data    = json.loads(content)
+                return data.get("relevant", False) and data.get("confidence", 0) > 0.7
+            except Exception:
+                return True  # Default: crawl jika tidak yakin
+
+        def batch_profile_companies_dev(companies: list[dict]) -> list[dict]:
+            """Development mode: profile menggunakan Groq gratis."""
+            results = []
+            for company in companies:
+                content, usage = call_llm(
+                    system_prompt="Profile the company as JSON.",
+                    user_prompt=str(company),
+                    model=GROQ_MODELS["quality"],
+                    response_format="json",
+                )
+                print(f"[Groq] {usage['model']} | cost=${usage['cost_usd']:.5f} (practically free)")
+                try:
+                    results.append(json.loads(content))
+                except json.JSONDecodeError:
+                    results.append({"error": "json_parse_failed"})
+            return results
+
+      expected_output: |
+        [Groq] groq/llama-3.1-8b-instant | tokens=342 | latency=0.8s
+        {"relevant": true, "confidence": 0.92, "reason": "URL path suggests exhibitor directory listing"}
+
+        [Groq] groq/llama-3.1-70b-versatile | cost=$0.00000 (free tier)
+        Profile Card generated in 1.2 seconds (vs ~5s Claude)
+
+    notes:
+      - "Groq free tier sangat generous untuk development: 14,400 requests/hari Llama 70B = bisa test ratusan company profiles per hari gratis"
+      - "Groq latency sangat rendah (< 1 detik untuk 500 token output) cocok untuk realtime filtering tasks"
+      - "Llama 3.1 70B kualitasnya sudah sangat baik untuk JSON extraction dan company profiling"
+      - "Rate limit Groq: 30 RPM untuk free tier. Tambahkan asyncio.sleep(2) antar calls jika batch processing"
+    pitfalls:
+      - "Groq rate limit lebih ketat dari Claude, gunakan asyncio.sleep(2) antar calls di development"
+      - "Llama 3.1 kadang verbose dalam output JSON, lebih sering butuh cleanup dibanding Claude"
+      - "JANGAN gunakan Groq untuk Proposal Writer di production, kualitas teks kurang professional dibanding Claude"
+
+  - id: ollama
+    name: "Ollama (Local LLM)"
+    category: "LLM Provider - Local"
+    description: >
+      Ollama adalah tool untuk menjalankan LLM secara lokal di laptop atau server.
+      Mendukung ratusan model open-source: Llama 3.2 (1B, 3B), Llama 3.1 (8B, 70B),
+      Mistral 7B, Gemma 2, Phi-3, Qwen 2.5, dan banyak lagi. Ollama menyediakan
+      REST API yang kompatibel dengan OpenAI API format, sehingga LiteLLM bisa
+      connect ke Ollama tanpa perubahan kode. Berguna untuk RETRO ketika data
+      sensitif tidak boleh dikirim ke cloud atau tidak ada koneksi internet.
+    specific_function: >
+      Local LLM untuk RETRO offline mode. Seluruh pipeline bisa berjalan 100% lokal:
+      embedding (nomic-embed-text), company profiling (Llama 3.2 / Qwen 2.5),
+      dan proposal generation (Llama 3.1 70B jika punya GPU). Privasi data terjaga
+      karena tidak ada data keluar dari server.
+    language: "Python (via LiteLLM atau httpx langsung)"
+    pricing: "Free (lokal), butuh GPU untuk model besar"
+    last_updated: "2025"
+    url: "https://ollama.com"
+    retro:
+      phase: "Phase 3, 4, 5 (offline / private mode)"
+      role: >
+        Fully local alternative untuk semua LLM tasks. Context Agent menggunakan
+        Qwen 2.5 7B atau Llama 3.2 3B untuk profiling. Synthesis Agent menggunakan
+        Llama 3.1 8B. Proposal Writer menggunakan Llama 3.1 70B (butuh GPU 40GB+).
+        Semua embedding menggunakan nomic-embed-text lokal.
+      when_to_use: >
+        Gunakan Ollama ketika: (1) data company profile bersifat highly confidential,
+        (2) tidak ada koneksi internet di deployment environment, (3) ingin zero
+        API cost untuk development, (4) testing pipeline logic tanpa API calls.
+      priority: "secondary (offline/private mode)"
+      output_goes_to: "Sama dengan provider lain"
+    setup:
+      install: |
+        # 1. Download Ollama dari https://ollama.com/download
+        # 2. Pull model yang dibutuhkan
+        ollama pull qwen2.5:7b          # 7B, cocok untuk company profiling (4GB RAM)
+        ollama pull llama3.2:3b         # 3B, sangat cepat (2GB RAM)
+        ollama pull llama3.1:8b         # 8B, balance quality/speed (5GB RAM)
+        ollama pull nomic-embed-text    # Untuk embeddings (270MB)
+        # 3. Install Python package
+        pip install ollama
+      requirements:
+        - "Ollama installed dan running (ollama serve)"
+        - "Minimal 8GB RAM untuk model 7B"
+        - "GPU (opsional tapi disarankan untuk speed)"
+      env_vars:
+        - name: OLLAMA_BASE_URL
+          description: "http://localhost:11434 (default)"
+        - name: LLM_MODEL
+          description: "ollama/qwen2.5:7b untuk Context Agent lokal"
+    usage:
+      basic_example: |
+        # Via LiteLLM (DIREKOMENDASIKAN)
+        import litellm
+
+        response = litellm.completion(
+            model="ollama/qwen2.5:7b",
+            messages=[
+                {"role": "system", "content": "You are a business analyst. Output JSON only."},
+                {"role": "user",   "content": "Profile PT Maju Bersama, logistics company Jakarta"},
+            ],
+            api_base="http://localhost:11434",
+            max_tokens=500,
+        )
+        print(response.choices[0].message.content)
+
+        # Via ollama Python package langsung
+        import ollama
+        response = ollama.chat(
+            model='qwen2.5:7b',
+            messages=[{'role': 'user', 'content': 'Profile this company...'}],
+            options={'temperature': 0.1},
+        )
+        print(response['message']['content'])
+
+      retro_example: |
+        import litellm
+        import json
+        import subprocess
+        import time
+
+        OLLAMA_MODELS = {
+            "fast":    "ollama/llama3.2:3b",
+            "quality": "ollama/qwen2.5:7b",
+            "embed":   "ollama/nomic-embed-text",
+        }
+
+        def is_ollama_running() -> bool:
+            try:
+                import httpx
+                r = httpx.get("http://localhost:11434/api/tags", timeout=2)
+                return r.status_code == 200
+            except Exception:
+                return False
+
+        def ensure_model_pulled(model_name: str):
+            """Pull model jika belum ada."""
+            import ollama as _ollama
+            try:
+                _ollama.show(model_name)
+                print(f"[Ollama] Model {model_name} ready")
+            except Exception:
+                print(f"[Ollama] Pulling {model_name}...")
+                _ollama.pull(model_name)
+
+        def context_agent_local(
+            company_name: str,
+            domain: str,
+            content: str,
+            quality: str = "quality"
+        ) -> dict | None:
+            """Run Context Agent menggunakan Ollama local model."""
+            if not is_ollama_running():
+                raise RuntimeError("Ollama tidak running. Jalankan 'ollama serve' di terminal.")
+
+            model = OLLAMA_MODELS[quality]
+            content_truncated = content[:50_000]  # Local model context terbatas
+
+            prompt = f"""
+            Company: {company_name}
+            Domain: {domain}
+            Content: {content_truncated}
+
+            Produce a JSON company profile with these exact keys:
+            company_name, domain, industry, products_services, value_proposition,
+            target_market, company_size (startup/sme/enterprise), country, keywords (list),
+            collaboration_potential (high/medium/low), collaboration_reason
+
+            Return ONLY the JSON object, no other text.
+            """
+
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a business analyst. Output valid JSON only. No explanations."},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    api_base="http://localhost:11434",
+                    max_tokens=800,
+                    temperature=0.1,
+                )
+                content_out = response.choices[0].message.content.strip()
+                if "```" in content_out:
+                    content_out = content_out.split("```json")[-1].split("```")[0].strip()
+                return json.loads(content_out)
+            except Exception as e:
+                print(f"[Ollama] Error profiling {domain}: {e}")
+                return None
+
+      expected_output: |
+        [Ollama] Model qwen2.5:7b ready
+        [Ollama] Profiling PT Sinar Logistik Nusantara...
+        {
+          "company_name": "PT Sinar Logistik Nusantara",
+          "domain": "sinarlogistik.co.id",
+          "industry": "Logistics",
+          "products_services": "Route optimization, fleet management",
+          "collaboration_potential": "high"
+        }
+        Processing time: 8.3 seconds (CPU) / 1.2 seconds (GPU)
+
+    notes:
+      - "Ollama context window: Llama 3.2 3B = 128K tokens, Qwen 2.5 7B = 128K tokens, cukup untuk company profiling"
+      - "Tanpa GPU, Ollama berjalan di CPU: 7B model ~30 tok/s di CPU M1 Mac, ~10 tok/s di Intel Core i7"
+      - "GPU NVIDIA VRAM: Llama 3.2 3B = 2GB, Qwen 2.5 7B = 4.5GB, Llama 3.1 70B = 40GB+"
+      - "Ollama mendukung model quantization (Q4, Q8) untuk mengurangi VRAM: ollama pull qwen2.5:7b-instruct-q4_K_M"
+    pitfalls:
+      - "JANGAN expect Ollama 3B/7B menghasilkan kualitas proposal setara Claude Sonnet. Gunakan hanya untuk development"
+      - "JANGAN kirim content HTML raw yang sangat panjang ke Ollama, truncate ke 50K karakter untuk model 7B"
+      - "Ollama tidak thread-safe untuk concurrent requests dalam beberapa versi, test concurrency sebelum production"
+
+  - id: pydantic_ai
+    name: "PydanticAI"
+    category: "Agent Framework"
+    description: >
+      PydanticAI adalah agent framework yang dibuat oleh tim Pydantic, mengintegrasikan
+      Pydantic v2 validation dengan LLM calls. Memungkinkan mendefinisikan output
+      schema sebagai Pydantic model dan memastikan LLM selalu menghasilkan output
+      yang valid sesuai schema. Lebih ringan dari LangChain, tidak ada overhead besar.
+      Mendukung: structured outputs (Pydantic model), tools/function calling, dependency
+      injection, streaming, dan multi-turn conversations. Sangat type-safe.
+    specific_function: >
+      Type-safe agent definition untuk RETRO Context Agent dan Synthesis Agent.
+      Dengan PydanticAI, output Context Agent (Company Profile Card) dijamin valid
+      Pydantic model, tidak perlu manual JSON parsing dan validation. Synthesis Agent
+      menghasilkan ranked list yang tervalidasi schema.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://ai.pydantic.dev"
+    retro:
+      phase: "Phase 3 (Context Agent) + Phase 4 (Synthesis Agent)"
+      role: >
+        Framework untuk mendefinisikan Context Agent dan Synthesis Agent dengan
+        type-safe output. Menggantikan manual JSON parsing dan validation yang
+        error-prone. Jika LLM menghasilkan invalid output, PydanticAI otomatis
+        retry dengan error feedback ke LLM.
+      when_to_use: >
+        Gunakan PydanticAI untuk Context Agent dan Synthesis Agent di mana
+        structured JSON output wajib. Jangan gunakan untuk Proposal Writer
+        (output bebas teks panjang, tidak perlu schema validation).
+      priority: "secondary (agent structure)"
+      output_goes_to: "PostgreSQL (via validated Pydantic models)"
+    setup:
+      install: "pip install pydantic-ai"
+      requirements:
+        - "pydantic-ai>=0.0.14"
+        - "pydantic>=2.0"
+        - "API key untuk LLM provider yang digunakan"
+      env_vars:
+        - name: ANTHROPIC_API_KEY
+          description: "Untuk Claude models dengan PydanticAI"
+        - name: OPENAI_API_KEY
+          description: "Untuk GPT models dengan PydanticAI"
+    usage:
+      basic_example: |
+        from pydantic_ai import Agent
+        from pydantic import BaseModel
+        from typing import Optional
+
+        # Definisi output schema sebagai Pydantic model
+        class CompanyProfile(BaseModel):
+            company_name:          str
+            industry:              str
+            value_proposition:     str
+            collaboration_potential: str  # "high" | "medium" | "low"
+            keywords:              list[str]
+
+        # Buat agent
+        agent = Agent(
+            model="anthropic:claude-sonnet-4-6",
+            result_type=CompanyProfile,
+            system_prompt="You are a B2B business analyst. Extract company information accurately.",
+        )
+
+        # Run agent (blocking)
+        result = agent.run_sync("Analyze: PT Maju Bersama, logistics startup Jakarta")
+        profile: CompanyProfile = result.data  # Sudah tervalidasi Pydantic
+        print(profile.company_name)
+        print(profile.keywords)
+
+      retro_example: |
+        from pydantic_ai import Agent, RunContext
+        from pydantic import BaseModel, Field
+        from typing import Optional, Literal
+        import asyncio
+
+        class CompanyProfileCard(BaseModel):
+            company_name:            str
+            domain:                  str
+            tagline:                 Optional[str] = None
+            industry:                str
+            sub_industry:            Optional[str] = None
+            products_services:       str
+            value_proposition:       str
+            target_market:           str
+            company_size:            Literal["startup", "sme", "enterprise", "unknown"] = "unknown"
+            country:                 Optional[str] = None
+            keywords:                list[str] = Field(default_factory=list, max_length=10)
+            contact_email:           Optional[str] = None
+            collaboration_potential: Literal["high", "medium", "low"] = "medium"
+            collaboration_reason:    str
+
+        class SynthesisOutput(BaseModel):
+            top_candidates: list[str] = Field(description="List of domains, ranked best to worst")
+            synthesis_notes: str      = Field(description="Why these are the best matches for RETRO")
+
+        # Context Agent dengan PydanticAI
+        context_agent = Agent(
+            model="anthropic:claude-sonnet-4-6",
+            result_type=CompanyProfileCard,
+            system_prompt="""
+            You are a B2B business intelligence analyst for RETRO platform.
+            Extract accurate company profile information from the provided content.
+            Be precise, do not invent information not present in the source.
+            If information is missing, use null.
+            """,
+        )
+
+        # Synthesis Agent
+        synthesis_agent = Agent(
+            model="anthropic:claude-sonnet-4-6",
+            result_type=SynthesisOutput,
+            system_prompt="""
+            You are RETRO's Synthesis Agent. Analyze company profiles and identify
+            the best collaboration opportunities for RETRO's B2B intelligence platform.
+            Consider: industry complementarity, market overlap, technology synergy.
+            """,
+        )
+
+        async def run_context_agent(
+            company_name: str,
+            domain: str,
+            content: str,
+            expo: str,
+        ) -> CompanyProfileCard | None:
+            try:
+                prompt = f"""
+                Company: {company_name}
+                Domain: {domain}
+                Expo: {expo}
+                Source:
+                {content[:80_000]}
+                """
+                result = await context_agent.run(prompt)
+                profile = result.data  # Type: CompanyProfileCard, already validated
+                # Override domain to ensure correct value
+                profile.domain = domain
+                print(f"[PydanticAI] Profiled: {profile.company_name} | Potential: {profile.collaboration_potential}")
+                return profile
+            except Exception as e:
+                print(f"[PydanticAI] Context Agent error for {domain}: {e}")
+                return None
+
+        async def run_synthesis_agent(
+            profiles: list[CompanyProfileCard],
+            retro_description: str,
+        ) -> SynthesisOutput:
+            profile_summaries = "\n\n".join([
+                f"Domain: {p.domain}\n"
+                f"Company: {p.company_name}\n"
+                f"Industry: {p.industry}\n"
+                f"Value Prop: {p.value_proposition}\n"
+                f"Potential: {p.collaboration_potential}"
+                for p in profiles[:50]  # Max 50 profiles per synthesis batch
+            ])
+
+            prompt = f"""
+            RETRO Description: {retro_description}
+
+            Company Profiles to Evaluate:
+            {profile_summaries}
+
+            Rank the top 10 companies best suited for collaboration with RETRO.
+            """
+            result = await synthesis_agent.run(prompt)
+            return result.data
+
+      expected_output: |
+        [PydanticAI] Profiled: PT Sinar Logistik Nusantara | Potential: high
+        CompanyProfileCard(
+          company_name='PT Sinar Logistik Nusantara',
+          domain='sinarlogistik.co.id',
+          industry='Logistics & Supply Chain',
+          collaboration_potential='high',
+          keywords=['logistics', 'route-optimization', 'Indonesia', 'SaaS', 'last-mile']
+        )
+
+        SynthesisOutput(
+          top_candidates=['sinarlogistik.co.id', 'globalscm.io', 'nexusdist.sg', ...],
+          synthesis_notes='Top candidates have strong logistics technology focus that complements RETRO...'
+        )
+
+    notes:
+      - "PydanticAI otomatis retry LLM call dengan error feedback jika output tidak valid Pydantic schema"
+      - "result.data sudah tervalidasi, tidak perlu manual json.loads() atau validasi manual"
+      - "Field validators Pydantic bisa menambahkan business logic: max_length untuk keywords, regex untuk email"
+      - "PydanticAI mendukung tool_calls (function calling) untuk agents yang perlu akses ke external data"
+      - "Gunakan asyncio.gather() untuk run Context Agent pada multiple companies secara concurrent"
+    pitfalls:
+      - "PydanticAI masih dalam early development (0.0.x), API bisa berubah di versi berikutnya"
+      - "JANGAN define Pydantic fields terlalu strict (regex yang terlalu ketat), LLM akan retry berkali-kali"
+      - "Optional fields yang sering null lebih baik dari required fields yang sering menyebabkan validation error"
+
+  - id: langfuse
+    name: "Langfuse"
+    category: "LLM Observability & Tracing"
+    description: >
+      Langfuse adalah open-source LLM observability platform untuk tracing, monitoring,
+      dan evaluasi LLM applications. Merekam setiap LLM call: input prompt, output,
+      token usage, latency, cost. Memungkinkan debug pipeline RETRO dari satu dashboard.
+      Tersedia sebagai self-hosted (Docker) atau Langfuse Cloud (free tier: 50K traces/bulan).
+      Sangat berguna untuk RETRO karena tiga agents bisa di-trace dari satu dashboard
+      untuk melihat bottleneck, error rates, dan total cost per pipeline run.
+    specific_function: >
+      Observability untuk semua LLM calls di RETRO. Setiap call ke Context Agent,
+      Synthesis Agent, dan Proposal Writer di-trace ke Langfuse dengan metadata:
+      company domain, expo name, model used, token count, cost, latency. Dashboard
+      Langfuse menampilkan total cost per expo, error rate per agent, dan p95 latency.
+    language: "Python (langfuse SDK)"
+    pricing: "Free self-hosted, Langfuse Cloud free 50K traces/bulan"
+    last_updated: "2025"
+    url: "https://langfuse.com"
+    retro:
+      phase: "Semua Phase (cross-cutting observability)"
+      role: >
+        Visibility layer untuk semua LLM calls. Director RETRO bisa lihat di Langfuse:
+        berapa total biaya API per expo, company mana yang paling banyak token,
+        agent mana yang sering error, dan latency breakdown per step.
+      when_to_use: >
+        Setup Langfuse dari awal development. Tidak ada overhead signifikan dari SDK
+        (async, non-blocking). Langfuse Cloud free tier 50K traces/bulan sangat
+        cukup untuk RETRO MVP yang process ratusan companies per run.
+      priority: "recommended (observability)"
+      output_goes_to: "Langfuse dashboard (monitoring, tidak mempengaruhi pipeline data)"
+    setup:
+      install: "pip install langfuse"
+      docker: "docker compose up (dari https://langfuse.com/docs/deployment/self-host)"
+      requirements:
+        - "langfuse>=2.0.0"
+        - "Langfuse Cloud account atau self-hosted instance"
+      env_vars:
+        - name: LANGFUSE_PUBLIC_KEY
+          description: "Public key dari Langfuse project settings"
+        - name: LANGFUSE_SECRET_KEY
+          description: "Secret key dari Langfuse project settings"
+        - name: LANGFUSE_HOST
+          description: "https://cloud.langfuse.com (cloud) atau http://localhost:3000 (self-hosted)"
+    usage:
+      basic_example: |
+        from langfuse import Langfuse
+        from langfuse.decorators import observe, langfuse_context
+        import litellm
+
+        langfuse = Langfuse()
+
+        # Decorator-based tracing (paling simple)
+        @observe()
+        def profile_company(company_name: str, content: str) -> dict:
+            response = litellm.completion(
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": f"Profile: {company_name}\n{content}"}],
+            )
+            return {"profile": response.choices[0].message.content}
+
+        # LiteLLM integration (auto-trace semua litellm calls)
+        litellm.success_callback = ["langfuse"]
+        litellm.failure_callback = ["langfuse"]
+
+      retro_example: |
+        from langfuse import Langfuse
+        from langfuse.decorators import observe, langfuse_context
+        import litellm
+        import os
+
+        # Setup LiteLLM auto-trace ke Langfuse
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-..."
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-..."
+        os.environ["LANGFUSE_HOST"]       = "https://cloud.langfuse.com"
+
+        litellm.success_callback = ["langfuse"]
+        litellm.failure_callback = ["langfuse"]
+
+        langfuse_client = Langfuse()
+
+        @observe(name="context_agent")
+        def run_context_agent_traced(
+            domain: str,
+            content: str,
+            expo: str,
+        ) -> dict | None:
+            # Set metadata untuk trace ini
+            langfuse_context.update_current_observation(
+                metadata={"domain": domain, "expo": expo, "content_length": len(content)}
+            )
+
+            # LiteLLM call otomatis ter-trace karena success_callback = ["langfuse"]
+            content_out, usage = call_llm(
+                system_prompt=CONTEXT_AGENT_SYSTEM,
+                user_prompt=f"Domain: {domain}\n{content[:80_000]}",
+                model=LLM_MODEL,
+                response_format="json",
+            )
+
+            # Score trace berdasarkan hasil
+            if content_out:
+                langfuse_context.score_current_observation(
+                    name="profiling_success",
+                    value=1.0,
+                )
+            return json.loads(content_out) if content_out else None
+
+        @observe(name="pipeline_run")
+        def run_full_pipeline(expo: str, urls: list[str]):
+            """Satu trace untuk seluruh pipeline run, dengan nested spans."""
+            langfuse_context.update_current_observation(
+                metadata={
+                    "expo": expo,
+                    "url_count": len(urls),
+                    "started_by": "scheduler",
+                }
+            )
+
+            profiles = []
+            for url in urls:
+                profile = run_context_agent_traced(
+                    domain=extract_domain(url),
+                    content=crawl(url),
+                    expo=expo,
+                )
+                if profile:
+                    profiles.append(profile)
+
+            # Generate summary untuk trace
+            langfuse_context.update_current_observation(
+                output={"profiled": len(profiles), "total": len(urls)}
+            )
+            return profiles
+
+        def get_cost_summary(expo: str) -> dict:
+            """Query Langfuse untuk total cost satu expo run."""
+            traces = langfuse_client.fetch_traces(
+                tags=[f"expo:{expo}"],
+                limit=1000,
+            )
+            total_cost = sum(t.cost_usd or 0 for t in traces.data)
+            total_tokens_in  = sum(t.usage.input  or 0 for t in traces.data)
+            total_tokens_out = sum(t.usage.output or 0 for t in traces.data)
+            return {
+                "expo":         expo,
+                "total_traces": len(traces.data),
+                "cost_usd":     round(total_cost, 4),
+                "tokens_in":    total_tokens_in,
+                "tokens_out":   total_tokens_out,
+            }
+
+      expected_output: |
+        # Langfuse Dashboard URL: https://cloud.langfuse.com/traces
+        #
+        # Trace: pipeline_run (LogiSEA 2025)
+        #   Duration: 47 minutes
+        #   Nested spans: 342x context_agent
+        #   Total cost: $0.94
+        #   Success rate: 96.2% (329/342 profiled)
+        #
+        # Cost breakdown:
+        #   Context Agent:  $0.72 (342 calls x ~2100 tokens avg)
+        #   Synthesis Agent: $0.15 (1 call x 45K tokens)
+        #   Proposal Writer: $0.07 (3 proposals x ~8K tokens)
+
+    notes:
+      - "litellm.success_callback = ['langfuse'] otomatis trace SEMUA litellm calls ke Langfuse, tidak perlu manual instrumentation"
+      - "langfuse_context.update_current_observation() menambahkan metadata ke trace aktif"
+      - "Langfuse Cloud free tier 50K traces/bulan = lebih dari cukup untuk RETRO yang process ratusan companies per run"
+      - "Gunakan tags untuk group traces: tags=[f'expo:{expo_name}', 'env:production']"
+      - "@observe() decorator otomatis create trace untuk fungsi tersebut, nested calls menjadi nested spans"
+    pitfalls:
+      - "JANGAN log raw company content atau proposal text ke Langfuse jika bersifat confidential (visible di dashboard)"
+      - "langfuse.flush() diperlukan di akhir script (non-server) untuk ensure semua events terkirim sebelum proses exit"
+      - "Self-hosted Langfuse butuh PostgreSQL, perlu 2 Docker containers. Cloud lebih mudah untuk MVP"
+
+  - id: dspy
+    name: "DSPy"
+    category: "LLM Prompt Optimization Framework"
+    description: >
+      DSPy adalah framework dari Stanford untuk programming LLM prompts secara
+      systematic. Alih-alih hardcode prompt string, DSPy mendefinisikan prompt
+      sebagai program yang bisa di-optimize secara otomatis menggunakan contoh data.
+      Mendukung: Signature (definisi input/output format), Module (composable LLM
+      components), dan Teleprompter/Optimizer (auto-optimize prompt berdasarkan metric).
+      RETRO bisa menggunakan DSPy untuk optimize Context Agent prompt menggunakan
+      small set of labeled examples.
+    specific_function: >
+      Prompt optimization untuk Context Agent. Jika hasil profiling kurang akurat,
+      DSPy bisa otomatis improve prompt menggunakan 20-50 labeled examples. Lebih
+      systematic dari trial-and-error manual prompt engineering.
+    language: "Python"
+    pricing: "Free (open-source, Stanford)"
+    last_updated: "2025"
+    url: "https://dspy.ai"
+    retro:
+      phase: "Phase 3 (Context Agent optimization)"
+      role: >
+        Prompt optimization tool. Ketika Context Agent menghasilkan profile card
+        yang sering salah, DSPy bisa analyze contoh yang salah dan otomatis
+        improve prompt. Tidak digunakan di runtime pipeline, hanya di development.
+      when_to_use: >
+        Gunakan DSPy ketika Context Agent performance belum memuaskan setelah
+        manual prompt tuning. Buat 20-50 labeled examples (input company content
+        + expected output profile card), run DSPy optimizer, export optimized prompt.
+        Proses ini offline, bukan realtime.
+      priority: "optional (prompt optimization)"
+      output_goes_to: "Optimized prompt yang digunakan Context Agent"
+    setup:
+      install: "pip install dspy-ai"
+      requirements:
+        - "dspy-ai>=2.4.0"
+        - "API key untuk LLM provider"
+      env_vars:
+        - name: ANTHROPIC_API_KEY
+          description: "Untuk optimize dengan Claude"
+    usage:
+      basic_example: |
+        import dspy
+
+        # Configure LLM
+        lm = dspy.LM(model="anthropic/claude-sonnet-4-6")
+        dspy.configure(lm=lm)
+
+        # Definisi Signature (input -> output format)
+        class CompanyProfileSignature(dspy.Signature):
+            """Extract company profile information from raw content."""
+            company_content: str = dspy.InputField(desc="Raw company webpage content")
+            company_name_hint: str = dspy.InputField(desc="Company name if known")
+            profile_json: str = dspy.OutputField(desc="JSON company profile card")
+
+        # Buat module
+        profiler = dspy.Predict(CompanyProfileSignature)
+
+        # Run
+        result = profiler(
+            company_content="PT Maju Bersama adalah perusahaan logistik...",
+            company_name_hint="PT Maju Bersama",
+        )
+        print(result.profile_json)
+
+      retro_example: |
+        import dspy
+        import json
+
+        # Setup
+        lm = dspy.LM(model="anthropic/claude-sonnet-4-6", temperature=0.1)
+        dspy.configure(lm=lm)
+
+        class ProfileSignature(dspy.Signature):
+            """Extract structured company profile from raw content for B2B partnership matching."""
+            raw_content:       str = dspy.InputField(desc="Company webpage HTML stripped to text")
+            domain:            str = dspy.InputField(desc="Company domain name")
+            company_name_hint: str = dspy.InputField(desc="Guessed company name from URL/crawl")
+            profile_json:      str = dspy.OutputField(desc="Valid JSON profile card with keys: company_name, industry, value_proposition, keywords, collaboration_potential")
+
+        class RetroContextAgent(dspy.Module):
+            def __init__(self):
+                super().__init__()
+                self.profiler = dspy.ChainOfThought(ProfileSignature)
+
+            def forward(self, raw_content: str, domain: str, company_name_hint: str):
+                result = self.profiler(
+                    raw_content=raw_content[:50_000],
+                    domain=domain,
+                    company_name_hint=company_name_hint,
+                )
+                try:
+                    return json.loads(result.profile_json)
+                except json.JSONDecodeError:
+                    return None
+
+        # Training examples untuk optimization (buat 20-50 contoh)
+        trainset = [
+            dspy.Example(
+                raw_content="PT Sinar Logistik adalah platform teknologi ...",
+                domain="sinarlogistik.co.id",
+                company_name_hint="PT Sinar Logistik",
+                profile_json='{"company_name": "PT Sinar Logistik", "industry": "logistics", ...}'
+            ).with_inputs("raw_content", "domain", "company_name_hint"),
+            # ... tambah 19-49 contoh lagi
+        ]
+
+        # Metric function untuk evaluasi
+        def profile_accuracy(example, prediction, trace=None) -> float:
+            try:
+                pred_json = json.loads(prediction.profile_json)
+                exp_json  = json.loads(example.profile_json)
+                # Cek apakah industry dan collaboration_potential benar
+                industry_ok = pred_json.get("industry", "").lower() in exp_json.get("industry", "").lower()
+                potential_ok = pred_json.get("collaboration_potential") == exp_json.get("collaboration_potential")
+                return float(industry_ok and potential_ok)
+            except Exception:
+                return 0.0
+
+        # Optimize (jalankan sekali offline, simpan hasil)
+        # agent = RetroContextAgent()
+        # optimizer = dspy.MIPROv2(metric=profile_accuracy, auto="light")
+        # optimized_agent = optimizer.compile(agent, trainset=trainset)
+        # optimized_agent.save("optimized_context_agent.json")
+
+      expected_output: |
+        # DSPy optimization output:
+        # Initial accuracy: 62%
+        # After MIPRO optimization (20 iterations): 84%
+        # Optimized prompt saved to optimized_context_agent.json
+
+        # Production usage setelah optimization:
+        # agent = RetroContextAgent()
+        # agent.load("optimized_context_agent.json")
+        # profile = agent("PT Maju content...", "maju.co.id", "PT Maju")
+
+    notes:
+      - "DSPy optimization memerlukan API calls untuk setiap optimization iteration, bisa mahal. Gunakan Groq untuk optimization"
+      - "ChainOfThought lebih akurat dari Predict untuk complex extraction tasks seperti company profiling"
+      - "Simpan trained DSPy module ke JSON untuk reuse tanpa perlu re-optimize setiap kali"
+      - "DSPy tidak wajib untuk RETRO MVP, gunakan jika manual prompt tuning tidak cukup"
+    pitfalls:
+      - "DSPy optimization butuh 20-50 labeled examples yang high-quality. Tanpa data bagus, optimization tidak efektif"
+      - "API cost bisa tinggi saat optimization (ratusan LLM calls), gunakan cheap model (Groq) untuk optimize"
+
+  - id: mem0
+    name: "Mem0 (AI Memory Layer)"
+    category: "LLM Memory"
+    description: >
+      Mem0 adalah library untuk memberikan persistent memory kepada LLM agents.
+      Memungkinkan agent mengingat informasi dari session sebelumnya. Untuk RETRO,
+      Mem0 bisa digunakan untuk memberikan Context Agent memori tentang perusahaan
+      yang sudah pernah di-profile di expo sebelumnya, sehingga tidak perlu
+      re-profile dari scratch. Mendukung: user memory, session memory, agent memory.
+      Tersedia sebagai library Python dan managed service.
+    specific_function: >
+      Persistent memory untuk Context Agent. Jika RETRO process expo yang sama
+      tahun berikutnya, Context Agent bisa recall profile dari tahun lalu dan
+      hanya update bagian yang berubah, bukan dari scratch. Menghemat token signifikan.
+    language: "Python"
+    pricing: "Free (open-source self-hosted), Mem0 Cloud free 1000 memories/bulan"
+    last_updated: "2025"
+    url: "https://mem0.ai"
+    retro:
+      phase: "Phase 3 (Context Agent memory enhancement)"
+      role: >
+        Memory layer untuk Context Agent. Store profile notes dari setiap company
+        profiling. Ketika company yang sama muncul di expo tahun berikutnya, Context
+        Agent bisa retrieve existing notes dan update hanya yang berubah.
+      when_to_use: >
+        Pertimbangkan Mem0 ketika RETRO sudah running lebih dari satu expo cycle
+        dan mulai process returning exhibitors. Untuk first run, tidak diperlukan.
+      priority: "optional"
+      output_goes_to: "Context Agent (enriched context)"
+    setup:
+      install: "pip install mem0ai"
+      requirements:
+        - "mem0ai>=0.1.0"
+        - "Qdrant (untuk vector store backend Mem0)"
+      env_vars:
+        - name: MEM0_API_KEY
+          description: "Untuk Mem0 Cloud, kosongkan untuk self-hosted"
+    usage:
+      basic_example: |
+        from mem0 import Memory
+
+        # Config dengan Qdrant sebagai vector store
+        config = {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "collection_name": "retro_agent_memory",
+                    "host": "localhost",
+                    "port": 6333,
+                }
+            }
+        }
+        m = Memory.from_config(config)
+
+        # Simpan memory untuk agent "context_agent" tentang company "sinarlogistik.co.id"
+        m.add(
+            messages="PT Sinar Logistik is a logistics SaaS company in Jakarta, collaboration potential HIGH",
+            user_id="context_agent",
+            metadata={"domain": "sinarlogistik.co.id", "expo": "LogiSEA 2025"},
+        )
+
+        # Recall
+        results = m.search(query="logistics company Jakarta", user_id="context_agent")
+        for r in results:
+            print(r["memory"])
+
+      retro_example: |
+        from mem0 import Memory
+        import json
+
+        MEM0_CONFIG = {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"collection_name": "retro_memory", "host": "localhost", "port": 6333}
+            }
+        }
+        _mem0 = None
+
+        def get_mem0() -> Memory:
+            global _mem0
+            if _mem0 is None:
+                _mem0 = Memory.from_config(MEM0_CONFIG)
+            return _mem0
+
+        def recall_company_history(domain: str) -> str:
+            """Ambil history profiling perusahaan untuk di-inject ke Context Agent prompt."""
+            m = get_mem0()
+            results = m.search(
+                query=f"company domain {domain}",
+                user_id="context_agent",
+                limit=3,
+            )
+            if not results:
+                return ""
+            history = "\n".join([f"- {r['memory']}" for r in results])
+            return f"\nPREVIOUS INTEL ON THIS COMPANY:\n{history}\n"
+
+        def save_profile_to_memory(profile_card: dict, expo: str):
+            """Simpan profile card ke Mem0 untuk future reference."""
+            m = get_mem0()
+            summary = (
+                f"{profile_card['company_name']} ({profile_card['domain']}) is "
+                f"a {profile_card.get('industry', 'unknown')} company. "
+                f"Value prop: {profile_card.get('value_proposition', 'N/A')}. "
+                f"Collaboration potential: {profile_card.get('collaboration_potential', 'unknown')}."
+            )
+            m.add(
+                messages=summary,
+                user_id="context_agent",
+                metadata={
+                    "domain": profile_card["domain"],
+                    "expo":   expo,
+                    "profiled_at": profile_card.get("profiled_at"),
+                },
+            )
+
+      expected_output: |
+        [Mem0] Recall for sinarlogistik.co.id:
+        - PT Sinar Logistik is a logistics SaaS company in Jakarta (from LogiSEA 2025)
+        - Collaboration potential HIGH - route optimization complements RETRO platform
+        - Contact: partnership@sinarlogistik.co.id (verified 2025-04-23)
+
+    notes:
+      - "Mem0 menggunakan Qdrant di balik layar untuk semantic memory search"
+      - "user_id memisahkan memory antar agents: 'context_agent', 'synthesis_agent' dst"
+      - "Mem0 otomatis deduplicate dan merge memories yang similar saat add()"
+    pitfalls:
+      - "Mem0 masih early development, API bisa berubah. Pin versi di requirements.txt"
+      - "Memory Mem0 bisa stale, tambahkan TTL atau expiry logic manual untuk data yang cepat berubah"
+
+  - id: langsmith
+    name: "LangSmith"
+    category: "LLM Observability (LangChain)"
+    description: >
+      LangSmith adalah observability platform dari LangChain untuk tracing dan
+      evaluasi LLM applications. Mirip Langfuse tapi terikat erat dengan ekosistem
+      LangChain. Tersedia sebagai cloud service dengan free tier. RETRO bisa
+      menggunakan LangSmith sebagai alternatif Langfuse, terutama jika sudah
+      menggunakan LangChain untuk agent orchestration.
+    specific_function: >
+      Alternatif Langfuse untuk LLM observability. Jika RETRO menggunakan LangChain,
+      LangSmith terintegrasi otomatis. Untuk RETRO yang menggunakan LiteLLM langsung
+      (tanpa LangChain), Langfuse lebih mudah di-setup.
+    language: "Python (langsmith SDK)"
+    pricing: "Free tier: 5K traces/bulan, Pro: $39/bulan"
+    last_updated: "2025"
+    url: "https://smith.langchain.com"
+    retro:
+      phase: "Semua Phase (observability)"
+      role: "Alternatif Langfuse jika menggunakan LangChain"
+      when_to_use: >
+        Gunakan LangSmith hanya jika RETRO sudah menggunakan LangChain dan ingin
+        native integration. Untuk RETRO dengan LiteLLM direct, gunakan Langfuse
+        karena free tier lebih generous (50K vs 5K traces/bulan).
+      priority: "optional (Langfuse lebih disarankan)"
+      output_goes_to: "LangSmith dashboard"
+    setup:
+      install: "pip install langsmith"
+      requirements:
+        - "langsmith>=0.1.0"
+        - "LANGCHAIN_API_KEY dari smith.langchain.com"
+      env_vars:
+        - name: LANGCHAIN_API_KEY
+          description: "API key dari https://smith.langchain.com"
+        - name: LANGCHAIN_TRACING_V2
+          description: "true (untuk enable auto-tracing)"
+        - name: LANGCHAIN_PROJECT
+          description: "Nama project di LangSmith"
+    usage:
+      basic_example: |
+        import os
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"]     = "ls__..."
+        os.environ["LANGCHAIN_PROJECT"]     = "retro-pipeline"
+
+        # Setelah set env vars, semua LangChain calls otomatis ter-trace
+        # Untuk LiteLLM, gunakan langsmith decorator:
+        from langsmith import traceable
+
+        @traceable(name="context_agent", tags=["retro", "context"])
+        def run_context_agent(domain: str, content: str) -> dict:
+            # ... LLM call ...
+            return {}
+
+      retro_example: |
+        # Untuk RETRO yang tidak menggunakan LangChain, gunakan @traceable decorator
+        from langsmith import traceable
+
+        @traceable(name="retro_context_agent", metadata={"version": "1.0"})
+        def context_agent_traced(domain: str, content: str, expo: str) -> dict | None:
+            profile = run_context_agent(domain, content, expo)  # Fungsi dari litellm section
+            return profile
+
+      expected_output: |
+        # LangSmith Dashboard: https://smith.langchain.com
+        # Traces: retro_context_agent
+        #   342 runs | avg latency 8.3s | total cost $0.72
+
+    notes:
+      - "Langfuse free tier (50K traces/bulan) jauh lebih generous dari LangSmith (5K traces/bulan)"
+      - "LangSmith lebih cocok jika RETRO menggunakan LangChain framework untuk agent orchestration"
+      - "LANGCHAIN_TRACING_V2=true mengaktifkan auto-tracing tanpa perubahan kode lain"
+    pitfalls:
+      - "Free tier 5K traces/bulan habis cepat jika RETRO process ratusan companies per run"
+      - "LangSmith terikat dengan LangChain ecosystem, kurang flexible untuk non-LangChain code"

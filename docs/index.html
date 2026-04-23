@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RETRO System Documentation</title>
+    <!-- Tailwind CSS for elegant styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- js-yaml to parse YAML files dynamically -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+    <!-- Beautiful Google Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700&display=swap"
+        rel="stylesheet">
+    <!-- Highlight.js for code block beautification -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <!-- Phosphor Icons for minimalist beautiful icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        heading: ['Outfit', 'sans-serif'],
+                    },
+                    colors: {
+                        gemini: {
+                            blue: '#4285f4',
+                            red: '#ea4335',
+                            yellow: '#fbbc05',
+                            green: '#34a853',
+                            bg: '#f8f9fa'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #f8f9fa;
+            /* Gemini subtle light bg */
+            color: #1f2937;
+        }
+
+        .sidebar {
+            background-color: #ffffff;
+            border-right: 1px solid #e5e7eb;
+            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.01);
+        }
+
+        .clean-card {
+            background-color: #ffffff;
+            border: 1px solid #f3f4f6;
+            border-radius: 1.5rem;
+            box-shadow: 0 4px 24px -6px rgba(0, 0, 0, 0.03);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .clean-card:hover {
+            box-shadow: 0 10px 40px -8px rgba(66, 133, 244, 0.08);
+            /* slight Gemini blue glow */
+            border-color: #e5ebf3;
+            transform: translateY(-2px);
+        }
+
+        .nav-item.active {
+            background-color: #f1f3f4;
+            color: #1a73e8;
+            font-weight: 600;
+        }
+
+        .gradient-text {
+            background: linear-gradient(90deg, #4285f4, #ea4335);
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Custom subtle scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .code-wrapper {
+            position: relative;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            border: 1px solid #e5e7eb;
+        }
+
+        pre {
+            margin: 0;
+        }
+
+        @keyframes fadeUp {
+            from {
+                opacity: 0;
+                transform: translateY(15px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .animate-fade-up {
+            animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0;
+        }
+
+        .sound-wave {
+            display: inline-flex;
+            gap: 2px;
+            height: 12px;
+            align-items: flex-end;
+        }
+
+        .sound-wave span {
+            width: 3px;
+            background-color: currentColor;
+            border-radius: 3px;
+        }
+
+        .is-playing .sound-wave span {
+            animation: bounce 0.6s infinite alternate;
+        }
+
+        .is-playing .sound-wave span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .is-playing .sound-wave span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes bounce {
+            0% {
+                height: 3px;
+            }
+
+            100% {
+                height: 12px;
+            }
+        }
+    </style>
+</head>
+
+<body class="flex h-screen overflow-hidden">
+
+    <div class="sidebar w-80 flex-shrink-0 h-full overflow-y-auto z-10 flex flex-col">
+        <div class="p-8 pb-4">
+            <h1 class="text-2xl font-bold font-heading gradient-text flex items-center gap-2 mb-1">
+                <i class="ph-fill ph-sparkle text-gemini-blue"></i>
+                RETRO Docs
+            </h1>
+            <p class="text-xs text-gray-500 font-medium">Pipeline Visualizer</p>
+        </div>
+        <div class="px-6 pb-6 mt-4">
+            <div class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3 px-2">Knowledge Base</div>
+            <ul id="fileNav" class="space-y-1">
+                <!-- Files populated here -->
+            </ul>
+        </div>
+    </div>
+
+    <main class="flex-1 h-full overflow-y-auto relative">
+        <header
+            class="sticky top-0 z-20 bg-white/80 backdrop-blur-xl border-b border-gray-100 p-4 px-8 flex justify-between items-center h-20">
+            <h2 id="headerTitle" class="text-lg font-heading font-semibold text-gray-800 tracking-tight">Select a module
+                from the left menu</h2>
+            <div>
+                <button id="globalStopBtn"
+                    class="hidden px-5 py-2.5 bg-red-50 text-red-600 rounded-full text-sm font-semibold hover:bg-red-100 transition-all flex items-center gap-2 shadow-sm">
+                    <i class="ph-fill ph-stop-circle text-lg"></i> Stop Audio
+                </button>
+            </div>
+        </header>
+
+        <div class="p-8 md:p-12 max-w-5xl mx-auto" id="mainContent">
+            <div class="flex flex-col items-center justify-center h-[60vh] text-center text-gray-400 animate-fade-up">
+                <i class="ph-light ph-books text-7xl mb-6 text-gray-300"></i>
+                <h3 class="text-xl font-heading font-semibold text-gray-700 mb-2">Welcome to RETRO Insight</h3>
+                <p class="max-w-md">Browse through the YAML files interactively. Enjoy the light, aesthetic Gemini vibe
+                    while listening to Ardi Neural TTS.</p>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // === Audio File playback logic ===
+        let currentAudio = null;
+        let currentlyPlayingIndex = -1;
+        // Penanda file YAML yang aktif
+        window.currentYamlFilename = "";
+
+        function stopSpeech() {
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+            }
+            document.getElementById('globalStopBtn').classList.add('hidden');
+            document.querySelectorAll('.btn-play').forEach(btn => btn.classList.remove('is-playing'));
+            currentlyPlayingIndex = -1;
+        }
+
+        function playSpeech(index, buttonEl) {
+            stopSpeech();
+
+            if (!window.currentYamlFilename) {
+                alert("File YAML belum dimuat sepenuhnya.");
+                return;
+            }
+
+            // Nama file base (misal: 01_world_awareness)
+            const baseName = window.currentYamlFilename.replace(".yaml", "");
+            // Format URL: audio/01_world_awareness_0.mp3
+            const audioUrl = `audio/${baseName}_${index}.mp3`;
+
+            currentAudio = new Audio(audioUrl);
+
+            currentAudio.onplay = () => {
+                document.getElementById('globalStopBtn').classList.remove('hidden');
+                buttonEl.classList.add('is-playing');
+                currentlyPlayingIndex = index;
+            };
+
+            currentAudio.onended = () => {
+                document.getElementById('globalStopBtn').classList.add('hidden');
+                buttonEl.classList.remove('is-playing');
+                currentlyPlayingIndex = -1;
+            };
+
+            currentAudio.onerror = () => {
+                alert(`File audio tidak ditemukan: ${audioUrl}\nPastikan lo udah ngejalanin python generate_audio.py untuk men-generate file MP3-nya.`);
+                document.getElementById('globalStopBtn').classList.add('hidden');
+                buttonEl.classList.remove('is-playing');
+                currentlyPlayingIndex = -1;
+            };
+
+            currentAudio.play();
+        }
+        document.getElementById('globalStopBtn').onclick = stopSpeech;
+
+        // === Application Logic ===
+        const files = [
+            '01_world_awareness.yaml',
+            '02_web_crawling.yaml',
+            '03_pdf_pipeline.yaml',
+            '04_nlp_entity_extraction.yaml',
+            '05_vector_db_search.yaml',
+            '06_relational_db_cache.yaml',
+            '07_llm_agent_framework.yaml',
+            '08_scheduler_queue.yaml',
+            '09_email_discovery.yaml',
+            '10_pdf_generation.yaml',
+            '11_email_sending.yaml',
+            '12_notification.yaml',
+            '13_osint_supplemental.yaml'
+        ];
+
+        let currentTools = [];
+
+        const navElement = document.getElementById('fileNav');
+        const contentElement = document.getElementById('mainContent');
+        const headerTitleElement = document.getElementById('headerTitle');
+
+        // Generate Sidebar Menu
+        files.forEach(file => {
+            const li = document.createElement('li');
+            const readableTitle = file.replace('.yaml', '').replace(/^[0-9]+_/, '').replace(/_/g, ' ');
+            const finalTitle = readableTitle.charAt(0).toUpperCase() + readableTitle.slice(1);
+
+            li.innerHTML = `
+            <button onclick="loadYaml('${file}', this)" class="nav-item w-full text-left px-4 py-3 rounded-xl text-[14px] text-gray-600 hover:bg-gray-50 transition-all flex items-center gap-3">
+                <i class="ph-fill ph-file-code text-gray-400 text-lg"></i> 
+                <span class="truncate font-medium">${finalTitle}</span>
+            </button>
+        `;
+            navElement.appendChild(li);
+        });
+
+        async function loadYaml(filename, targetBtn) {
+            stopSpeech();
+            window.currentYamlFilename = filename;
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            if (targetBtn) targetBtn.classList.add('active');
+
+            contentElement.innerHTML = `
+            <div class="flex flex-col items-center justify-center py-20 text-gray-400">
+                <i class="ph ph-spinner-gap animate-spin text-4xl mb-4 text-gemini-blue"></i>
+                <p class="font-medium">Memuat dan mem-parsing dokumen...</p>
+            </div>
+        `;
+
+            try {
+                // Because they are in the same folder structurally when running local server
+                const resp = await fetch('tools/' + filename);
+                if (!resp.ok) throw new Error('File tidak dapat ditemukan atau ada masalah CORS.');
+                const text = await resp.text();
+
+                const doc = jsyaml.load(text);
+                currentTools = doc.tools || [];
+                renderDoc(doc);
+            } catch (err) {
+                contentElement.innerHTML = `
+                <div class="clean-card bg-white p-8 flex items-start gap-5 border-l-4 border-l-gemini-red">
+                    <i class="ph-fill ph-warning-circle text-4xl text-gemini-red"></i>
+                    <div>
+                        <h3 class="font-bold text-gray-900 text-lg mb-2">Gagal memuat ${filename}</h3>
+                        <p class="text-gray-600 mb-4">${err.message}</p>
+                        <div class="bg-gray-50 rounded-lg p-4 font-mono text-sm text-gray-700">
+                            <strong>Note:</strong> Karena ini file lokal, pastikan lo ngejalanin server lokal ya.<br>
+                            Buka di terminal: <br>
+                            <span class="text-gemini-blue font-bold px-2 py-1 bg-white rounded mt-2 inline-block shadow-sm">python -m http.server 8000</span><br>
+                            Dan akses: http://localhost:8000/index.html
+                        </div>
+                    </div>
+                </div>
+            `;
+            }
+        }
+
+        function renderDoc(doc) {
+            setTimeout(() => { window.scrollTo({ top: 0, behavior: 'smooth' }); }, 100);
+
+            headerTitleElement.innerText = doc.stage || 'Dashboard';
+
+            let html = `
+            <div class="mb-14 animate-fade-up">
+                <div class="inline-flex items-center gap-2 px-4 py-1.5 bg-gemini-blue/10 text-gemini-blue text-[11px] font-bold uppercase tracking-widest rounded-full mb-5">
+                    ${doc.retro_phase || 'General Phase'}
+                </div>
+                <h1 class="text-4xl md:text-5xl font-heading font-bold text-gray-900 mb-6 tracking-tight leading-tight">${doc.stage || 'Pipeline Details'}</h1>
+                <p class="text-lg text-gray-600 leading-relaxed max-w-3xl">${doc.stage_description ? doc.stage_description.replace(/\\n/g, '<br>') : 'Tidak ada deskripsi stage.'}</p>
+                
+                ${doc.retro_role ? `
+                    <div class="mt-8 bg-gemini-bg p-6 rounded-2xl border border-gray-100 flex gap-4">
+                        <i class="ph-fill ph-info text-gemini-blue text-2xl shrink-0 mt-0.5"></i>
+                        <div>
+                            <h4 class="font-bold text-gray-900 mb-1 text-sm uppercase tracking-wider">Role Summary</h4>
+                            <p class="text-gray-600 text-sm leading-relaxed">${doc.retro_role.replace(/\\n/g, '<br>')}</p>
+                        </div>
+                    </div>
+                ` : ''}
+            </div>
+            
+            <div class="flex items-center gap-3 mb-8 animate-fade-up" style="animation-delay: 0.1s">
+                <div class="h-px bg-gray-200 flex-1"></div>
+                <h3 class="text-lg font-heading font-semibold text-gray-400 uppercase tracking-widest px-4 flex items-center gap-2">
+                    <i class="ph-fill ph-plugs"></i> Integrated Tools
+                </h3>
+                <div class="h-px bg-gray-200 flex-1"></div>
+            </div>
+            
+            <div class="space-y-8">
+        `;
+
+            if (currentTools.length > 0) {
+                currentTools.forEach((tool, index) => {
+                    const delay = (index * 0.1) + 0.2;
+                    html += `
+                    <div class="clean-card p-8 animate-fade-up" style="animation-delay: ${delay}s">
+                        <div class="flex flex-col md:flex-row md:justify-between md:items-start gap-4 mb-6 pb-6 border-b border-gray-50">
+                            <div>
+                                <div class="flex items-center gap-3 mb-3">
+                                    <h2 class="text-2xl font-bold font-heading text-gray-900">${tool.name}</h2>
+                                    <span class="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-[10px] font-bold uppercase tracking-widest">
+                                        ${tool.category}
+                                    </span>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-gray-500 font-medium">
+                                    <span class="flex items-center gap-1.5"><i class="ph-fill ph-code"></i> ${tool.language || '-'}</span>
+                                    <span class="flex items-center gap-1.5"><i class="ph-fill ph-currency-circle-dollar"></i> ${tool.pricing || '-'}</span>
+                                </div>
+                            </div>
+                            <!-- TTS Button -->
+                            <button onclick="playSpeech(${index}, this)" class="btn-play group flex items-center gap-2.5 bg-white border border-gray-200 hover:border-gemini-blue hover:bg-gemini-blue/5 text-gray-700 hover:text-gemini-blue px-5 py-2.5 rounded-full font-semibold transition-all text-sm shrink-0 shadow-sm">
+                                <div class="sound-wave flex items-end opacity-0 group-hover:opacity-100 transition-opacity w-0 group-hover:w-auto overflow-hidden group-[.is-playing]:opacity-100 group-[.is-playing]:w-auto group-[.is-playing]:mr-1">
+                                    <span></span><span></span><span></span>
+                                </div>
+                                <i class="ph-fill ph-speaker-high text-lg group-[.is-playing]:hidden"></i> 
+                                <span class="group-[.is-playing]:text-gemini-blue">Dengarkan Audio</span>
+                            </button>
+                        </div>
+                        
+                        <div class="grid md:grid-cols-2 gap-10 mb-8">
+                            <div>
+                                <h4 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">General Description</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">${tool.description || '-'}</p>
+                            </div>
+                            <div>
+                                <h4 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">Specific Function</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">${tool.specific_function || '-'}</p>
+                            </div>
+                        </div>
+
+                        ${tool.retro ? `
+                            <div class="bg-gray-50 rounded-2xl p-6 mb-8 border border-gray-100">
+                                <h4 class="text-xs font-bold text-gray-900 uppercase tracking-widest mb-4 flex items-center gap-2">
+                                    <i class="ph-fill ph-lightning text-gemini-yellow"></i> Retro Implementation
+                                </h4>
+                                <div class="grid md:grid-cols-2 gap-8 text-sm">
+                                    <div>
+                                        <span class="block font-semibold text-gray-900 mb-1.5">Role in Pipeline</span>
+                                        <p class="text-gray-600 leading-relaxed">${tool.retro.role}</p>
+                                    </div>
+                                    <div>
+                                        <span class="block font-semibold text-gray-900 mb-1.5">When to Use</span>
+                                        <p class="text-gray-600 leading-relaxed">${tool.retro.when_to_use}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${tool.setup ? `
+                            <h4 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3 mt-8">Setup & Configuration</h4>
+                            <div class="code-wrapper mb-8 bg-[#f6f8fa] p-5">
+                                ${tool.setup.install ? `<div class="mb-3 font-mono text-sm"><span class="text-gemini-blue select-none mr-3">$</span><span class="text-gray-800">${tool.setup.install}</span></div>` : ''}
+                                ${tool.setup.requirements ? `<div class="font-mono text-sm text-gray-500 pl-6"># Prerequisites: ${tool.setup.requirements.join(', ')}</div>` : ''}
+                            </div>
+                        ` : ''}
+
+                        ${tool.usage?.basic_example ? `
+                            <h4 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3 mt-8">Basic Example</h4>
+                            <div class="code-wrapper text-[13px] bg-white border border-gray-200">
+                                <pre><code class="language-${tool.language && tool.language.toLowerCase().includes('python') ? 'python' : 'javascript'} p-5 block overflow-x-auto text-gray-800">${tool.usage.basic_example}</code></pre>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+                });
+            }
+
+            html += '</div>';
+            contentElement.innerHTML = html;
+            // Trigger syntax highlighting
+            document.querySelectorAll('pre code').forEach((block) => {
+                hljs.highlightElement(block);
+            });
+        }
+    </script>
+
+</body>
+
+</html>

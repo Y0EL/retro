@@ -1,0 +1,1320 @@
+stage: "02 - Web Crawling"
+stage_description: >
+  Framework dan library untuk crawling website expo, domain company,
+  dan konten web secara otomatis. Dari framework crawler sampai parser
+  HTML dan manajemen proxy. Semua berjalan NON-LLM, pure code.
+retro_phase: "Phase 1: The Discovery Engine (lanjutan)"
+retro_role: >
+  Setelah mendapat daftar domain dari Stage 01, Stage 02 bertugas
+  mengunjungi setiap domain dan mengekstrak: produk apa yang dijual,
+  siapa target pasarnya, model bisnis perusahaan. Output berupa teks
+  bersih yang siap dikirim ke Context Agent di Phase 3.
+execution_mode: "NON-LLM, berjalan otomatis. LLM tidak dipanggil di stage ini."
+output_destination: "Staging area: raw_company_text table dan file storage (MinIO)"
+
+tools:
+
+  - id: crawl4ai
+    name: "Crawl4AI"
+    category: "AI-Native & LLM-Friendly Crawler"
+    description: >
+      LLM-friendly crawler generasi terbaru. Output langsung berupa
+      clean Markdown dan JSON yang siap dikonsumsi LLM tanpa post-processing
+      manual. 46K+ GitHub stars per 2025. Pilihan UTAMA untuk RETRO.
+    specific_function: >
+      Crawl domain company, output structured JSON + Markdown bersih.
+      LLM prompt-guided extraction. Playwright integration untuk
+      JavaScript-heavy sites. Anti-bot bawaan.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/unclecode/crawl4ai"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        PRIMARY CRAWLER untuk RETRO. Mengunjungi domain company yang
+        ditemukan dari Stage 01 dan mengekstrak konten halaman menjadi
+        Markdown bersih. Output langsung siap masuk ke Context Agent
+        tanpa perlu cleaning manual.
+      when_to_use: >
+        Gunakan untuk SEMUA crawling domain company. Crawl4AI adalah
+        default crawler RETRO. Gunakan Playwright langsung hanya jika
+        ada kebutuhan browser automation yang sangat spesifik yang
+        tidak bisa ditangani Crawl4AI.
+      priority: "primary"
+      output_goes_to: "raw_company_text table, file disimpan di MinIO"
+
+    setup:
+      install: |
+        pip install crawl4ai
+        playwright install chromium
+      requirements:
+        - "Python 3.9+"
+        - "Playwright browsers (install via: playwright install)"
+        - "RAM minimal 2GB untuk browser headless"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import asyncio
+        from crawl4ai import AsyncWebCrawler
+
+        async def crawl_company(url: str) -> dict:
+            async with AsyncWebCrawler(verbose=False) as crawler:
+                result = await crawler.arun(url=url)
+                return {
+                    "url": url,
+                    "success": result.success,
+                    "markdown": result.markdown,
+                    "cleaned_html": result.cleaned_html,
+                    "links": result.links
+                }
+
+        result = asyncio.run(crawl_company("https://example-company.com"))
+        print(f"Success: {result['success']}")
+        print(f"Markdown length: {len(result['markdown'])} chars")
+        print(result['markdown'][:500])
+
+      retro_example: |
+        import asyncio
+        import json
+        import hashlib
+        from datetime import datetime
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+        from crawl4ai.extraction_strategy import LLMExtractionStrategy
+
+        async def retro_crawl_company_domain(
+            domain: str,
+            max_pages: int = 10
+        ) -> dict:
+            """
+            Crawl domain perusahaan secara mendalam.
+            Mengunjungi homepage + halaman About, Products, Services, Contact.
+            Return: dict dengan semua teks yang dikumpulkan dari domain.
+            """
+            base_url = f"https://{domain}" if not domain.startswith("http") else domain
+
+            # Halaman prioritas yang harus dikunjungi
+            priority_paths = [
+                "",           # homepage
+                "/about",
+                "/about-us",
+                "/products",
+                "/services",
+                "/solutions",
+                "/contact",
+                "/company",
+            ]
+
+            browser_config = BrowserConfig(
+                headless=True,
+                java_script_enabled=True,
+                user_agent="Mozilla/5.0 (compatible; RETRO-Bot/1.0)"
+            )
+
+            crawl_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                word_count_threshold=50,  # Skip halaman dengan teks sangat sedikit
+                excluded_tags=["nav", "footer", "header", "script", "style"],
+                remove_overlay_elements=True,
+                process_iframes=False
+            )
+
+            all_pages = []
+            crawled_urls = set()
+
+            async with AsyncWebCrawler(config=browser_config, verbose=False) as crawler:
+                # Crawl priority pages
+                for path in priority_paths:
+                    url = f"{base_url}{path}"
+                    if url in crawled_urls:
+                        continue
+                    crawled_urls.add(url)
+
+                    try:
+                        result = await crawler.arun(url=url, config=crawl_config)
+                        if result.success and result.markdown and len(result.markdown) > 100:
+                            all_pages.append({
+                                "url": url,
+                                "markdown": result.markdown,
+                                "word_count": len(result.markdown.split()),
+                                "internal_links": [
+                                    l["href"] for l in result.links.get("internal", [])
+                                    if l.get("href")
+                                ][:20]
+                            })
+                    except Exception as e:
+                        print(f"[Crawl4AI] Failed {url}: {e}")
+                    finally:
+                        await asyncio.sleep(1)  # Sopan ke server
+
+            # Gabungkan semua teks dari semua halaman
+            combined_text = "\n\n---PAGE BREAK---\n\n".join(
+                f"# Source: {p['url']}\n\n{p['markdown']}"
+                for p in all_pages
+            )
+
+            # Kumpulkan semua PDF links yang ditemukan
+            pdf_links = []
+            for page in all_pages:
+                for link in page.get("internal_links", []):
+                    if link.lower().endswith(".pdf"):
+                        pdf_links.append(link)
+
+            return {
+                "domain": domain,
+                "base_url": base_url,
+                "pages_crawled": len(all_pages),
+                "combined_text": combined_text,
+                "total_word_count": sum(p["word_count"] for p in all_pages),
+                "pdf_links_found": list(set(pdf_links)),
+                "page_urls_crawled": [p["url"] for p in all_pages],
+                "crawled_at": datetime.utcnow().isoformat(),
+                "status": "success" if all_pages else "failed"
+            }
+
+        async def retro_batch_crawl(domains: list, max_concurrent: int = 3) -> list:
+            """
+            Crawl banyak domain secara concurrent.
+            Batasi concurrent untuk menghindari overload.
+            """
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def crawl_with_limit(domain):
+                async with semaphore:
+                    return await retro_crawl_company_domain(domain)
+
+            tasks = [crawl_with_limit(d) for d in domains]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            successful = [r for r in results if isinstance(r, dict) and r["status"] == "success"]
+            print(f"[Crawl4AI] Crawled: {len(successful)}/{len(domains)} domains successfully")
+            return [r for r in results if isinstance(r, dict)]
+
+        # Contoh penggunaan
+        domains_to_crawl = [
+            "abctech.co.id",
+            "pt-maju-jaya.com",
+            "indonesian-vendor.net"
+        ]
+
+        results = asyncio.run(retro_batch_crawl(domains_to_crawl))
+
+        for r in results:
+            output_path = f"staging/company_text/{r['domain'].replace('.', '_')}.json"
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(r, f, indent=2, ensure_ascii=False)
+            print(f"Saved: {r['domain']} ({r['pages_crawled']} pages, {r['total_word_count']} words)")
+
+      expected_output: |
+        [Crawl4AI] Crawled: 3/3 domains successfully
+        Saved: abctech.co.id (6 pages, 4823 words)
+        Saved: pt-maju-jaya.com (4 pages, 2156 words)
+        Saved: indonesian-vendor.net (8 pages, 7234 words)
+
+        staging/company_text/abctech_co_id.json:
+        {
+          "domain": "abctech.co.id",
+          "base_url": "https://abctech.co.id",
+          "pages_crawled": 6,
+          "combined_text": "# Source: https://abctech.co.id\n\n## ABC Technology Solutions\n\nABC Technology adalah perusahaan teknologi yang berfokus pada solusi IoT untuk industri manufaktur...\n\n---PAGE BREAK---\n\n# Source: https://abctech.co.id/products\n\n## Produk Kami\n\n### IoT Gateway Pro\n...",
+          "total_word_count": 4823,
+          "pdf_links_found": [
+            "https://abctech.co.id/catalog-2024.pdf",
+            "https://abctech.co.id/product-brochure.pdf"
+          ],
+          "page_urls_crawled": [
+            "https://abctech.co.id",
+            "https://abctech.co.id/about",
+            "https://abctech.co.id/products"
+          ],
+          "crawled_at": "2025-04-23T12:00:00",
+          "status": "success"
+        }
+
+    notes:
+      - "Gunakan CacheMode.BYPASS untuk selalu fetch fresh content, bukan cache."
+      - "word_count_threshold=50 menghindari halaman kosong atau pure-nav masuk ke output."
+      - "excluded_tags menghilangkan noise dari nav, footer, dan script."
+      - "Selalu gunakan asyncio untuk crawling concurrent. Jangan panggil secara synchronous."
+      - "Crawl4AI otomatis handle JavaScript rendering via Playwright bawaan."
+    pitfalls:
+      - "Jangan crawl lebih dari 5 concurrent per domain. Bisa kena rate limit atau blacklist."
+      - "Beberapa website anti-bot canggih (Cloudflare) perlu curl-impersonate. Deteksi dari status code 403."
+      - "asyncio.sleep(1) antar request ke domain yang sama adalah minimum. Tambah jika perlu."
+      - "Jika website pakai infinite scroll, konten bawah halaman tidak akan ter-crawl."
+
+  - id: scrapy
+    name: "Scrapy"
+    category: "Core Crawling Framework"
+    description: >
+      Framework crawling Python paling mature dan widely-used. Async,
+      spider-based, extensible middleware. Sangat cocok untuk crawling
+      terstruktur dengan banyak rules dan custom logic.
+    specific_function: >
+      Crawl website bisnis, expo, domain target. Built-in support
+      CSV/JSON/XML export. Schedule via cron. Middleware untuk
+      deduplication, rate limiting, dan retry bawaan.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/scrapy/scrapy"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Digunakan untuk crawling halaman expo/pameran yang memiliki
+        struktur list exhibitor yang perlu di-paginate. Scrapy lebih
+        baik dari Crawl4AI untuk structured data extraction dengan
+        CSS/XPath selector yang presisi.
+      when_to_use: >
+        Gunakan Scrapy untuk halaman expo yang punya daftar exhibitor
+        dengan pagination (halaman 1, 2, 3, dst). Juga gunakan untuk
+        crawling yang butuh custom middleware seperti login atau cookie.
+        Untuk general domain crawling, gunakan Crawl4AI.
+      priority: "secondary"
+      output_goes_to: "domains_discovered table"
+
+    setup:
+      install: "pip install scrapy"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        # Buat spider baru
+        # scrapy startproject retro_crawl
+        # cd retro_crawl && scrapy genspider expo expo-website.com
+
+        import scrapy
+
+        class ExpoExhibitorSpider(scrapy.Spider):
+            name = "expo_exhibitor"
+            allowed_domains = ["expo-website.com"]
+            start_urls = ["https://expo-website.com/exhibitors"]
+
+            def parse(self, response):
+                # Ekstrak nama dan website exhibitor
+                for exhibitor in response.css(".exhibitor-card"):
+                    yield {
+                        "name": exhibitor.css("h3.name::text").get("").strip(),
+                        "website": exhibitor.css("a.website::attr(href)").get(""),
+                        "description": exhibitor.css("p.desc::text").get("").strip(),
+                        "category": exhibitor.css(".category::text").get("").strip()
+                    }
+
+                # Handle pagination
+                next_page = response.css("a.next-page::attr(href)").get()
+                if next_page:
+                    yield response.follow(next_page, self.parse)
+
+      retro_example: |
+        import scrapy
+        from scrapy.crawler import CrawlerProcess
+        from scrapy.utils.project import get_project_settings
+        import json
+        from urllib.parse import urlparse
+        import re
+
+        class RetroExpoSpider(scrapy.Spider):
+            """
+            Spider untuk extract daftar exhibitor dari halaman expo.
+            Menghasilkan list domain perusahaan untuk di-crawl lebih lanjut.
+            """
+            name = "retro_expo"
+            custom_settings = {
+                "DOWNLOAD_DELAY": 1.5,
+                "CONCURRENT_REQUESTS": 2,
+                "ROBOTSTXT_OBEY": True,
+                "USER_AGENT": "RETRO-Bot/1.0 (+https://company.com/bot)",
+                "FEEDS": {
+                    "staging/expo_exhibitors.json": {
+                        "format": "json",
+                        "encoding": "utf8",
+                        "overwrite": True
+                    }
+                }
+            }
+
+            def __init__(self, expo_url: str, expo_name: str, **kwargs):
+                self.start_urls = [expo_url]
+                self.expo_name = expo_name
+                self.allowed_domains = [urlparse(expo_url).netloc]
+                super().__init__(**kwargs)
+
+            def parse(self, response):
+                # Coba berbagai selector umum untuk list exhibitor
+                selectors = [
+                    ".exhibitor", ".vendor", ".participant",
+                    ".company-card", ".booth", "[class*='exhibitor']",
+                    "[class*='vendor']", "[class*='company']"
+                ]
+
+                items_found = []
+                for selector in selectors:
+                    items = response.css(selector)
+                    if items:
+                        items_found = items
+                        break
+
+                for item in items_found:
+                    # Cari website URL dari berbagai kemungkinan atribut
+                    website = (
+                        item.css("a[href*='http']::attr(href)").get() or
+                        item.css("a::attr(href)").re_first(r'https?://[^"]+') or
+                        ""
+                    )
+                    # Skip jika website adalah link internal expo
+                    if website and self.allowed_domains[0] in website:
+                        website = ""
+
+                    company_name = (
+                        item.css("h1::text, h2::text, h3::text, h4::text, .name::text").get() or
+                        item.css("strong::text").get() or
+                        ""
+                    ).strip()
+
+                    if company_name:
+                        domain = ""
+                        if website:
+                            parsed = urlparse(website)
+                            domain = parsed.netloc.replace("www.", "")
+
+                        yield {
+                            "expo_name": self.expo_name,
+                            "expo_url": response.url,
+                            "company_name": company_name,
+                            "company_website": website,
+                            "company_domain": domain,
+                            "description": " ".join(item.css("p::text").getall()).strip()[:500],
+                        }
+
+                # Pagination
+                for next_url in response.css("a[rel='next']::attr(href), .next::attr(href), .pagination a::attr(href)").getall():
+                    yield response.follow(next_url, self.parse)
+
+        # Jalankan spider
+        def run_expo_spider(expo_url: str, expo_name: str):
+            process = CrawlerProcess(settings={
+                "LOG_LEVEL": "WARNING"
+            })
+            process.crawl(RetroExpoSpider, expo_url=expo_url, expo_name=expo_name)
+            process.start()
+            print(f"[Scrapy] Spider selesai untuk {expo_name}")
+
+        run_expo_spider(
+            expo_url="https://inacraft.or.id/exhibitors",
+            expo_name="INACRAFT 2025"
+        )
+
+      expected_output: |
+        [Scrapy] Spider selesai untuk INACRAFT 2025
+
+        staging/expo_exhibitors.json:
+        [
+          {
+            "expo_name": "INACRAFT 2025",
+            "expo_url": "https://inacraft.or.id/exhibitors",
+            "company_name": "PT Karya Kreatif Indonesia",
+            "company_website": "https://karyakreatif.co.id",
+            "company_domain": "karyakreatif.co.id",
+            "description": "Produsen kerajinan tangan premium untuk pasar ekspor..."
+          },
+          {
+            "company_name": "Batik Nusantara Craft",
+            "company_website": "https://batiknusantara.com",
+            "company_domain": "batiknusantara.com",
+            "description": ""
+          }
+        ]
+
+    notes:
+      - "DOWNLOAD_DELAY adalah minimum delay per request. Tambah jika website sensitif."
+      - "ROBOTSTXT_OBEY: True adalah etis. Set False hanya jika terpaksa dan ada izin."
+      - "Scrapy FEEDS otomatis menyimpan output ke file. Gunakan format JSON untuk RETRO."
+      - "Spider bisa dijalankan dari code (CrawlerProcess) atau dari command line."
+    pitfalls:
+      - "CSS selector bisa berbeda antar website expo. Buat spider yang flexible dengan multiple selector fallback."
+      - "Jangan gunakan Scrapy untuk JavaScript-heavy sites. Gunakan Crawl4AI atau Playwright."
+      - "Scrapy tidak bisa dijalankan dalam asyncio event loop yang sudah berjalan. Gunakan di thread terpisah."
+
+  - id: playwright_python
+    name: "Playwright (Python)"
+    category: "Core Crawling Framework"
+    description: >
+      Browser automation dari Microsoft. Support Chromium, Firefox, Safari.
+      Headless mode untuk server deployment. Modern dan lebih cepat dari Selenium.
+    specific_function: >
+      Crawl SPA (Single Page Application), JavaScript-rendered sites,
+      form interaction, screenshot, PDF render dari browser.
+    language: "Python / JS"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/microsoft/playwright-python"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine dan Phase 2 - PDF Pipeline"
+      role: >
+        Browser automation untuk website yang tidak bisa di-crawl dengan
+        HTTP request biasa. Digunakan ketika Crawl4AI gagal karena website
+        butuh JavaScript execution atau interaksi user untuk menampilkan
+        konten (infinite scroll, lazy loading, login wall).
+      when_to_use: >
+        Gunakan sebagai fallback ketika Crawl4AI mengembalikan konten
+        kosong atau sangat sedikit. Juga digunakan di Phase 2 untuk
+        render halaman PDF dari template HTML proposal (PDF generation).
+        Jangan gunakan sebagai default karena lebih lambat dan resource-intensive.
+      priority: "secondary (fallback untuk Crawl4AI)"
+      output_goes_to: "raw_company_text table"
+
+    setup:
+      install: |
+        pip install playwright
+        playwright install chromium
+      requirements:
+        - "Python 3.8+"
+        - "System dependencies untuk Chromium (otomatis diinstall)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from playwright.sync_api import sync_playwright
+
+        def crawl_with_playwright(url: str) -> dict:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+
+                # Block resource yang tidak perlu (speed optimization)
+                page.route("**/*.{png,jpg,gif,svg,css,font}", lambda route: route.abort())
+
+                page.goto(url, wait_until="networkidle", timeout=30000)
+
+                # Ambil semua teks visible
+                text = page.inner_text("body")
+                title = page.title()
+                links = page.eval_on_selector_all("a[href]", "els => els.map(el => el.href)")
+
+                browser.close()
+                return {
+                    "url": url,
+                    "title": title,
+                    "text": text,
+                    "links": [l for l in links if l.startswith("http")]
+                }
+
+        result = crawl_with_playwright("https://example-company.com/products")
+        print(result["title"])
+        print(result["text"][:500])
+
+      retro_example: |
+        from playwright.async_api import async_playwright
+        import asyncio
+        import json
+        from datetime import datetime
+
+        async def retro_playwright_crawl(url: str, wait_for_selector: str = None) -> dict:
+            """
+            Crawl URL dengan Playwright. Digunakan sebagai fallback ketika
+            Crawl4AI gagal karena JavaScript-heavy content.
+            """
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"]
+                )
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    viewport={"width": 1280, "height": 720}
+                )
+                page = await context.new_page()
+
+                # Block assets tidak perlu untuk mempercepat
+                await page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2}", lambda r: r.abort())
+
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+                    # Tunggu selector spesifik jika perlu (untuk SPA)
+                    if wait_for_selector:
+                        await page.wait_for_selector(wait_for_selector, timeout=10000)
+
+                    # Scroll untuk trigger lazy loading
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(2)
+
+                    # Ekstrak semua teks yang visible
+                    text_content = await page.evaluate("""
+                        () => {
+                            const elements = document.querySelectorAll(
+                                'h1,h2,h3,h4,h5,p,li,td,th,span,div'
+                            );
+                            return Array.from(elements)
+                                .map(el => el.innerText)
+                                .filter(t => t && t.trim().length > 10)
+                                .join('\\n');
+                        }
+                    """)
+
+                    # Ambil semua link
+                    links = await page.eval_on_selector_all(
+                        "a[href]",
+                        "els => els.map(el => ({href: el.href, text: el.innerText.trim()}))"
+                    )
+
+                    # Filter PDF links
+                    pdf_links = [l["href"] for l in links if l["href"].lower().endswith(".pdf")]
+
+                    return {
+                        "url": url,
+                        "title": await page.title(),
+                        "text_content": text_content,
+                        "word_count": len(text_content.split()),
+                        "all_links": [l["href"] for l in links[:50]],
+                        "pdf_links": pdf_links,
+                        "crawled_at": datetime.utcnow().isoformat(),
+                        "method": "playwright",
+                        "status": "success"
+                    }
+
+                except Exception as e:
+                    return {
+                        "url": url,
+                        "status": "failed",
+                        "error": str(e),
+                        "method": "playwright"
+                    }
+                finally:
+                    await browser.close()
+
+        # Penggunaan: sebagai fallback ketika Crawl4AI gagal
+        async def retro_crawl_with_fallback(domain: str) -> dict:
+            from crawl4ai import AsyncWebCrawler
+
+            base_url = f"https://{domain}"
+            print(f"[Crawler] Trying Crawl4AI for {domain}...")
+
+            async with AsyncWebCrawler(verbose=False) as crawler:
+                result = await crawler.arun(url=base_url)
+
+            if result.success and len(result.markdown) > 200:
+                return {"domain": domain, "text": result.markdown, "method": "crawl4ai"}
+
+            # Fallback ke Playwright
+            print(f"[Crawler] Crawl4AI insufficient, falling back to Playwright for {domain}...")
+            pw_result = await retro_playwright_crawl(base_url)
+            pw_result["domain"] = domain
+            return pw_result
+
+        result = asyncio.run(retro_crawl_with_fallback("complex-spa-vendor.com"))
+        print(f"Method used: {result.get('method')}")
+        print(f"Words: {result.get('word_count', 0)}")
+
+      expected_output: |
+        [Crawler] Trying Crawl4AI for complex-spa-vendor.com...
+        [Crawler] Crawl4AI insufficient, falling back to Playwright for complex-spa-vendor.com...
+        Method used: playwright
+        Words: 3421
+
+        Result:
+        {
+          "domain": "complex-spa-vendor.com",
+          "url": "https://complex-spa-vendor.com",
+          "title": "TechVendor - IoT Solutions for Industry",
+          "text_content": "TechVendor\nIoT Solutions for Industry\n\nAbout Us\nFounded in 2018, TechVendor...",
+          "word_count": 3421,
+          "pdf_links": ["https://complex-spa-vendor.com/catalog-2025.pdf"],
+          "method": "playwright"
+        }
+
+    notes:
+      - "Gunakan async_playwright untuk concurrent crawling dalam asyncio."
+      - "Block assets gambar dan font untuk mempercepat 3-5x."
+      - "wait_until='domcontentloaded' lebih cepat dari 'networkidle' untuk kebanyakan site."
+      - "Selalu close browser di finally block untuk menghindari memory leak."
+    pitfalls:
+      - "Playwright memakan RAM sekitar 100-200MB per browser instance. Batasi concurrent."
+      - "JavaScript timeout 30000ms mungkin perlu ditambah untuk website lambat."
+      - "Headless browser masih bisa dideteksi oleh sistem anti-bot canggih."
+
+  - id: beautifulsoup4
+    name: "BeautifulSoup4"
+    category: "HTML Parsing"
+    description: >
+      HTML/XML parser Python paling populer. Simple API, intuitif,
+      dokumentasi sangat lengkap. Digunakan untuk parsing HTML yang
+      sudah di-fetch oleh requests atau Scrapy.
+    specific_function: >
+      Parse HTML response dari requests atau Scrapy. Ekstrak tag,
+      atribut, text dari halaman web. Fallback ke lxml untuk performa.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/waylan/beautifulsoup"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        HTML parser untuk halaman expo yang sudah di-fetch. Digunakan
+        untuk mengekstrak daftar exhibitor, URL perusahaan, dan metadata
+        dari halaman expo yang strukturnya sudah diketahui.
+      when_to_use: >
+        Gunakan ketika sudah mendapatkan HTML raw dari requests atau
+        Scrapy dan perlu mengekstrak elemen spesifik dengan CSS selector
+        atau tag search. Untuk halaman yang perlu JavaScript, gunakan
+        Playwright terlebih dahulu lalu parse hasilnya dengan BS4.
+      priority: "primary"
+      output_goes_to: "Digunakan sebagai utility dalam Scrapy spider"
+
+    setup:
+      install: "pip install beautifulsoup4 lxml"
+      requirements:
+        - "pip install lxml (untuk parser yang lebih cepat)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import requests
+        from bs4 import BeautifulSoup
+
+        url = "https://expo-website.com/exhibitors"
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, "lxml")  # Gunakan lxml, bukan html.parser
+
+        # Cari semua exhibitor cards
+        companies = []
+        for card in soup.select(".exhibitor-card, .company-card, [class*='exhibitor']"):
+            name = card.select_one("h1, h2, h3, h4, .name, strong")
+            website = card.select_one("a[href*='http']")
+
+            companies.append({
+                "name": name.get_text(strip=True) if name else "",
+                "website": website.get("href", "") if website else ""
+            })
+
+        print(f"Found {len(companies)} companies")
+        for c in companies[:3]:
+            print(c)
+
+      retro_example: |
+        import requests
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin, urlparse
+        import re
+        import json
+        from datetime import datetime
+
+        def retro_extract_exhibitors_bs4(expo_url: str, expo_name: str) -> list:
+            """
+            Extract daftar exhibitor dari halaman expo.
+            Menggunakan multiple selector strategies untuk robustness.
+            """
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9,id;q=0.8"
+            }
+
+            try:
+                resp = requests.get(expo_url, headers=headers, timeout=15)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                print(f"[BS4] Failed to fetch {expo_url}: {e}")
+                return []
+
+            soup = BeautifulSoup(resp.text, "lxml")
+            companies = []
+            seen_names = set()
+
+            # Strategy 1: Cari card/container dengan pola umum
+            container_selectors = [
+                ".exhibitor", ".vendor", ".participant", ".company",
+                "[class*='exhibitor']", "[class*='vendor']", "[class*='booth']",
+                "article", ".card", ".item"
+            ]
+
+            found_containers = []
+            for sel in container_selectors:
+                found = soup.select(sel)
+                if len(found) >= 3:  # Setidaknya 3 item untuk valid
+                    found_containers = found
+                    break
+
+            for container in found_containers:
+                # Ekstrak nama
+                name_el = container.select_one("h1,h2,h3,h4,h5,.name,.title,strong")
+                name = name_el.get_text(strip=True) if name_el else ""
+
+                if not name or name in seen_names:
+                    continue
+                seen_names.add(name)
+
+                # Ekstrak website
+                website = ""
+                for link in container.find_all("a", href=True):
+                    href = link["href"]
+                    if href.startswith("http") and urlparse(href).netloc != urlparse(expo_url).netloc:
+                        website = href
+                        break
+
+                # Ekstrak domain
+                domain = ""
+                if website:
+                    domain = urlparse(website).netloc.replace("www.", "")
+
+                # Ekstrak deskripsi
+                desc_el = container.select_one("p, .description, .desc, .summary")
+                description = desc_el.get_text(strip=True)[:300] if desc_el else ""
+
+                # Cari email jika ada
+                email = ""
+                text_content = container.get_text()
+                email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text_content)
+                if email_match:
+                    email = email_match.group()
+
+                companies.append({
+                    "expo_name": expo_name,
+                    "expo_url": expo_url,
+                    "company_name": name,
+                    "company_website": website,
+                    "company_domain": domain,
+                    "description": description,
+                    "email_found": email,
+                    "extracted_at": datetime.utcnow().isoformat()
+                })
+
+            print(f"[BS4] Extracted {len(companies)} companies from {expo_url}")
+            return companies
+
+        results = retro_extract_exhibitors_bs4(
+            "https://inacraft.or.id/exhibitors",
+            "INACRAFT 2025"
+        )
+        with open("staging/exhibitors_bs4.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+      expected_output: |
+        [BS4] Extracted 47 companies from https://inacraft.or.id/exhibitors
+
+        staging/exhibitors_bs4.json (contoh):
+        [
+          {
+            "expo_name": "INACRAFT 2025",
+            "company_name": "PT Karya Nusantara",
+            "company_website": "https://karyanusantara.co.id",
+            "company_domain": "karyanusantara.co.id",
+            "description": "Produsen kerajinan tangan berbahan bambu untuk pasar lokal dan ekspor",
+            "email_found": "info@karyanusantara.co.id",
+            "extracted_at": "2025-04-23T12:00:00"
+          }
+        ]
+
+    notes:
+      - "Selalu gunakan 'lxml' sebagai parser, bukan 'html.parser'. 10-30x lebih cepat."
+      - "select() menggunakan CSS selector, find()/find_all() menggunakan tag + attributes."
+      - "get_text(strip=True) menghilangkan whitespace berlebih secara otomatis."
+    pitfalls:
+      - "BS4 tidak bisa render JavaScript. Untuk SPA, fetch dulu dengan Playwright."
+      - "Selector yang terlalu spesifik akan gagal di website lain. Buat fallback chain."
+
+  - id: tldextract
+    name: "tldextract"
+    category: "HTML Parsing (utility)"
+    description: >
+      Ekstrak domain, subdomain, TLD dari URL dengan akurat menggunakan
+      Public Suffix List (PSL). Jauh lebih akurat dari parsing URL manual.
+    specific_function: >
+      Parse domain company dari URL yang di-crawl. Normalisasi dan
+      deduplication domain. Menghindari kesalahan parsing TLD kompleks
+      seperti .co.id, .com.au, .co.uk.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/john-kurkowski/tldextract"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Domain normalizer. Setiap URL yang ditemukan perlu dinormalisasi
+        menjadi domain canonical (tanpa subdomain, tanpa path) untuk
+        deduplication yang akurat di Redis.
+      when_to_use: >
+        Gunakan di setiap titik di pipeline RETRO ketika menerima URL
+        dan perlu mengekstrak domain clean-nya. Wajib digunakan sebelum
+        operasi deduplication di Redis.
+      priority: "primary (utility)"
+      output_goes_to: "Digunakan sebagai utility function di seluruh pipeline"
+
+    setup:
+      install: "pip install tldextract"
+      requirements:
+        - "Python 3.5+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import tldextract
+
+        urls = [
+            "https://www.pt-abc.co.id/products/iot",
+            "https://subdomain.company.com/about",
+            "https://gov.kemenperin.go.id/page",
+            "http://simple-site.net",
+        ]
+
+        for url in urls:
+            ext = tldextract.extract(url)
+            domain = f"{ext.domain}.{ext.suffix}"
+            print(f"{url}")
+            print(f"  subdomain: {ext.subdomain}")
+            print(f"  domain:    {ext.domain}")
+            print(f"  suffix:    {ext.suffix}")
+            print(f"  canonical: {domain}")
+
+      retro_example: |
+        import tldextract
+        import hashlib
+        from typing import Optional
+
+        def normalize_domain(url: str) -> Optional[str]:
+            """
+            Normalisasi URL menjadi domain canonical untuk RETRO.
+            Return None jika URL tidak valid.
+            """
+            if not url or not url.startswith("http"):
+                return None
+
+            ext = tldextract.extract(url)
+            if not ext.domain or not ext.suffix:
+                return None
+
+            # Canonical domain tanpa subdomain (kecuali www sudah di-strip)
+            return f"{ext.domain}.{ext.suffix}".lower()
+
+        def get_domain_hash(url: str) -> Optional[str]:
+            """
+            Generate hash untuk domain, digunakan sebagai Redis key dedup.
+            """
+            domain = normalize_domain(url)
+            if not domain:
+                return None
+            return hashlib.md5(domain.encode()).hexdigest()
+
+        # Contoh dengan edge cases
+        test_urls = [
+            "https://www.pt-maju.co.id/products/iot-gateway",
+            "https://blog.pt-maju.co.id/article/123",  # subdomain berbeda, domain sama
+            "https://PT-MAJU.CO.ID",                   # uppercase
+            "http://pt-maju.co.id",                    # http vs https
+            "not-a-url",                               # invalid
+            "https://gov.go.id/portal",                # government domain
+        ]
+
+        for url in test_urls:
+            domain = normalize_domain(url)
+            h = get_domain_hash(url)
+            print(f"Input:  {url}")
+            print(f"Domain: {domain}")
+            print(f"Hash:   {h}")
+            print("---")
+
+      expected_output: |
+        Input:  https://www.pt-maju.co.id/products/iot-gateway
+        Domain: pt-maju.co.id
+        Hash:   a1b2c3d4...
+
+        Input:  https://blog.pt-maju.co.id/article/123
+        Domain: pt-maju.co.id           <- SAMA dengan yang atas (terdeteksi sebagai domain sama)
+        Hash:   a1b2c3d4...             <- Hash IDENTIK, akan di-skip sebagai duplikat
+
+        Input:  https://PT-MAJU.CO.ID
+        Domain: pt-maju.co.id           <- lowercase otomatis
+        Hash:   a1b2c3d4...
+
+        Input:  not-a-url
+        Domain: None
+        Hash:   None
+
+    notes:
+      - "tldextract menggunakan Public Suffix List untuk handle .co.id, .go.id, .or.id dengan benar."
+      - "Update PSL dengan: tldextract.update() jika ada TLD baru yang tidak dikenali."
+      - "Subdomain dan domain utama akan menghasilkan domain canonical yang SAMA. Ini behavior yang benar untuk dedup."
+    pitfalls:
+      - "tldextract perlu network access pada pertama kali untuk download PSL. Cache otomatis setelahnya."
+      - "IP address bukan domain. tldextract akan return empty string untuk IP."
+
+  - id: httpx
+    name: "httpx"
+    category: "HTTP Client & Proxy"
+    description: >
+      HTTP client async modern untuk Python. Drop-in replacement requests
+      dengan async support. Connection pooling, timeout, redirect handling
+      bawaan. Jauh lebih efisien dari requests untuk concurrent crawling.
+    specific_function: >
+      HTTP request async untuk crawling paralel. Connection pooling,
+      timeout management, redirect handling otomatis. HTTP/2 support.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2025"
+    url: "https://github.com/encode/httpx"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        HTTP client utama untuk semua request yang tidak butuh browser.
+        Digunakan untuk fetch halaman HTML, download PDF, dan call API
+        news sources. Lebih efisien dari requests karena async.
+      when_to_use: >
+        Gunakan httpx untuk semua HTTP request di pipeline RETRO yang
+        tidak butuh JavaScript rendering. Untuk JavaScript-heavy sites,
+        gunakan Playwright. Untuk API calls, gunakan httpx async.
+      priority: "primary"
+      output_goes_to: "Digunakan sebagai HTTP client di seluruh pipeline"
+
+    setup:
+      install: "pip install httpx"
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import httpx
+        import asyncio
+
+        # Sync (sama seperti requests)
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            resp = client.get("https://example.com")
+            print(resp.status_code)
+            print(resp.text[:200])
+
+        # Async (lebih efisien untuk concurrent)
+        async def fetch_many(urls: list) -> list:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                tasks = [client.get(url) for url in urls]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                return [
+                    {"url": url, "status": r.status_code, "text": r.text[:100]}
+                    for url, r in zip(urls, responses)
+                    if isinstance(r, httpx.Response)
+                ]
+
+        results = asyncio.run(fetch_many(["https://site1.com", "https://site2.com"]))
+
+      retro_example: |
+        import httpx
+        import asyncio
+        from urllib.parse import urljoin
+        import json
+        from datetime import datetime
+        import hashlib
+
+        HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8"
+        }
+
+        async def retro_fetch_url(
+            client: httpx.AsyncClient,
+            url: str,
+            semaphore: asyncio.Semaphore
+        ) -> dict:
+            """
+            Fetch satu URL dengan rate limiting via semaphore.
+            Return: dict dengan status dan konten.
+            """
+            async with semaphore:
+                try:
+                    resp = await client.get(url, headers=HEADERS)
+                    content_type = resp.headers.get("content-type", "")
+                    is_pdf = "pdf" in content_type or url.lower().endswith(".pdf")
+
+                    return {
+                        "url": url,
+                        "status_code": resp.status_code,
+                        "content_type": content_type,
+                        "is_pdf": is_pdf,
+                        "content_length": len(resp.content),
+                        "html": resp.text if not is_pdf else None,
+                        "binary": resp.content if is_pdf else None,
+                        "final_url": str(resp.url),  # URL setelah redirect
+                        "fetched_at": datetime.utcnow().isoformat(),
+                        "error": None
+                    }
+                except httpx.TimeoutException:
+                    return {"url": url, "error": "timeout", "status_code": None}
+                except httpx.RequestError as e:
+                    return {"url": url, "error": str(e), "status_code": None}
+
+        async def retro_batch_fetch(urls: list, max_concurrent: int = 10) -> list:
+            """
+            Fetch banyak URL secara concurrent dengan rate limiting.
+            """
+            semaphore = asyncio.Semaphore(max_concurrent)
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=5.0),
+                follow_redirects=True,
+                verify=False  # Beberapa site Indo punya SSL issues
+            ) as client:
+                tasks = [retro_fetch_url(client, url, semaphore) for url in urls]
+                results = await asyncio.gather(*tasks)
+
+            success = sum(1 for r in results if r.get("status_code") == 200)
+            print(f"[httpx] Fetched: {success}/{len(urls)} successful")
+            return list(results)
+
+        # Contoh: fetch semua halaman yang ditemukan dari crawl expo
+        urls = [
+            "https://company1.co.id",
+            "https://company2.com",
+            "https://company3.co.id/catalog.pdf"
+        ]
+
+        results = asyncio.run(retro_batch_fetch(urls))
+        for r in results:
+            if r["is_pdf"]:
+                with open(f"staging/pdfs/{hashlib.md5(r['url'].encode()).hexdigest()}.pdf", "wb") as f:
+                    f.write(r["binary"])
+                print(f"PDF saved: {r['url']}")
+            else:
+                print(f"HTML fetched: {r['url']} ({r['content_length']} bytes)")
+
+      expected_output: |
+        [httpx] Fetched: 3/3 successful
+        HTML fetched: https://company1.co.id (42847 bytes)
+        HTML fetched: https://company2.com (18293 bytes)
+        PDF saved: https://company3.co.id/catalog.pdf
+
+    notes:
+      - "verify=False untuk bypass SSL certificate errors yang umum di domain .co.id."
+      - "httpx.Timeout memungkinkan set timeout berbeda untuk connect vs read."
+      - "follow_redirects=True penting karena banyak domain yang redirect HTTP ke HTTPS."
+      - "AsyncClient lebih efisien dari Client karena bisa reuse connection pool."
+    pitfalls:
+      - "Jangan share satu AsyncClient instance antar event loop yang berbeda."
+      - "verify=False menghilangkan SSL validation. Gunakan hanya dalam pipeline internal, bukan production user-facing."
+      - "max_concurrent terlalu tinggi bisa blacklist IP. Mulai dari 5, naikkan jika aman."
+
+  - id: fake_useragent
+    name: "fake-useragent"
+    category: "HTTP Client & Proxy"
+    description: >
+      Library untuk randomisasi User-Agent string. Hindari blocking
+      berbasis UA dengan rotate user agent secara otomatis.
+    specific_function: >
+      Rotate user agent header otomatis agar terlihat seperti browser
+      asli. Database user agent selalu up-to-date dari browser terbaru.
+    language: "Python"
+    pricing: "Gratis & open source"
+    last_updated: "2024"
+    url: "https://github.com/fake-useragent/fake-useragent"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Anti-detection utility. Digunakan bersama httpx atau requests
+        untuk menghindari blocking berbasis User-Agent detection.
+      when_to_use: >
+        Gunakan ketika domain target memblokir request berdasarkan
+        User-Agent yang tidak dikenal. Rotate UA di setiap request
+        atau setiap N request untuk terlihat lebih natural.
+      priority: "secondary (anti-detection)"
+      output_goes_to: "Digunakan sebagai utility di HTTP client layer"
+
+    setup:
+      install: "pip install fake-useragent"
+      requirements:
+        - "Python 3.7+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from fake_useragent import UserAgent
+        import requests
+
+        ua = UserAgent()
+
+        # Random UA setiap request
+        headers = {"User-Agent": ua.random}
+        resp = requests.get("https://example.com", headers=headers)
+
+        # UA spesifik browser
+        print(ua.chrome)   # Chrome UA terbaru
+        print(ua.firefox)  # Firefox UA
+        print(ua.safari)   # Safari UA
+
+      retro_example: |
+        from fake_useragent import UserAgent
+        import httpx
+        import asyncio
+        import random
+
+        ua = UserAgent()
+
+        def get_rotating_headers() -> dict:
+            """
+            Generate headers yang terlihat seperti browser asli.
+            Rotate UA setiap kali dipanggil.
+            """
+            return {
+                "User-Agent": ua.random,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
+            }
+
+        async def retro_fetch_with_rotation(url: str) -> dict:
+            headers = get_rotating_headers()
+            async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
+                resp = await client.get(url, headers=headers, timeout=15)
+                return {
+                    "url": url,
+                    "status": resp.status_code,
+                    "ua_used": headers["User-Agent"],
+                    "content_length": len(resp.content)
+                }
+
+        result = asyncio.run(retro_fetch_with_rotation("https://expo-site.com"))
+        print(result)
+
+      expected_output: |
+        {
+          "url": "https://expo-site.com",
+          "status": 200,
+          "ua_used": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "content_length": 52847
+        }
+
+    notes:
+      - "fake-useragent otomatis update database UA dari browser terbaru."
+      - "Gunakan ua.chrome untuk terlihat seperti Chrome yang paling umum digunakan."
+      - "Jangan gunakan UA yang sama untuk semua request ke domain yang sama."
+    pitfalls:
+      - "Rotate UA saja tidak cukup untuk bypass Cloudflare atau anti-bot canggih. Gunakan curl-impersonate."
+      - "Beberapa website mendeteksi inkonsistensi antar header. Pastikan Accept-Language konsisten dengan UA."
+
+  - id: curl_impersonate
+    name: "curl-impersonate"
+    category: "HTTP Client & Proxy"
+    description: >
+      Tool untuk impersonate browser TLS fingerprint secara akurat.
+      Bypass bot detection yang mendeteksi perbedaan TLS fingerprint
+      antara browser asli dan HTTP client biasa.
+    specific_function: >
+      Bypass Cloudflare dan anti-bot yang mendeteksi TLS fingerprint
+      non-browser. Impersonate Chrome, Firefox, Edge secara akurat.
+    language: "C / Python binding"
+    pricing: "Gratis & open source"
+    last_updated: "2024"
+    url: "https://github.com/lwthiker/curl-impersonate"
+
+    retro:
+      phase: "Phase 1 - Discovery Engine"
+      role: >
+        Last-resort anti-bot bypass. Gunakan ketika semua metode crawling
+        lain gagal karena Cloudflare atau sistem anti-bot yang mendeteksi
+        TLS fingerprint.
+      when_to_use: >
+        Gunakan HANYA sebagai last resort ketika Crawl4AI, Playwright,
+        dan httpx dengan fake-useragent semuanya gagal dengan HTTP 403.
+        Sistem anti-bot canggih mendeteksi TLS fingerprint yang berbeda
+        dari browser asli, dan curl-impersonate adalah solusinya.
+      priority: "last-resort fallback"
+      output_goes_to: "raw_company_text table"
+
+    setup:
+      install: |
+        # Linux/Mac:
+        pip install curl-cffi  # Python binding yang lebih mudah
+
+        # Atau gunakan curl-cffi sebagai alternatif modern:
+        pip install curl-cffi
+      requirements:
+        - "Linux atau macOS (lebih mudah)"
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        # Gunakan curl-cffi sebagai Python binding (lebih mudah dari curl-impersonate langsung)
+        from curl_cffi import requests as curl_requests
+
+        # Impersonate Chrome
+        resp = curl_requests.get(
+            "https://cloudflare-protected-site.com",
+            impersonate="chrome124"
+        )
+        print(resp.status_code)
+        print(resp.text[:200])
+
+      retro_example: |
+        from curl_cffi import requests as curl_requests
+        from curl_cffi import CurlError
+        import json
+        from datetime import datetime
+
+        BROWSER_VERSIONS = ["chrome124", "chrome120", "firefox121", "safari17_0"]
+
+        def retro_bypass_crawl(url: str) -> dict:
+            """
+            Coba crawl URL dengan berbagai browser impersonation.
+            Digunakan sebagai absolute last resort.
+            """
+            for browser in BROWSER_VERSIONS:
+                try:
+                    resp = curl_requests.get(
+                        url,
+                        impersonate=browser,
+                        timeout=30,
+                        allow_redirects=True,
+                        headers={
+                            "Accept-Language": "en-US,en;q=0.9",
+                        }
+                    )
+
+                    if resp.status_code == 200 and len(resp.text) > 100:
+                        print(f"[curl-impersonate] Success with {browser}: {url}")
+                        return {
+                            "url": url,
+                            "status": resp.status_code,
+                            "html": resp.text,
+                            "method": f"curl-impersonate-{browser}",
+                            "crawled_at": datetime.utcnow().isoformat()
+                        }
+                    elif resp.status_code == 403:
+                        print(f"[curl-impersonate] 403 with {browser}, trying next...")
+                        continue
+                except CurlError as e:
+                    print(f"[curl-impersonate] Error with {browser}: {e}")
+                    continue
+
+            return {
+                "url": url,
+                "status": None,
+                "error": "All impersonation attempts failed",
+                "method": "curl-impersonate"
+            }
+
+        result = retro_bypass_crawl("https://cloudflare-site.com")
+        print(f"Status: {result['status']}")
+        print(f"Method: {result['method']}")
+
+      expected_output: |
+        [curl-impersonate] 403 with chrome124, trying next...
+        [curl-impersonate] Success with firefox121: https://cloudflare-site.com
+        Status: 200
+        Method: curl-impersonate-firefox121
+
+    notes:
+      - "curl-cffi adalah Python wrapper yang lebih mudah dari curl-impersonate binary langsung."
+      - "Gunakan sebagai last resort, bukan default. Crawl4AI sudah menangani sebagian besar anti-bot."
+      - "Browser version yang tersedia: chrome99-chrome124, firefox99-firefox121, safari15-safari17."
+    pitfalls:
+      - "Tidak semua anti-bot bisa di-bypass bahkan dengan TLS impersonation. CAPTCHA tetap perlu diselesaikan manual."
+      - "Hati-hati dengan legalitas crawling. Periksa ToS website sebelum menggunakan bypass tools."

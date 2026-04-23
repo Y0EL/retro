@@ -1,0 +1,1069 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: PDF Generation & Report Rendering
+# File: 10_pdf_generation.yaml
+# Purpose: Tools untuk menghasilkan proposal PDF profesional dari template HTML.
+#          RETRO menggunakan LLM hanya untuk generate TEXT proposal (body teks),
+#          kemudian formatter (WeasyPrint + Jinja2) yang mengubah teks menjadi PDF
+#          dengan layout profesional. LLM TIDAK menangani layout, font, warna, dll.
+#
+# ARCHITECTURE PATTERN (TOKEN-EFFICIENT):
+#   LLM -> teks proposal (JSON dengan sections) -> Jinja2 template -> HTML -> WeasyPrint -> PDF
+#
+# BENEFITS:
+#   - LLM hanya generate teks, tidak tahu tentang CSS/HTML (hemat token signifikan)
+#   - Layout konsisten di setiap proposal (tidak bergantung LLM untuk formatting)
+#   - Template bisa diupdate tanpa re-generate teks
+#   - PDF bisa di-customize per client tanpa LLM call tambahan
+#
+# RECOMMENDED STACK (RETRO):
+#   Primary:   WeasyPrint + Jinja2 (HTML-to-PDF, CSS support, header/footer)
+#   Template:  Jinja2 (Python native, mudah, powerful)
+#   Fallback:  ReportLab (direct PDF generation tanpa HTML, lebih complex)
+#   Dev/test:  Playwright PDF (Chrome-based, paling akurat tapi butuh browser)
+
+tools:
+
+  - id: weasyprint
+    name: "WeasyPrint"
+    category: "HTML-to-PDF Converter"
+    description: >
+      WeasyPrint adalah library Python yang mengkonversi HTML+CSS menjadi PDF dengan
+      dukungan CSS yang sangat baik: flexbox, grid, page-break control, running headers
+      dan footers, page numbers, SVG, dan web fonts. Berbasis Python murni (tidak
+      memerlukan Chrome atau wkhtmltopdf). Menggunakan CSS Paged Media specification
+      untuk control layout per halaman. Output berkualitas profesional. Cocok untuk
+      RETRO karena proposal bisa di-design menggunakan HTML+CSS standar yang sudah
+      dikenal semua web developer.
+    specific_function: >
+      Render HTML proposal template menjadi PDF yang siap dikirim ke potential partners.
+      Jinja2 mengisi template dengan data dari LLM (teks proposal) dan Company Profile
+      Card, kemudian WeasyPrint mengkonversi hasil HTML ke PDF yang branded dan
+      profesional. Header dengan logo RETRO, footer dengan page numbers, dan
+      typography yang konsisten setiap proposal.
+    language: "Python"
+    pricing: "Free (open-source, BSD)"
+    last_updated: "2025"
+    url: "https://weasyprint.org"
+    retro:
+      phase: "Phase 5 (Proposal Generation)"
+      role: >
+        PDF renderer untuk semua proposal RETRO. Menerima HTML yang dihasilkan Jinja2
+        dan mengkonversi ke PDF berkualitas profesional. Output PDF disimpan ke MinIO
+        proposals bucket dan di-attach ke email yang dikirim ke potential partners.
+      when_to_use: >
+        Gunakan WeasyPrint setiap kali Proposal Writer LLM selesai generate teks proposal.
+        Pipeline: LLM output (JSON sections) -> Jinja2 render -> HTML string -> WeasyPrint -> PDF bytes.
+        PDF bytes langsung di-upload ke MinIO tanpa disimpan ke disk.
+      priority: "primary (PDF generation)"
+      output_goes_to: "MinIO proposals bucket, Email Agent (attachment)"
+    setup:
+      install: |
+        pip install weasyprint
+        # Untuk sistem dependencies (Linux/WSL):
+        # sudo apt-get install libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+        # Untuk macOS:
+        # brew install pango
+        # Untuk Windows: WeasyPrint 61+ sudah bundled dengan binary dependencies
+      requirements:
+        - "weasyprint>=61.0"
+        - "Jinja2>=3.1.0"
+        - "System library: pango, fontconfig (auto-installed di Windows WeasyPrint 61+)"
+      env_vars:
+        - name: RETRO_LOGO_URL
+          description: "URL atau path ke logo RETRO untuk header proposal"
+        - name: PROPOSAL_TEMPLATE_DIR
+          description: "Path ke direktori templates Jinja2, default './templates'"
+    usage:
+      basic_example: |
+        from weasyprint import HTML, CSS
+        from weasyprint.text.fonts import FontConfiguration
+        import io
+
+        # Dari HTML string
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            @page { size: A4; margin: 2cm; }
+            body { font-family: 'Arial', sans-serif; font-size: 11pt; color: #333; }
+            h1 { color: #1a1a2e; border-bottom: 2px solid #e94560; }
+          </style>
+        </head>
+        <body>
+          <h1>Partnership Proposal</h1>
+          <p>Dear PT Sinar Logistik Team,</p>
+          <p>We are pleased to propose a strategic partnership...</p>
+        </body>
+        </html>
+        """
+
+        # Render ke file
+        HTML(string=html_content).write_pdf("/tmp/proposal.pdf")
+
+        # Render ke bytes (untuk upload ke MinIO tanpa disk)
+        pdf_bytes = HTML(string=html_content).write_pdf()
+        print(f"PDF size: {len(pdf_bytes):,} bytes")
+
+        # Dengan external CSS file
+        css = CSS(filename="proposal.css")
+        pdf_bytes = HTML(string=html_content).write_pdf(stylesheets=[css])
+
+      retro_example: |
+        from weasyprint import HTML, CSS
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+        import os
+        import io
+        from datetime import date
+
+        TEMPLATE_DIR = os.getenv("PROPOSAL_TEMPLATE_DIR", "./templates")
+        RETRO_BRAND  = {
+            "company_name": "RETRO Intelligence Platform",
+            "tagline":      "Autonomous B2B Partnership Intelligence",
+            "logo_url":     os.getenv("RETRO_LOGO_URL", ""),
+            "website":      "https://retro.id",
+            "email":        "partnership@retro.id",
+            "phone":        "+62-21-XXXX-XXXX",
+            "address":      "Jakarta, Indonesia",
+        }
+
+        # Setup Jinja2 environment
+        _jinja_env = None
+        def get_jinja():
+            global _jinja_env
+            if _jinja_env is None:
+                _jinja_env = Environment(
+                    loader=FileSystemLoader(TEMPLATE_DIR),
+                    autoescape=select_autoescape(["html", "xml"]),
+                )
+            return _jinja_env
+
+        def render_proposal_html(
+            profile_card:       dict,
+            proposal_sections:  dict,
+            proposal_number:    str,
+        ) -> str:
+            """
+            Render Jinja2 template menjadi HTML string.
+
+            proposal_sections: dict dari LLM output dengan keys:
+                - executive_summary: teks opening paragraph
+                - about_retro: deskripsi singkat RETRO
+                - collaboration_opportunity: mengapa kolaborasi ini menarik
+                - proposed_collaboration: detail apa yang diusulkan
+                - value_proposition: manfaat bagi partner
+                - next_steps: action items
+                - closing: closing paragraph
+            """
+            env = get_jinja()
+            template = env.get_template("proposal.html.j2")
+
+            html = template.render(
+                # Branding
+                retro=RETRO_BRAND,
+
+                # Target company
+                company=profile_card,
+
+                # Proposal content dari LLM
+                proposal=proposal_sections,
+
+                # Metadata
+                proposal_number=proposal_number,
+                date_str=date.today().strftime("%d %B %Y"),
+                expo_name=profile_card.get("expo", "Business Expo 2025"),
+            )
+            return html
+
+        def generate_proposal_pdf(
+            profile_card:       dict,
+            proposal_sections:  dict,
+            proposal_number:    str,
+        ) -> bytes:
+            """
+            Full pipeline: proposal data -> HTML -> PDF bytes.
+            Return: PDF as bytes (untuk langsung upload ke MinIO).
+            """
+            html_content = render_proposal_html(
+                profile_card=profile_card,
+                proposal_sections=proposal_sections,
+                proposal_number=proposal_number,
+            )
+
+            # WeasyPrint: HTML string -> PDF bytes
+            pdf_bytes = HTML(
+                string=html_content,
+                base_url=TEMPLATE_DIR,  # Untuk resolving relative CSS/image paths
+            ).write_pdf(
+                uncompressed_pdf=False,  # Compress PDF
+                optimize_images=True,
+            )
+
+            print(f"[WeasyPrint] Generated PDF: {len(pdf_bytes):,} bytes ({len(pdf_bytes)/1024:.1f} KB)")
+            return pdf_bytes
+
+        def generate_and_upload_proposal(
+            profile_card:      dict,
+            proposal_sections: dict,
+            expo_name:         str,
+        ) -> str:
+            """End-to-end: generate PDF dan upload ke MinIO. Return MinIO object key."""
+            from retro.storage.minio_client import upload_proposal_bytes
+
+            proposal_number = f"RETRO-{date.today().strftime('%Y%m')}-{profile_card['domain'][:6].upper()}"
+            pdf_bytes = generate_proposal_pdf(profile_card, proposal_sections, proposal_number)
+
+            object_key = upload_proposal_bytes(pdf_bytes, profile_card["domain"], expo_name)
+            print(f"[Proposal] Uploaded: {object_key}")
+            return object_key
+
+      expected_output: |
+        [WeasyPrint] Generated PDF: 284,672 bytes (278.0 KB)
+        [Proposal] Uploaded: LogiSEA_2025/sinarlogistik.co.id/proposal.pdf
+
+        # PDF berisi:
+        # - Header: Logo RETRO + nama perusahaan + proposal number
+        # - Page 1: Cover page dengan nama partner, tanggal, expo
+        # - Page 2-4: Isi proposal (executive summary, collaboration opportunity, dll)
+        # - Page 5: Next steps dan CTA
+        # - Footer setiap halaman: "Confidential | RETRO Intelligence Platform | Halaman X dari Y"
+
+    notes:
+      - "base_url=TEMPLATE_DIR penting untuk WeasyPrint bisa resolve relative path ke CSS dan image files di template"
+      - "optimize_images=True mengkompresi gambar di PDF, mengurangi file size signifikan"
+      - "@page CSS rule mengontrol ukuran kertas (A4), margin, dan running headers/footers"
+      - "WeasyPrint 61+ di Windows sudah bundled binary dependencies (pango, dll), tidak perlu install manual"
+      - "Untuk header/footer dengan page numbers: gunakan CSS Paged Media @page dan position: running(header)"
+      - "Web fonts (Google Fonts) bisa digunakan di WeasyPrint jika online, atau sertakan font files lokal di template"
+    pitfalls:
+      - "WeasyPrint versi < 61 di Windows sering crash karena library dependency masalah, upgrade ke >= 61"
+      - "JANGAN load external images dari URL di WeasyPrint jika environment tidak ada internet, embed sebagai base64"
+      - "CSS flexbox dan grid didukung tapi tidak 100% identik dengan Chrome, test render sebelum production"
+      - "PDF generation bisa lambat untuk template dengan banyak CSS kompleks (> 5 detik untuk 10 halaman)"
+
+  - id: jinja2
+    name: "Jinja2"
+    category: "Template Engine"
+    description: >
+      Jinja2 adalah template engine Python yang sangat powerful. Memungkinkan membuat
+      HTML template dengan variabel, loop, kondisi, dan inheritance (extends). RETRO
+      menggunakan Jinja2 untuk proposal HTML templates: satu base template dengan
+      branding RETRO, dan specific templates untuk berbagai industri (logistics,
+      manufacturing, technology). Template dapat di-customize per expo tanpa mengubah
+      kode Python. Autoescape mencegah XSS injection dari data perusahaan yang
+      mengandung HTML characters.
+    specific_function: >
+      HTML template rendering untuk proposal RETRO. Jinja2 mengisi template dengan:
+      company profile data, teks proposal dari LLM, branding RETRO, dan metadata
+      seperti tanggal dan proposal number. Output HTML kemudian di-render ke PDF
+      oleh WeasyPrint.
+    language: "Python"
+    pricing: "Free (open-source, BSD)"
+    last_updated: "2025"
+    url: "https://jinja.palletsprojects.com"
+    retro:
+      phase: "Phase 5 (Proposal Template Rendering)"
+      role: >
+        Template engine antara LLM output dan WeasyPrint. LLM menghasilkan teks
+        proposal sebagai JSON dict, Jinja2 menyusun teks tersebut ke dalam template
+        HTML yang terstruktur dan branded, kemudian WeasyPrint mengkonversi ke PDF.
+      when_to_use: >
+        Gunakan Jinja2 untuk semua HTML generation di RETRO: proposal, email body,
+        dan laporan internal. Jangan generate HTML manual dengan string concatenation.
+      priority: "primary (template rendering)"
+      output_goes_to: "WeasyPrint (HTML -> PDF)"
+    setup:
+      install: "pip install Jinja2"
+      requirements:
+        - "Jinja2>=3.1.0"
+        - "MarkupSafe>=2.1.0 (dependency Jinja2, auto-installed)"
+      env_vars:
+        - name: PROPOSAL_TEMPLATE_DIR
+          description: "Path ke direktori template, default './templates'"
+    usage:
+      basic_example: |
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+        env = Environment(
+            loader=FileSystemLoader("./templates"),
+            autoescape=select_autoescape(["html", "xml"]),  # Proteksi XSS
+        )
+
+        # Contoh template: templates/proposal.html.j2
+        # <h1>Dear {{ company.company_name }} Team,</h1>
+        # {% if proposal.executive_summary %}
+        # <p>{{ proposal.executive_summary }}</p>
+        # {% endif %}
+        # {% for item in proposal.next_steps %}
+        # <li>{{ item }}</li>
+        # {% endfor %}
+
+        template = env.get_template("proposal.html.j2")
+        html = template.render(
+            company={"company_name": "PT Sinar Logistik", "industry": "Logistics"},
+            proposal={"executive_summary": "We are pleased to propose..."},
+            date_str="23 April 2025",
+        )
+        print(html)
+
+      retro_example: |
+        # File: templates/proposal.html.j2
+        PROPOSAL_TEMPLATE_CONTENT = '''
+        <!DOCTYPE html>
+        <html lang="id">
+        <head>
+          <meta charset="UTF-8">
+          <style>
+            @page {
+              size: A4;
+              margin: 2.5cm 2cm;
+              @top-center {
+                content: "{{ retro.company_name }} | CONFIDENTIAL";
+                font-size: 8pt;
+                color: #888;
+              }
+              @bottom-right {
+                content: "Halaman " counter(page) " dari " counter(pages);
+                font-size: 8pt;
+                color: #888;
+              }
+            }
+            body { font-family: Arial, sans-serif; font-size: 11pt; line-height: 1.6; color: #333; }
+            .cover { text-align: center; padding-top: 5cm; page-break-after: always; }
+            .cover h1 { font-size: 24pt; color: #1a1a2e; margin-bottom: 0.5cm; }
+            .cover .subtitle { font-size: 14pt; color: #666; }
+            .section { margin-bottom: 1.5cm; }
+            .section h2 { color: #1a1a2e; border-left: 4px solid #e94560; padding-left: 0.5cm; font-size: 14pt; }
+            .highlight-box { background: #f0f7ff; border: 1px solid #bdd7f5; padding: 0.5cm; border-radius: 4px; }
+            .next-steps ol { padding-left: 1.5cm; }
+            .next-steps li { margin-bottom: 0.3cm; }
+            .footer-contact { border-top: 2px solid #e94560; padding-top: 1cm; margin-top: 2cm; }
+          </style>
+        </head>
+        <body>
+
+        <!-- COVER PAGE -->
+        <div class="cover">
+          {% if retro.logo_url %}<img src="{{ retro.logo_url }}" alt="RETRO" style="height: 60px; margin-bottom: 1cm;"><br>{% endif %}
+          <h1>Partnership Proposal</h1>
+          <div class="subtitle">
+            For: <strong>{{ company.company_name }}</strong><br>
+            Re: {{ expo_name }}<br>
+            Date: {{ date_str }}<br>
+            Proposal No: {{ proposal_number }}
+          </div>
+        </div>
+
+        <!-- EXECUTIVE SUMMARY -->
+        <div class="section">
+          <h2>Executive Summary</h2>
+          <p>{{ proposal.executive_summary }}</p>
+        </div>
+
+        <!-- ABOUT RETRO -->
+        <div class="section">
+          <h2>About RETRO Intelligence Platform</h2>
+          <p>{{ proposal.about_retro }}</p>
+        </div>
+
+        <!-- ABOUT TARGET COMPANY -->
+        <div class="section">
+          <h2>About {{ company.company_name }}</h2>
+          <div class="highlight-box">
+            <strong>Industry:</strong> {{ company.industry }}<br>
+            <strong>Products/Services:</strong> {{ company.products_services }}<br>
+            <strong>Value Proposition:</strong> {{ company.value_proposition }}
+          </div>
+        </div>
+
+        <!-- COLLABORATION OPPORTUNITY -->
+        <div class="section">
+          <h2>Collaboration Opportunity</h2>
+          <p>{{ proposal.collaboration_opportunity }}</p>
+        </div>
+
+        <!-- PROPOSED COLLABORATION -->
+        <div class="section">
+          <h2>Proposed Collaboration</h2>
+          <p>{{ proposal.proposed_collaboration }}</p>
+        </div>
+
+        <!-- VALUE PROPOSITION -->
+        <div class="section">
+          <h2>Value Proposition for {{ company.company_name }}</h2>
+          <p>{{ proposal.value_for_partner }}</p>
+        </div>
+
+        <!-- NEXT STEPS -->
+        <div class="section next-steps">
+          <h2>Next Steps</h2>
+          <ol>
+            {% for step in proposal.next_steps %}
+            <li>{{ step }}</li>
+            {% endfor %}
+          </ol>
+        </div>
+
+        <!-- CLOSING -->
+        <div class="section">
+          <p>{{ proposal.closing }}</p>
+        </div>
+
+        <!-- CONTACT -->
+        <div class="footer-contact">
+          <strong>{{ retro.company_name }}</strong><br>
+          {{ retro.address }}<br>
+          Email: {{ retro.email }} | Web: {{ retro.website }}
+        </div>
+
+        </body>
+        </html>
+        '''
+
+        # Simpan template ke file
+        import os
+        os.makedirs("./templates", exist_ok=True)
+        with open("./templates/proposal.html.j2", "w") as f:
+            f.write(PROPOSAL_TEMPLATE_CONTENT)
+
+        # Render dengan data
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+        env = Environment(
+            loader=FileSystemLoader("./templates"),
+            autoescape=select_autoescape(["html", "xml"]),
+        )
+        template = env.get_template("proposal.html.j2")
+
+        llm_proposal_output = {
+            "executive_summary":        "We at RETRO Intelligence Platform are delighted to propose...",
+            "about_retro":              "RETRO is an autonomous B2B intelligence platform...",
+            "collaboration_opportunity": "Having met at LogiSEA 2025, we recognized an exceptional...",
+            "proposed_collaboration":   "We propose a three-phase collaboration starting with...",
+            "value_for_partner":        "By partnering with RETRO, PT Sinar Logistik will benefit...",
+            "next_steps":               ["Schedule an introductory call within 2 weeks", "Share technical documentation", "Begin 30-day pilot program"],
+            "closing":                  "We look forward to the possibility of collaboration...",
+        }
+
+        company_profile = {
+            "company_name":    "PT Sinar Logistik Nusantara",
+            "industry":        "Logistics & Supply Chain",
+            "products_services": "Route optimization SaaS, fleet management",
+            "value_proposition": "Reduces last-mile delivery costs by 35%",
+        }
+
+        html = template.render(
+            retro={
+                "company_name": "RETRO Intelligence Platform",
+                "logo_url":     "",
+                "website":      "https://retro.id",
+                "email":        "partnership@retro.id",
+                "address":      "Jakarta, Indonesia",
+            },
+            company=company_profile,
+            proposal=llm_proposal_output,
+            proposal_number="RETRO-202504-SINAR",
+            date_str="23 April 2025",
+            expo_name="LogiSEA 2025",
+        )
+        print(f"[Jinja2] HTML rendered: {len(html):,} chars")
+
+      expected_output: |
+        [Jinja2] HTML rendered: 8,432 chars
+        # HTML berisi complete proposal document siap di-render WeasyPrint
+        # Template menggunakan @page CSS untuk header/footer per halaman
+
+    notes:
+      - "autoescape=select_autoescape(['html', 'xml']) penting untuk prevent XSS jika data perusahaan mengandung < > & characters"
+      - "Gunakan Jinja2 template inheritance (extends) untuk share base template antara berbagai jenis proposal"
+      - "{{ variable | default('N/A') }} Jinja2 filter untuk handle None values dengan graceful fallback"
+      - "Simpan templates di folder terpisah dari kode (./templates/) untuk mudah diedit tanpa ubah Python"
+      - "Jinja2 Filter custom bisa ditambahkan: env.filters['format_currency'] = lambda v: f'Rp {v:,}'"
+    pitfalls:
+      - "JANGAN gunakan {{ variable | safe }} kecuali benar-benar yakin teks aman, bisa bypass autoescape"
+      - "JANGAN hardcode data branding di template, gunakan context variables yang di-inject saat render"
+      - "Template file harus di-reload jika ada perubahan, gunakan auto_reload=True di development"
+
+  - id: playwright_pdf
+    name: "Playwright (PDF via Chromium)"
+    category: "Browser-based PDF Generator"
+    description: >
+      Playwright adalah browser automation library yang juga bisa digunakan untuk
+      generate PDF menggunakan Chromium headless. Menghasilkan PDF yang paling akurat
+      secara visual (identik dengan Chrome print preview) karena menggunakan actual
+      Chrome rendering engine. Mendukung JavaScript execution, sehingga template
+      dengan React atau Vue bisa di-render sebelum print. Lebih berat dari WeasyPrint
+      (butuh Chromium binary ~150MB) tapi menghasilkan output paling akurat.
+    specific_function: >
+      Alternative PDF generator menggunakan Chromium. Digunakan sebagai fallback
+      jika WeasyPrint menghasilkan layout yang tidak sesuai untuk proposal dengan
+      CSS yang kompleks (gradients, advanced layout). Juga berguna jika template
+      proposal menggunakan JavaScript (React/Vue components).
+    language: "Python (playwright)"
+    pricing: "Free (open-source, Microsoft)"
+    last_updated: "2025"
+    url: "https://playwright.dev/python"
+    retro:
+      phase: "Phase 5 (Proposal PDF) - Fallback untuk complex templates"
+      role: >
+        Fallback PDF generator ketika WeasyPrint tidak bisa render template dengan
+        benar. Chromium-based rendering memberikan hasil yang 100% identik dengan
+        Chrome print output.
+      when_to_use: >
+        Gunakan Playwright PDF hanya jika WeasyPrint menghasilkan layout yang salah
+        atau template menggunakan JavaScript. WeasyPrint lebih ringan dan lebih cepat,
+        Playwright lebih akurat tapi lebih resource-intensive.
+      priority: "fallback (complex template)"
+      output_goes_to: "MinIO proposals bucket"
+    setup:
+      install: |
+        pip install playwright
+        playwright install chromium  # Download Chromium (~150MB)
+      requirements:
+        - "playwright>=1.40.0"
+        - "Chromium binary (via playwright install chromium)"
+      env_vars: []
+    usage:
+      basic_example: |
+        from playwright.sync_api import sync_playwright
+
+        def html_to_pdf_playwright(html_content: str) -> bytes:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page    = browser.new_page()
+                page.set_content(html_content, wait_until="networkidle")
+                pdf_bytes = page.pdf(
+                    format="A4",
+                    margin={"top": "2.5cm", "bottom": "2.5cm", "left": "2cm", "right": "2cm"},
+                    print_background=True,  # Print background colors
+                )
+                browser.close()
+            return pdf_bytes
+
+        # Test
+        html = "<html><body><h1>Test PDF</h1><p>Hello World</p></body></html>"
+        pdf  = html_to_pdf_playwright(html)
+        print(f"PDF size: {len(pdf):,} bytes")
+
+      retro_example: |
+        from playwright.async_api import async_playwright
+        import asyncio
+
+        async def generate_proposal_pdf_chromium(html_content: str) -> bytes:
+            """
+            Async Playwright PDF generation. Digunakan ketika WeasyPrint gagal.
+            """
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"],  # Untuk Docker
+                )
+                context = await browser.new_context()
+                page    = await context.new_page()
+
+                await page.set_content(html_content, wait_until="networkidle")
+
+                # Inject custom CSS untuk @page jika perlu
+                await page.add_style_tag(content="""
+                    @page { size: A4; }
+                """)
+
+                pdf_bytes = await page.pdf(
+                    format="A4",
+                    margin={
+                        "top":    "25mm",
+                        "bottom": "25mm",
+                        "left":   "20mm",
+                        "right":  "20mm",
+                    },
+                    print_background=True,
+                    display_header_footer=True,
+                    header_template='<div style="font-size:8px; text-align:center; width:100%;">RETRO Intelligence Platform | CONFIDENTIAL</div>',
+                    footer_template='<div style="font-size:8px; text-align:right; width:100%; padding-right:20mm;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>',
+                )
+
+                await browser.close()
+            return pdf_bytes
+
+        def generate_pdf_with_fallback(html_content: str) -> bytes:
+            """
+            Try WeasyPrint first, fallback ke Playwright jika gagal.
+            """
+            try:
+                from weasyprint import HTML
+                pdf_bytes = HTML(string=html_content).write_pdf()
+                print("[PDF] Generated via WeasyPrint")
+                return pdf_bytes
+            except Exception as e:
+                print(f"[PDF] WeasyPrint failed ({e}), falling back to Playwright")
+                return asyncio.run(generate_proposal_pdf_chromium(html_content))
+
+      expected_output: |
+        [PDF] Generated via Playwright Chromium
+        PDF size: 312,450 bytes (305.1 KB)
+        # Output identik dengan Chrome print-to-PDF hasil
+
+    notes:
+      - "headless=True penting untuk server environment tanpa display"
+      - "args=['--no-sandbox'] diperlukan jika berjalan di Docker container sebagai root"
+      - "wait_until='networkidle' menunggu sampai semua resources (CSS, fonts) terload"
+      - "print_background=True memastikan background colors dan images ikut di-print"
+      - "Playwright PDF jauh lebih akurat dari WeasyPrint untuk CSS modern (gradients, complex flex)"
+    pitfalls:
+      - "Chromium binary ~150MB, perlu didownload sekali: playwright install chromium"
+      - "Playwright lebih lambat dari WeasyPrint (~5-10 detik vs ~1-3 detik per PDF)"
+      - "Di Docker, butuh extra packages: chromium-browser dan libglib2.0-0, atau gunakan image playwright/python"
+
+  - id: reportlab
+    name: "ReportLab"
+    category: "Direct PDF Generation"
+    description: >
+      ReportLab adalah library Python untuk generate PDF secara langsung (tanpa HTML).
+      Mendefinisikan layout PDF secara programmatic: posisi teks, gambar, tabel, dan
+      grafik langsung dalam Python code. Tidak memerlukan template HTML atau browser.
+      Lebih verbose dari WeasyPrint tapi lebih predictable dan tidak ada rendering
+      surprises. ReportLab Platypus (component dalam reportlab) menyediakan higher-level
+      abstraction: Paragraph, Table, Spacer, PageBreak.
+    specific_function: >
+      Direct PDF generation sebagai alternatif WeasyPrint untuk perusahaan yang
+      tidak familiar dengan HTML/CSS atau yang butuh PDF dengan elemen programmatic
+      (charts, dynamic tables dari data). Lebih cocok untuk laporan analytics RETRO
+      daripada proposal yang butuh custom branding.
+    language: "Python"
+    pricing: "Free (open-source, BSD)"
+    last_updated: "2025"
+    url: "https://www.reportlab.com"
+    retro:
+      phase: "Phase 5 atau Reporting (laporan analytics)"
+      role: >
+        Alternative PDF generator untuk laporan analytics RETRO (bukan proposal).
+        Cocok untuk: laporan summary per expo, statistik pipeline run, atau laporan
+        internal yang berisi tabel data banyak.
+      when_to_use: >
+        Gunakan ReportLab untuk laporan data-heavy (tabel perusahaan, statistik,
+        charts). Untuk proposal yang butuh custom branding HTML, tetap gunakan WeasyPrint.
+      priority: "secondary (reports/analytics)"
+      output_goes_to: "Laporan PDF untuk internal atau director RETRO"
+    setup:
+      install: "pip install reportlab"
+      requirements:
+        - "reportlab>=4.0.0"
+        - "Pillow (untuk embed images): pip install Pillow"
+      env_vars: []
+    usage:
+      basic_example: |
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+        from reportlab.lib import colors
+        import io
+
+        def generate_simple_pdf(title: str, data: list[list]) -> bytes:
+            buf    = io.BytesIO()
+            doc    = SimpleDocTemplate(buf, pagesize=A4,
+                                       rightMargin=2*cm, leftMargin=2*cm,
+                                       topMargin=2*cm, bottomMargin=2*cm)
+            styles = getSampleStyleSheet()
+            story  = []
+
+            # Judul
+            story.append(Paragraph(title, styles["Title"]))
+            story.append(Spacer(1, 0.5*cm))
+
+            # Tabel
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
+                ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID",       (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ]))
+            story.append(table)
+
+            doc.build(story)
+            return buf.getvalue()
+
+        # Contoh: generate laporan company list
+        data = [
+            ["Company Name", "Industry", "Potential", "Email"],
+            ["PT Sinar Logistik", "Logistics", "High", "budi@sinar.co.id"],
+            ["Global SCM Tech", "Technology", "Medium", "info@globalscm.io"],
+        ]
+        pdf_bytes = generate_simple_pdf("RETRO Candidate List - LogiSEA 2025", data)
+        print(f"PDF: {len(pdf_bytes):,} bytes")
+
+      retro_example: |
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Table, TableStyle,
+            Spacer, HRFlowable, PageBreak,
+        )
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT
+        import io
+        from datetime import date
+
+        def generate_expo_report(expo_name: str, profiles: list[dict]) -> bytes:
+            """
+            Generate laporan summary expo untuk director RETRO.
+            Berisi tabel semua perusahaan, statistik, dan top candidates.
+            """
+            buf  = io.BytesIO()
+            doc  = SimpleDocTemplate(buf, pagesize=A4,
+                                     leftMargin=2*cm, rightMargin=2*cm,
+                                     topMargin=2.5*cm, bottomMargin=2*cm)
+            styles = getSampleStyleSheet()
+            story  = []
+
+            # Header
+            story.append(Paragraph(f"RETRO Intelligence Platform", styles["Title"]))
+            story.append(Paragraph(f"Expo Intelligence Report: {expo_name}", styles["Heading2"]))
+            story.append(Paragraph(f"Generated: {date.today().strftime('%d %B %Y')}", styles["Normal"]))
+            story.append(HRFlowable(width="100%", thickness=1, color=colors.red))
+            story.append(Spacer(1, 0.5*cm))
+
+            # Stats
+            high    = sum(1 for p in profiles if p.get("collaboration_potential") == "high")
+            medium  = sum(1 for p in profiles if p.get("collaboration_potential") == "medium")
+            story.append(Paragraph("Summary Statistics", styles["Heading3"]))
+            stats_data = [
+                ["Metric", "Value"],
+                ["Total Companies Profiled", str(len(profiles))],
+                ["High Potential",           str(high)],
+                ["Medium Potential",         str(medium)],
+                ["Low Potential",            str(len(profiles) - high - medium)],
+            ]
+            stats_table = Table(stats_data, colWidths=[10*cm, 5*cm])
+            stats_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.navy),
+                ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID",       (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.lightblue]),
+            ]))
+            story.append(stats_table)
+            story.append(Spacer(1, 1*cm))
+
+            # Top candidates
+            story.append(Paragraph("Top Candidates (High Potential)", styles["Heading3"]))
+            top = [p for p in profiles if p.get("collaboration_potential") == "high"][:10]
+            if top:
+                rows = [["Company", "Industry", "Domain", "Email"]]
+                for p in top:
+                    rows.append([
+                        p.get("company_name", "")[:30],
+                        p.get("industry", "")[:20],
+                        p.get("domain", ""),
+                        p.get("contact_email", "N/A"),
+                    ])
+                t = Table(rows, colWidths=[6*cm, 4*cm, 4*cm, 4*cm])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.darkgreen),
+                    ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE",   (0, 0), (-1, -1), 8),
+                    ("GRID",       (0, 0), (-1, -1), 0.25, colors.grey),
+                ]))
+                story.append(t)
+
+            doc.build(story)
+            return buf.getvalue()
+
+      expected_output: |
+        [ReportLab] RETRO Expo Report generated
+        PDF size: 184,320 bytes (180 KB)
+        Pages: 4
+        # Berisi: header, stats table, top candidates table
+
+    notes:
+      - "io.BytesIO() sebagai buffer untuk generate PDF ke memory tanpa write ke disk"
+      - "TableStyle koordinat: (col_start, row_start) sampai (col_end, row_end). (-1, -1) = last col, last row"
+      - "ROWBACKGROUNDS membuat zebra striping alternating colors pada rows"
+      - "A4 dalam ReportLab: 595.27 x 841.89 points. 1 cm = 28.35 points"
+    pitfalls:
+      - "ReportLab tidak support CSS, layout harus dikontrol programmatic (lebih verbose dari HTML)"
+      - "Teks panjang di Table cell bisa overflow jika colWidth terlalu kecil, gunakan Paragraph di dalam Cell"
+      - "Image embed memerlukan Pillow: from reportlab.platypus import Image"
+
+  - id: fpdf2
+    name: "FPDF2"
+    category: "Lightweight PDF Generator"
+    description: >
+      FPDF2 adalah library Python untuk generate PDF secara langsung, sangat ringan
+      dan simple. Fork dari PHP FPDF yang sangat popular. Tidak ada dependencies
+      external. Cocok untuk generate PDF sederhana dengan teks dan basic formatting.
+      Kurang powerful dari ReportLab untuk complex layouts tapi jauh lebih simple
+      untuk use case basic.
+    specific_function: >
+      Quick PDF generation untuk use case simple: receipt konfirmasi email terkirim,
+      simple summary notes, atau internal memo. Untuk proposal profesional, gunakan
+      WeasyPrint.
+    language: "Python"
+    pricing: "Free (open-source, LGPL)"
+    last_updated: "2025"
+    url: "https://py-pdf.github.io/fpdf2"
+    retro:
+      phase: "Phase 5 (Simple PDFs) - Utility"
+      role: "Quick PDF generation untuk simple documents seperti konfirmasi atau internal notes"
+      when_to_use: >
+        Gunakan hanya untuk simple PDFs tanpa perlu complex layout. Untuk proposal
+        formal, tetap gunakan WeasyPrint. FPDF2 berguna untuk draft preview cepat.
+      priority: "optional (simple documents)"
+      output_goes_to: "Internal documents"
+    setup:
+      install: "pip install fpdf2"
+      requirements:
+        - "fpdf2>=2.7.0"
+      env_vars: []
+    usage:
+      basic_example: |
+        from fpdf import FPDF
+        import io
+
+        class ProposalPDF(FPDF):
+            def header(self):
+                self.set_font("Helvetica", "B", 10)
+                self.cell(0, 10, "RETRO Intelligence Platform | CONFIDENTIAL", align="C")
+                self.ln(5)
+
+            def footer(self):
+                self.set_y(-15)
+                self.set_font("Helvetica", "I", 8)
+                self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
+
+        pdf = ProposalPDF()
+        pdf.alias_nb_pages()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Partnership Proposal", ln=True, align="C")
+        pdf.ln(5)
+        pdf.set_font("Helvetica", size=11)
+        pdf.multi_cell(0, 8, "Dear PT Sinar Logistik Team,\n\nWe are pleased to propose...")
+
+        # Output ke bytes
+        pdf_bytes = bytes(pdf.output())
+        print(f"PDF: {len(pdf_bytes):,} bytes")
+
+      retro_example: |
+        from fpdf import FPDF
+        import io
+
+        def generate_quick_summary(companies: list[dict], expo: str) -> bytes:
+            """Quick summary PDF untuk director preview (bukan final proposal)."""
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.cell(0, 10, f"RETRO Quick Summary: {expo}", ln=True)
+            pdf.set_font("Helvetica", size=9)
+            pdf.ln(3)
+
+            for company in companies[:20]:
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.cell(0, 6, company.get("company_name", ""), ln=True)
+                pdf.set_font("Helvetica", size=8)
+                pdf.cell(0, 5, f"  Domain: {company.get('domain', '')} | Industry: {company.get('industry', '')}", ln=True)
+                pdf.cell(0, 5, f"  Potential: {company.get('collaboration_potential', '')} | Email: {company.get('contact_email', 'N/A')}", ln=True)
+                pdf.ln(2)
+
+            return bytes(pdf.output())
+
+      expected_output: |
+        PDF: 24,576 bytes (24 KB)
+        # Simple list of companies, 2 pages
+
+    notes:
+      - "FPDF2 tidak mendukung CSS, hanya basic text formatting via set_font(), set_text_color(), dll"
+      - "multi_cell() untuk teks yang perlu word-wrap. cell() untuk satu baris fixed"
+      - "pdf.output() return bytearray, wrap dengan bytes() untuk compatibility"
+    pitfalls:
+      - "FPDF2 tidak support RTL languages dan complex Unicode dengan baik, gunakan WeasyPrint untuk Bahasa Indonesia dengan karakter khusus"
+
+  - id: mako
+    name: "Mako (Template Engine)"
+    category: "Template Engine Alternative"
+    description: >
+      Mako adalah template engine Python yang mirip Jinja2 tapi dengan pendekatan
+      berbeda: memungkinkan Python code langsung di dalam template (bukan hanya
+      template language). Lebih powerful dari Jinja2 untuk complex templates tapi
+      kurang safe (bisa execute arbitrary Python). Digunakan di Pyramid framework
+      dan SQLAlchemy alembic untuk migration templates.
+    specific_function: >
+      Alternative template engine jika Jinja2 tidak cukup expressif. Misalnya
+      untuk proposal template yang butuh complex Python logic di dalam template itu sendiri.
+      Untuk sebagian besar use case RETRO, Jinja2 lebih disarankan.
+    language: "Python"
+    pricing: "Free (open-source, MIT)"
+    last_updated: "2025"
+    url: "https://www.makotemplates.org"
+    retro:
+      phase: "Phase 5 (Template rendering) - Optional alternative"
+      role: "Alternative Jinja2 untuk complex template logic"
+      when_to_use: >
+        Pertimbangkan Mako hanya jika template membutuhkan Python logic kompleks
+        yang tidak bisa dilakukan dengan Jinja2 filters dan tests. Untuk sebagian
+        besar proposal RETRO, Jinja2 sudah lebih dari cukup.
+      priority: "optional"
+      output_goes_to: "HTML untuk WeasyPrint"
+    setup:
+      install: "pip install Mako"
+      requirements:
+        - "Mako>=1.3.0"
+      env_vars: []
+    usage:
+      basic_example: |
+        from mako.template import Template
+        from mako.lookup import TemplateLookup
+
+        # Template dengan Python code langsung
+        template = Template("""
+        <h1>Partnership Proposal</h1>
+        <p>Dear ${company_name} Team,</p>
+        <%
+          score = len(keywords) * 10
+          level = "high" if score > 50 else "medium"
+        %>
+        <p>Collaboration potential score: ${score} (${level})</p>
+        % for keyword in keywords:
+          <span class="tag">${keyword}</span>
+        % endfor
+        """)
+
+        html = template.render(
+            company_name="PT Sinar Logistik",
+            keywords=["logistics", "supply chain", "Indonesia"],
+        )
+        print(html)
+
+      retro_example: |
+        # Untuk RETRO, penggunaan Mako sama dengan Jinja2 tapi dengan sintaks berbeda:
+        # Jinja2: {{ variable }}, {% if %}, {% for %}
+        # Mako:   ${variable}, % if ...:, % for ...: / % endfor
+
+        from mako.lookup import TemplateLookup
+        import os
+
+        lookup = TemplateLookup(
+            directories=["./templates"],
+            output_encoding="utf-8",
+            input_encoding="utf-8",
+        )
+
+        def render_mako_template(template_name: str, **context) -> str:
+            tmpl = lookup.get_template(template_name)
+            return tmpl.render(**context).decode("utf-8")
+
+      expected_output: |
+        <h1>Partnership Proposal</h1>
+        <p>Dear PT Sinar Logistik Team,</p>
+        <p>Collaboration potential score: 30 (medium)</p>
+        <span class="tag">logistics</span>
+        <span class="tag">supply chain</span>
+        <span class="tag">Indonesia</span>
+
+    notes:
+      - "Mako memungkinkan <%...%> blocks dengan Python code langsung, jauh lebih powerful dari Jinja2"
+      - "TemplateLookup dengan directories memungkinkan template inheritance mirip Jinja2"
+      - "Mako tidak auto-escape HTML, sangat hati-hati dengan user input"
+    pitfalls:
+      - "JANGAN gunakan Mako untuk templates yang mengandung user-generated content tanpa escaping manual"
+      - "Python code di template (${ } dan <% %>) bisa execute arbitrary code jika template bisa di-edit user"
+
+  - id: xhtml2pdf
+    name: "xhtml2pdf"
+    category: "HTML-to-PDF Converter (Lightweight)"
+    description: >
+      xhtml2pdf adalah library Python untuk konversi HTML ke PDF yang lebih ringan
+      dari WeasyPrint. Menggunakan ReportLab di balik layar untuk generate PDF.
+      Dukungan CSS terbatas (tidak support CSS Grid, Flexbox modern). Cocok untuk
+      template HTML simple yang tidak memerlukan CSS modern. Sudah ada sejak lama
+      dan stable, tapi kurang aktif dikembangkan dibanding WeasyPrint.
+    specific_function: >
+      Lightweight alternative WeasyPrint untuk template HTML sederhana. Jika server
+      tidak bisa install WeasyPrint dependencies (pango), xhtml2pdf menjadi fallback.
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2023"
+    url: "https://xhtml2pdf.com"
+    retro:
+      phase: "Phase 5 (PDF) - Lightweight fallback"
+      role: "Lightweight fallback jika WeasyPrint tidak bisa diinstall"
+      when_to_use: >
+        Hanya sebagai fallback jika WeasyPrint tidak bisa berjalan di environment
+        target (server sangat minimal tanpa pango). Untuk fitur dan kualitas terbaik,
+        gunakan WeasyPrint.
+      priority: "optional (minimal environment fallback)"
+      output_goes_to: "PDF bytes"
+    setup:
+      install: "pip install xhtml2pdf"
+      requirements:
+        - "xhtml2pdf>=0.2.11"
+        - "Pillow>=9.0.0"
+      env_vars: []
+    usage:
+      basic_example: |
+        from xhtml2pdf import pisa
+        import io
+
+        def html_to_pdf_xhtml2pdf(html_content: str) -> bytes:
+            buf = io.BytesIO()
+            pisa_status = pisa.CreatePDF(
+                src=html_content.encode("utf-8"),
+                dest=buf,
+            )
+            if pisa_status.err:
+                raise RuntimeError(f"PDF generation error: {pisa_status.err}")
+            return buf.getvalue()
+
+        html = """
+        <html><body>
+          <h1>Partnership Proposal</h1>
+          <p>Dear PT Sinar Logistik Team,</p>
+        </body></html>
+        """
+        pdf = html_to_pdf_xhtml2pdf(html)
+        print(f"PDF: {len(pdf):,} bytes")
+
+      retro_example: |
+        from xhtml2pdf import pisa
+        import io
+
+        def generate_pdf_fallback(html_content: str) -> bytes:
+            """
+            Fallback PDF generator menggunakan xhtml2pdf.
+            Dipanggil jika WeasyPrint tidak tersedia.
+            """
+            buf = io.BytesIO()
+            pisa.CreatePDF(html_content.encode("utf-8"), dest=buf)
+            return buf.getvalue()
+
+        def render_pdf_with_best_available(html_content: str) -> bytes:
+            """Try WeasyPrint -> Playwright -> xhtml2pdf."""
+            try:
+                from weasyprint import HTML
+                return HTML(string=html_content).write_pdf()
+            except ImportError:
+                pass
+            try:
+                from retro.pdf.playwright_pdf import generate_proposal_pdf_chromium
+                import asyncio
+                return asyncio.run(generate_proposal_pdf_chromium(html_content))
+            except ImportError:
+                pass
+            return generate_pdf_fallback(html_content)
+
+      expected_output: |
+        PDF: 48,120 bytes (47 KB)
+        # Simpler layout, CSS terbatas, tapi functional
+
+    notes:
+      - "xhtml2pdf tidak mendukung CSS modern (flexbox, grid, CSS variables), gunakan CSS sederhana"
+      - "Pillow diperlukan untuk embed images"
+      - "xhtml2pdf kurang diupdate, test dengan versi Python terbaru sebelum gunakan"
+    pitfalls:
+      - "JANGAN gunakan xhtml2pdf untuk proposal yang butuh layout professional, hasilnya kurang baik"
+      - "CSS yang bekerja di WeasyPrint mungkin tidak bekerja di xhtml2pdf karena CSS support terbatas"

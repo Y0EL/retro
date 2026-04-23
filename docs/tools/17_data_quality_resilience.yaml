@@ -1,0 +1,1150 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Data Quality, Resilience & Utility
+# File: 17_data_quality_resilience.yaml
+# Purpose: Tools untuk memastikan pipeline RETRO berjalan robust di production.
+#          Pipeline harian yang crawl ratusan company butuh:
+#          - Retry otomatis untuk network failures (tenacity)
+#          - Validasi data sebelum masuk DB (pandera)
+#          - Proses data besar dengan cepat (polars)
+#          - Deduplication nama company yang berbeda tapi sama (rapidfuzz)
+#          - Bersihkan teks dari noise (ftfy, clean-text)
+#          - Parse domain dari URL yang berantakan (tldextract)
+#          - Validasi nomor telepon internasional (phonenumbers)
+#
+# PRINSIP: "Garbage In, Garbage Out"
+#   Data kotor yang masuk LLM = profile company yang salah = proposal yang tidak relevan.
+#   Data quality layer ini berjalan SEBELUM LLM call, bukan sesudah.
+
+tools:
+
+  - id: tenacity
+    name: "tenacity"
+    category: "Retry & Resilience"
+    description: >
+      tenacity adalah Python library untuk retry dengan decorator syntax yang bersih.
+      Mendukung: exponential backoff, jitter, stop conditions (max attempts, max time),
+      retry pada exception spesifik, callback saat setiap retry, dan async support.
+      Practically wajib untuk semua HTTP calls ke API eksternal di production pipeline.
+      Tanpa retry, pipeline harian RETRO akan gagal karena network blip, rate limit
+      sementara, atau timeout sesekali dari API provider.
+    specific_function: >
+      Wrap semua external API calls di RETRO: crawler HTTP requests, Hunter.io API,
+      Apollo.io API, LLM calls (jika LiteLLM tidak handle sendiri), Shodan, dll.
+      Exponential backoff memastikan tidak spam API yang sedang overloaded.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/jd/tenacity"
+
+    retro:
+      phase: "Semua phase yang melibatkan external network calls"
+      role: >
+        Resilience layer untuk semua network operations. Crawler yang gagal karena
+        timeout di-retry otomatis. Email discovery API yang hit rate limit di-retry
+        setelah delay. Pipeline tidak berhenti karena satu request gagal.
+      when_to_use: >
+        Gunakan tenacity untuk SETIAP HTTP call ke external service:
+        - Crawling halaman company
+        - Semua email discovery API (Hunter, Snov, Apollo)
+        - OSINT API (Shodan, Censys, Crunchbase)
+        - LLM API calls (opsional, LiteLLM sudah punya retry)
+        - MinIO/S3 operations
+        Tidak perlu untuk operasi lokal (DB queries, file operations).
+      priority: "primary — wajib di semua external calls production"
+      output_goes_to: "Tidak ada output langsung, tapi mencegah pipeline crash"
+
+    setup:
+      install: |
+        pip install tenacity
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from tenacity import (
+            retry, stop_after_attempt, wait_exponential,
+            retry_if_exception_type, before_sleep_log
+        )
+        import httpx
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=30),
+            retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+            before_sleep=before_sleep_log(logger, logging.WARNING)
+        )
+        def fetch_company_page(url: str) -> str:
+            """Fetch halaman company dengan auto-retry 3x, backoff 2s -> 4s -> 8s."""
+            response = httpx.get(url, timeout=15)
+            response.raise_for_status()
+            return response.text
+
+        # Dipanggil sama seperti function biasa
+        content = fetch_company_page("https://example.com")
+
+      retro_example: |
+        from tenacity import (
+            retry, stop_after_attempt, stop_after_delay,
+            wait_exponential, wait_random_exponential,
+            retry_if_exception_type, retry_if_result,
+            before_sleep_log, after_log
+        )
+        import httpx
+        import logging
+        import time
+        from typing import Optional
+
+        logger = logging.getLogger(__name__)
+
+        # ===== 1. Untuk web crawling =====
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_random_exponential(multiplier=1, max=10),  # Random jitter anti-pattern detection
+            retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException, ConnectionError)),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+        )
+        async def crawl_company_website(url: str, client: httpx.AsyncClient) -> str:
+            """Async crawl dengan retry dan random jitter."""
+            response = await client.get(url, timeout=20, follow_redirects=True)
+            if response.status_code == 429:
+                # Rate limited — raise agar tenacity retry
+                raise httpx.HTTPError(f"Rate limited by {url}")
+            response.raise_for_status()
+            return response.text
+
+        # ===== 2. Untuk email discovery API =====
+        @retry(
+            stop=stop_after_attempt(4),
+            wait=wait_exponential(multiplier=2, min=5, max=60),  # Lebih agresif untuk rate limit
+            retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TimeoutException)),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            after=after_log(logger, logging.INFO),
+        )
+        def hunter_domain_search(domain: str, api_key: str) -> Optional[dict]:
+            """Hunter.io API call dengan retry untuk rate limit."""
+            response = httpx.get(
+                "https://api.hunter.io/v2/domain-search",
+                params={"domain": domain, "api_key": api_key},
+                timeout=30
+            )
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError(
+                    "Hunter rate limit",
+                    request=response.request,
+                    response=response
+                )
+            if response.status_code == 404:
+                return None  # Domain tidak ditemukan — tidak perlu retry
+            response.raise_for_status()
+            return response.json()
+
+        # ===== 3. Untuk LLM calls (backup dari LiteLLM retry) =====
+        def is_rate_limit_error(exception) -> bool:
+            """Cek apakah error adalah rate limit (layak di-retry)."""
+            error_msg = str(exception).lower()
+            return any(kw in error_msg for kw in ["rate limit", "429", "quota", "overloaded"])
+
+        @retry(
+            stop=stop_after_delay(120),  # Max 2 menit total
+            wait=wait_exponential(multiplier=1, min=5, max=60),
+            retry=retry_if_exception_type(Exception),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True  # Re-raise exception setelah semua retry habis
+        )
+        def call_llm_with_retry(prompt: str, model: str) -> str:
+            """LLM call dengan retry — backup jika LiteLLM retry tidak cover semua cases."""
+            import litellm
+            response = litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=60
+            )
+            return response.choices[0].message.content
+
+        # ===== 4. Custom retry callback untuk logging =====
+        def log_retry_attempt(retry_state):
+            logger.warning(
+                f"Retry attempt {retry_state.attempt_number} untuk {retry_state.fn.__name__} "
+                f"setelah {retry_state.outcome.exception()}"
+            )
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(min=1, max=10),
+            before_sleep=log_retry_attempt
+        )
+        def apollo_people_search(company_name: str, api_key: str) -> list:
+            """Apollo.io contact search dengan retry."""
+            response = httpx.post(
+                "https://api.apollo.io/api/v1/people/search",
+                headers={"x-api-key": api_key},
+                json={"organization_name": company_name, "per_page": 5},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("people", [])
+
+      expected_output: |
+        # Jika request gagal, tenacity otomatis log:
+        # WARNING: Retrying crawl_company_website (attempt 1/3) after exception: HTTPError
+        # WARNING: Retrying crawl_company_website (attempt 2/3) after exception: HTTPError
+        # INFO: crawl_company_website succeeded after 3 attempts
+
+        # Jika semua retry habis, tenacity raise RetryError:
+        # tenacity.RetryError: RetryError[...]
+
+    notes: >
+      wait_random_exponential lebih baik dari wait_exponential untuk crawling karena
+      random jitter mencegah "thundering herd" — banyak worker retry pada waktu bersamaan.
+      stop_after_delay vs stop_after_attempt: gunakan stop_after_delay untuk operations
+      dengan deadline, stop_after_attempt untuk API calls dengan quota terbatas.
+      reraise=True penting agar exception asli bisa di-catch di layer atas.
+
+    pitfalls:
+      - issue: "Semua exception di-retry, termasuk yang tidak perlu (404, auth error)"
+        fix: "Spesifik exception types: retry_if_exception_type((httpx.TimeoutException, httpx.HTTPError)). Atau gunakan retry_if_exception(lambda e: '429' in str(e))"
+      - issue: "Retry tidak bekerja di async function"
+        fix: "Gunakan @retry decorator yang sama — tenacity mendukung async function secara native."
+      - issue: "Pipeline stuck terlalu lama menunggu retry"
+        fix: "Tambahkan stop_after_delay(60) untuk cap total waktu. Kombinasikan: stop=(stop_after_attempt(3) | stop_after_delay(60))"
+
+  - id: pandera
+    name: "pandera"
+    category: "DataFrame Validation"
+    description: >
+      pandera adalah library Python untuk validasi schema DataFrame (pandas, polars).
+      Definisikan schema dengan Column types, constraints, dan custom checks.
+      Jalankan schema.validate(df) sebelum data masuk PostgreSQL.
+      Jika ada data yang tidak valid (email format salah, domain kosong, nama terlalu pendek),
+      pandera raise SchemaError dengan detail baris dan kolom yang bermasalah.
+    specific_function: >
+      Gatekeeper data sebelum INSERT ke PostgreSQL dan sebelum proses oleh LLM.
+      Data crawl mentah sering mengandung noise: company name "N/A", domain "http://",
+      email "@.com", telepon "-". pandera menangkap semua ini sebelum meracuni DB.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/unionai-oss/pandera"
+
+    retro:
+      phase: "Phase 1 dan Phase 2 — setelah crawling, sebelum DB insert"
+      role: >
+        Data validation gate di pipeline RETRO. Setiap batch data crawl divalidasi
+        sebelum masuk raw_staging table. Data yang tidak lolos validasi di-log ke
+        error table untuk review manual, bukan dibuang begitu saja.
+      when_to_use: >
+        Gunakan pandera di setiap pipeline stage yang menerima data external:
+        1. Setelah web crawl -> validate company staging data
+        2. Setelah PDF parse -> validate extracted company info
+        3. Setelah API enrichment (Hunter, Apollo) -> validate contact data
+        Tidak perlu untuk data internal yang sudah divalidasi sebelumnya.
+      priority: "medium-high (wajib untuk production data quality)"
+      output_goes_to: "Valid data ke PostgreSQL, invalid data ke error_log table"
+
+    setup:
+      install: |
+        pip install pandera
+        # Untuk integrasi polars (opsional):
+        pip install pandera[polars]
+      requirements:
+        - "Python 3.8+"
+        - "pandas atau polars"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import pandera as pa
+        from pandera import Column, DataFrameSchema, Check
+        import pandas as pd
+
+        # Definisikan schema untuk data staging company
+        staging_schema = DataFrameSchema({
+            "company_name": Column(str, [
+                Check.str_length(min_value=2, max_value=200),
+                Check(lambda s: ~s.str.startswith("N/A"), element_wise=False)
+            ]),
+            "domain": Column(str, nullable=True, checks=[
+                Check(lambda s: s.str.contains(r'\.').fillna(True),
+                      error="Domain harus mengandung titik")
+            ]),
+            "email": Column(str, nullable=True, checks=[
+                Check(lambda s: s.str.contains('@').fillna(True),
+                      error="Email harus mengandung @")
+            ]),
+            "industry": Column(str, nullable=True),
+            "source_url": Column(str, checks=Check.str_startswith("http")),
+        })
+
+        df = pd.DataFrame({
+            "company_name": ["PT Maju Jaya", "N/A", "AB"],
+            "domain": ["majujaya.co.id", None, "invalid"],
+            "email": ["info@mj.co.id", None, "@bad"],
+            "industry": ["konstruksi", None, "teknologi"],
+            "source_url": ["https://expo.com/a", "https://expo.com/b", "https://expo.com/c"],
+        })
+
+        try:
+            validated = staging_schema.validate(df, lazy=True)  # lazy=True collect semua error sekaligus
+        except pa.errors.SchemaErrors as e:
+            print(e.failure_cases)  # DataFrame berisi baris dan kolom yang bermasalah
+
+      retro_example: |
+        import pandera as pa
+        from pandera import Column, DataFrameSchema, Check, DataFrameModel
+        from pandera.typing import Series, Optional as PaOptional
+        import pandas as pd
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Approach 2: Class-based schema (lebih readable untuk complex schemas)
+        class CompanyStagingSchema(DataFrameModel):
+            company_name: Series[str] = pa.Field(
+                str_length={"min_value": 2, "max_value": 200},
+                description="Nama perusahaan minimal 2 karakter"
+            )
+            domain: PaOptional[Series[str]] = pa.Field(
+                nullable=True,
+                str_contains=r'\.',
+                description="Domain harus mengandung titik jika ada"
+            )
+            email: PaOptional[Series[str]] = pa.Field(
+                nullable=True,
+                str_contains='@',
+                description="Format email harus ada @"
+            )
+            industry: PaOptional[Series[str]] = pa.Field(nullable=True)
+            source_url: Series[str] = pa.Field(str_startswith="http")
+            is_processed: Series[bool] = pa.Field(default=False)
+
+            class Config:
+                coerce = True  # Auto-convert types jika memungkinkan (e.g., "True" -> True)
+                drop_invalid_rows = False
+
+        def validate_and_split_staging_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+            """
+            Validasi dataframe crawling data.
+            Return: (valid_df, invalid_df)
+            valid_df -> masuk PostgreSQL
+            invalid_df -> log ke error table
+            """
+            try:
+                # Validasi semua error sekaligus (lazy=True)
+                valid_df = CompanyStagingSchema.validate(df, lazy=True)
+                logger.info(f"Validasi berhasil: {len(valid_df)} rows valid")
+                return valid_df, pd.DataFrame()
+
+            except pa.errors.SchemaErrors as exc:
+                # Extract baris yang bermasalah
+                failure_cases = exc.failure_cases
+
+                # Index dari baris yang invalid
+                invalid_indices = set(failure_cases["index"].dropna().astype(int).tolist())
+                valid_indices = [i for i in df.index if i not in invalid_indices]
+
+                valid_df = df.loc[valid_indices].copy()
+                invalid_df = df.loc[list(invalid_indices)].copy()
+                invalid_df["validation_errors"] = invalid_df.index.map(
+                    lambda i: failure_cases[failure_cases["index"] == i]["failure_case"].tolist()
+                )
+
+                logger.warning(
+                    f"Validasi selesai: {len(valid_df)} valid, {len(invalid_df)} invalid",
+                    extra={"invalid_count": len(invalid_df)}
+                )
+
+                if not invalid_df.empty:
+                    logger.warning(f"Invalid rows:\n{failure_cases.to_string()}")
+
+                return valid_df, invalid_df
+
+        # Di RETRO crawling pipeline:
+        def process_crawl_batch(raw_data: list[dict]) -> int:
+            """
+            Proses batch crawling data: validate -> insert valid ke DB.
+            Return: jumlah row yang berhasil diinsert.
+            """
+            df = pd.DataFrame(raw_data)
+
+            # Normalize sebelum validasi
+            df["company_name"] = df["company_name"].str.strip()
+            df["domain"] = df.get("domain", pd.Series(dtype=str)).str.lower().str.strip()
+            df["email"] = df.get("email", pd.Series(dtype=str)).str.lower().str.strip()
+            df["is_processed"] = False
+
+            valid_df, invalid_df = validate_and_split_staging_data(df)
+
+            if not invalid_df.empty:
+                # Simpan invalid ke error log
+                for _, row in invalid_df.iterrows():
+                    logger.error(f"Invalid data: {row.to_dict()}")
+
+            # Insert valid data ke PostgreSQL
+            if not valid_df.empty:
+                from retro.db import get_engine
+                valid_df.to_sql("raw_staging", get_engine(), if_exists="append", index=False)
+
+            return len(valid_df)
+
+      expected_output: |
+        # Jika ada data invalid:
+        # WARNING: Validasi selesai: 47 valid, 3 invalid
+        # SchemaErrors.failure_cases:
+        # | schema_context | column | failure_case | index |
+        # | Column         | company_name | N/A      | 5     |
+        # | Column         | email        | @bad.com  | 12    |
+        # | Column         | domain       | invalid   | 23    |
+
+    notes: >
+      pandera lazy=True penting untuk collect semua validation errors sekaligus,
+      bukan stop di error pertama. Ini memberikan visibility lengkap tentang
+      kualitas data setiap batch crawl. Simpan failure_cases ke separate table
+      di PostgreSQL untuk monitoring data quality trend over time.
+
+    pitfalls:
+      - issue: "pandera terlalu strict, banyak data valid yang di-reject"
+        fix: "Mulai dengan schema longgar (nullable=True, coerce=True), ketatkan bertahap berdasarkan real data. Jangan schema terlalu idealis di awal."
+      - issue: "Schema validation lambat untuk DataFrame besar"
+        fix: "Sample validation: validate df.sample(min(1000, len(df))) dulu. Jika sample valid, asumsi full df valid."
+      - issue: "Check custom yang complex lambat"
+        fix: "Gunakan vectorized pandas operations di Check, bukan element_wise=True yang lebih lambat."
+
+  - id: polars
+    name: "polars"
+    category: "High-Performance DataFrame Processing"
+    description: >
+      Polars adalah DataFrame library Python yang ditulis dalam Rust. 10-100x lebih
+      cepat dari pandas untuk operasi besar. Mendukung lazy evaluation (query optimizer
+      memilih execution plan terbaik), parallel execution multi-core out-of-the-box,
+      dan streaming mode untuk dataset yang tidak muat di memory.
+      Polars menggunakan Apache Arrow sebagai in-memory format.
+    specific_function: >
+      Proses batch company data besar setelah crawling multi-expo. Sorting, filtering,
+      deduplication, dan aggregasi ribuan company record dalam hitungan detik.
+      Sangat berguna untuk: dedup by domain, group by industry, join antara staging
+      dan profiles table, dan export ke format lain.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://pola.rs/"
+
+    retro:
+      phase: "Phase 1 dan Phase 2 — batch data processing"
+      role: >
+        High-speed data processing untuk batch crawl results. Ketika crawl satu expo
+        dengan 500 booth companies, polars bisa dedup, normalize, dan prepare data
+        dalam < 1 detik vs pandas yang butuh beberapa detik. Di scale besar (10+
+        expo, 5000+ companies), difference ini sangat signifikan.
+      when_to_use: >
+        Gunakan polars untuk:
+        1. Batch processing company data dari crawling (> 100 rows)
+        2. Join antara multiple data source (expo_a + expo_b + company_registry)
+        3. Aggregasi dan statistics (company per industry, coverage per expo)
+        4. Export data ke CSV, Parquet untuk archival
+        Pandas masih OK untuk < 100 rows atau untuk integrasi dengan tools yang hanya support pandas.
+      priority: "medium (significant performance gain untuk batch operations)"
+      output_goes_to: "Processed data ke PostgreSQL (via to_pandas() atau direct write)"
+
+    setup:
+      install: |
+        pip install polars
+        # Untuk semua optional dependencies (Excel, iceberg, cloud storage):
+        pip install polars[all]
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import polars as pl
+
+        # Load data crawl dari multiple expo
+        df = pl.DataFrame({
+            "company_name": ["PT Maju Jaya", "PT Maju Jaya", "ABC Corp", "XYZ Ltd", ""],
+            "domain": ["majujaya.co.id", "majujaya.co.id", "abc.com", "xyz.co.id", None],
+            "industry": ["konstruksi", "konstruksi", "teknologi", "logistik", None],
+            "source_expo": ["BuildTech 2024", "InfraTech 2024", "TechExpo 2024", "LogiTech 2024", "Unknown"],
+        })
+
+        # 1. Hapus company_name kosong
+        # 2. Dedup berdasarkan domain
+        # 3. Filter hanya yang punya domain
+        # 4. Normalkan domain ke lowercase
+        result = (
+            df
+            .filter(pl.col("company_name").str.len_chars() > 0)
+            .filter(pl.col("domain").is_not_null())
+            .with_columns(pl.col("domain").str.to_lowercase().alias("domain"))
+            .unique(subset=["domain"], keep="first")
+            .sort("company_name")
+        )
+        print(result)
+
+      retro_example: |
+        import polars as pl
+        from datetime import datetime
+        from typing import List
+        import os
+
+        def process_expo_crawl_batch(raw_companies: List[dict], expo_name: str) -> pl.DataFrame:
+            """
+            Proses batch company dari satu expo:
+            1. Load ke polars
+            2. Clean dan normalize
+            3. Dedup by domain
+            4. Add metadata
+            5. Return cleaned DataFrame
+            """
+            if not raw_companies:
+                return pl.DataFrame()
+
+            df = pl.DataFrame(raw_companies, infer_schema_length=1000)
+
+            # Ensure required columns exist
+            for col in ["company_name", "domain", "email", "industry"]:
+                if col not in df.columns:
+                    df = df.with_columns(pl.lit(None).alias(col))
+
+            cleaned = (
+                df
+                # Normalize string columns
+                .with_columns([
+                    pl.col("company_name").str.strip_chars().alias("company_name"),
+                    pl.col("domain").str.to_lowercase().str.strip_chars()
+                                .str.replace(r'^https?://', '').str.replace(r'/.*$', '')
+                                .alias("domain"),
+                    pl.col("email").str.to_lowercase().str.strip_chars().alias("email"),
+                    pl.col("industry").str.to_lowercase().str.strip_chars().alias("industry"),
+                ])
+                # Filter noise
+                .filter(pl.col("company_name").str.len_chars() >= 2)
+                .filter(~pl.col("company_name").is_in(["N/A", "n/a", "-", "."]))
+                # Filter company tanpa domain (email discovery akan gagal)
+                .filter(pl.col("domain").is_not_null() & pl.col("domain").str.contains(r'\.'))
+                # Validate email format
+                .with_columns(
+                    pl.when(
+                        pl.col("email").is_not_null() & pl.col("email").str.contains('@')
+                    ).then(pl.col("email"))
+                    .otherwise(None)
+                    .alias("email")
+                )
+                # Dedup by domain — keep row dengan paling banyak info
+                .sort(by=[
+                    pl.col("email").is_not_null().cast(pl.Int8).alias("has_email"),
+                    pl.col("industry").is_not_null().cast(pl.Int8).alias("has_industry"),
+                ], descending=True)
+                .unique(subset=["domain"], keep="first")
+                # Add metadata
+                .with_columns([
+                    pl.lit(expo_name).alias("source_expo"),
+                    pl.lit(datetime.utcnow().isoformat()).alias("crawled_at"),
+                    pl.lit(False).alias("is_processed"),
+                ])
+                .sort("company_name")
+            )
+
+            return cleaned
+
+        def merge_multi_expo_data(expo_batches: List[pl.DataFrame]) -> pl.DataFrame:
+            """
+            Merge data dari multiple expo, dedup global by domain.
+            Company yang hadir di lebih dari satu expo: simpan semua expo names.
+            """
+            if not expo_batches:
+                return pl.DataFrame()
+
+            combined = pl.concat(expo_batches, how="diagonal_relaxed")
+
+            # Group by domain, collect expo names, keep latest data
+            merged = (
+                combined
+                .group_by("domain")
+                .agg([
+                    pl.col("company_name").first().alias("company_name"),
+                    pl.col("industry").first().alias("industry"),
+                    pl.col("email").drop_nulls().first().alias("email"),
+                    pl.col("source_expo").unique().alias("source_expos"),
+                    pl.col("crawled_at").max().alias("last_crawled_at"),
+                ])
+                .with_columns(
+                    pl.col("source_expos").list.len().alias("expo_count")
+                )
+                .sort("expo_count", descending=True)
+            )
+
+            return merged
+
+        def get_industry_summary(df: pl.DataFrame) -> dict:
+            """Agregasi company per industri untuk pipeline monitoring."""
+            if df.is_empty():
+                return {}
+
+            summary = (
+                df
+                .group_by("industry")
+                .agg(pl.len().alias("count"))
+                .sort("count", descending=True)
+                .to_dict(as_series=False)
+            )
+            return dict(zip(summary["industry"], summary["count"]))
+
+        # Contoh penggunaan
+        batch_a = [
+            {"company_name": "PT Maju Jaya", "domain": "majujaya.co.id", "industry": "konstruksi"},
+            {"company_name": "ABC Tech", "domain": "abctech.co.id", "industry": "teknologi"},
+        ]
+        batch_b = [
+            {"company_name": "PT Maju Jaya", "domain": "majujaya.co.id", "industry": "konstruksi"},
+            {"company_name": "XYZ Logistics", "domain": "xyz-logistic.co.id", "industry": "logistik"},
+        ]
+
+        df_a = process_expo_crawl_batch(batch_a, "BuildTech 2024")
+        df_b = process_expo_crawl_batch(batch_b, "InfraTech 2024")
+        merged = merge_multi_expo_data([df_a, df_b])
+
+        print(merged.select(["company_name", "domain", "source_expos", "expo_count"]))
+        print(get_industry_summary(merged))
+
+      expected_output: |
+        # merged DataFrame:
+        shape: (3, 5)
+        | company_name    | domain              | source_expos                          | expo_count |
+        | PT Maju Jaya    | majujaya.co.id      | ["BuildTech 2024", "InfraTech 2024"]  | 2          |
+        | ABC Tech        | abctech.co.id       | ["BuildTech 2024"]                    | 1          |
+        | XYZ Logistics   | xyz-logistic.co.id  | ["InfraTech 2024"]                    | 1          |
+
+        # industry summary:
+        {"konstruksi": 1, "teknologi": 1, "logistik": 1}
+
+    notes: >
+      Polars lazy API (pl.scan_csv(), .lazy()) memungkinkan query optimization sebelum
+      eksekusi. Untuk dataset besar, selalu gunakan .lazy().collect() bukan DataFrame
+      biasa. Polars v1.0 (2024) sudah production-stable. Kompatibel dengan pandas
+      via .to_pandas() dan pl.from_pandas(). Untuk output ke PostgreSQL, gunakan
+      df.to_pandas() lalu df.to_sql() atau psycopg2 executemany.
+
+    pitfalls:
+      - issue: "Polars API berbeda dari pandas — learning curve"
+        fix: "Perbedaan utama: pl.col() untuk column reference, method chaining lebih ketat. Gunakan polars.readthedocs.io untuk migration guide dari pandas."
+      - issue: "group_by order tidak deterministic"
+        fix: "Tambahkan .sort() setelah group_by jika butuh consistent order."
+      - issue: "Incompatible dengan library yang hanya accept pandas"
+        fix: "Gunakan .to_pandas() untuk convert ke pandas sebelum passing ke pandas-only library."
+
+  - id: rapidfuzz
+    name: "RapidFuzz"
+    category: "Fuzzy String Matching & Deduplication"
+    description: >
+      RapidFuzz adalah library Python untuk fuzzy string matching dan string similarity
+      dengan C++ backend. 100x lebih cepat dari FuzzyWuzzy (yang sudah deprecated)
+      dengan API yang identik. Mendukung: Levenshtein distance, Jaro-Winkler,
+      token sort ratio, partial ratio, dan banyak algoritma lain.
+      Sangat berguna untuk deduplication nama company dari berbagai sumber yang mungkin
+      menggunakan ejaan berbeda.
+    specific_function: >
+      Dedup company name yang sama tapi ditulis berbeda di source yang berbeda.
+      Contoh: "PT. Maju Jaya Abadi", "PT Maju Jaya", "MAJU JAYA ABADI" — semua
+      mungkin merujuk ke company yang sama. RapidFuzz menghitung similarity dan
+      membantu RETRO memutuskan apakah ini satu company atau berbeda.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://github.com/rapidfuzz/RapidFuzz"
+
+    retro:
+      phase: "Phase 1 — setelah crawling, sebelum DB insert"
+      role: >
+        Fuzzy deduplication untuk nama company. Dikombinasikan dengan Redis SETNX
+        (untuk dedup domain exact) dan Qdrant (untuk dedup semantic). RapidFuzz
+        mengisi gap: dua company dengan domain berbeda tapi nama sangat mirip.
+        Catatan: domain dedup lebih reliable — gunakan RapidFuzz hanya jika domain tidak tersedia.
+      when_to_use: >
+        Gunakan RapidFuzz ketika:
+        1. Domain tidak tersedia, harus compare by company name
+        2. Normalize company names dari berbagai format (PT., PT, CV., dll)
+        3. Find similar company names di DB sebelum insert baru
+        4. Match company dari expo list dengan company di existing DB
+      priority: "medium (domain dedup lebih reliable, ini untuk fallback)"
+      output_goes_to: "Dedup decision: proceed to insert atau mark as duplicate"
+
+    setup:
+      install: |
+        pip install rapidfuzz
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        from rapidfuzz import fuzz, process
+
+        # Similarity antara dua string
+        score1 = fuzz.ratio("PT Maju Jaya Abadi", "PT. Maju Jaya Abadi")
+        print(f"Exact ratio: {score1}")  # 96 (sangat mirip)
+
+        score2 = fuzz.token_sort_ratio("PT Maju Jaya Abadi", "MAJU JAYA ABADI PT")
+        print(f"Token sort: {score2}")  # 100 (sama setelah sort token)
+
+        score3 = fuzz.partial_ratio("PT Maju Jaya", "PT Maju Jaya Abadi Tbk")
+        print(f"Partial: {score3}")  # 100 (partial match)
+
+        # Find best match dari list
+        companies = ["PT Telkom Indonesia", "PT Telkomsel", "PT Indosat", "PT XL Axiata"]
+        query = "Telkom Indonesia"
+        best_match = process.extractOne(query, companies, score_cutoff=80)
+        print(best_match)  # ("PT Telkom Indonesia", 90, 0)
+
+      retro_example: |
+        from rapidfuzz import fuzz, process
+        from typing import Optional, List, Tuple
+        import re
+
+        def normalize_company_name(name: str) -> str:
+            """
+            Normalize nama company untuk comparison yang lebih akurat.
+            """
+            if not name:
+                return ""
+
+            # Uppercase untuk case-insensitive comparison
+            name = name.upper().strip()
+
+            # Hapus legal suffix yang sering berbeda penulisan
+            legal_suffixes = [
+                r'\bPT\.?\b', r'\bCV\.?\b', r'\bTBK\.?\b', r'\bPERSERO\.?\b',
+                r'\bLTD\.?\b', r'\bLIMITED\b', r'\bINC\.?\b', r'\bCORP\.?\b',
+                r'\bSDN\.?\s*BHD\.?\b',  # Malaysia
+            ]
+            for suffix in legal_suffixes:
+                name = re.sub(suffix, '', name)
+
+            # Hapus punctuation dan extra whitespace
+            name = re.sub(r'[.,&-]', ' ', name)
+            name = re.sub(r'\s+', ' ', name).strip()
+
+            return name
+
+        def is_duplicate_company(
+            new_company: str,
+            existing_companies: List[str],
+            threshold: int = 85
+        ) -> Optional[Tuple[str, int]]:
+            """
+            Cek apakah new_company sudah ada di existing_companies (fuzzy match).
+            Return: (matched_company, score) atau None jika tidak ada duplicate.
+            threshold: 85 berarti 85% similar = dianggap duplicate
+            """
+            normalized_new = normalize_company_name(new_company)
+            if not normalized_new:
+                return None
+
+            normalized_existing = [normalize_company_name(c) for c in existing_companies]
+
+            # process.extractOne returns (match, score, index) atau None
+            result = process.extractOne(
+                normalized_new,
+                normalized_existing,
+                scorer=fuzz.token_sort_ratio,  # Best untuk nama company yang kata-katanya bisa bertukar posisi
+                score_cutoff=threshold
+            )
+
+            if result:
+                match_str, score, idx = result
+                return (existing_companies[idx], score)
+
+            return None
+
+        def dedup_company_batch(companies: List[dict]) -> List[dict]:
+            """
+            Dedup list company berdasarkan fuzzy name matching.
+            Pertahankan company dengan info lebih lengkap jika ada duplicate.
+            """
+            unique_companies = []
+            seen_names = []
+
+            for company in companies:
+                name = company.get("company_name", "")
+                if not name:
+                    continue
+
+                # Cek domain exact match dulu (lebih reliable)
+                domain = company.get("domain")
+                if domain and any(c.get("domain") == domain for c in unique_companies):
+                    continue  # Domain exact duplicate, skip
+
+                # Fuzzy name match sebagai fallback
+                duplicate = is_duplicate_company(name, seen_names, threshold=88)
+
+                if duplicate:
+                    match_name, score = duplicate
+                    # Log duplicate untuk audit
+                    print(f"Fuzzy duplicate found: '{name}' ~ '{match_name}' (score={score})")
+
+                    # Pilih yang lebih lengkap (punya email, domain, dll)
+                    existing_idx = next(
+                        i for i, c in enumerate(unique_companies)
+                        if normalize_company_name(c["company_name"]) == normalize_company_name(match_name)
+                    )
+                    existing = unique_companies[existing_idx]
+
+                    # Merge: update existing dengan info yang missing
+                    if not existing.get("email") and company.get("email"):
+                        unique_companies[existing_idx]["email"] = company["email"]
+                    if not existing.get("domain") and company.get("domain"):
+                        unique_companies[existing_idx]["domain"] = company["domain"]
+                else:
+                    unique_companies.append(company)
+                    seen_names.append(name)
+
+            return unique_companies
+
+      expected_output: |
+        # is_duplicate_company("Maju Jaya Abadi", ["PT Maju Jaya", "ABC Corp"], threshold=85)
+        ("PT Maju Jaya", 91)  # Duplicate ditemukan!
+
+        # normalize_company_name("PT. Maju Jaya Abadi Tbk.")
+        "MAJU JAYA ABADI"  # Cleaned
+
+    notes: >
+      fuzz.token_sort_ratio adalah algoritma terbaik untuk nama company karena
+      menangani kata-kata yang sama tapi urutan berbeda ("PT Maju Jaya" vs "Maju Jaya PT").
+      fuzz.ratio lebih baik untuk domain/URL comparison.
+      Threshold 85 adalah starting point — sesuaikan berdasarkan false positive rate
+      yang acceptable. Terlalu rendah = data kotor, terlalu tinggi = miss legitimate duplicates.
+
+    pitfalls:
+      - issue: "False positive: company berbeda tapi nama mirip"
+        fix: "Naikkan threshold ke 90-92. Atau tambahkan secondary check: industry harus sama untuk dianggap duplicate."
+      - issue: "Lambat untuk list besar (10K+ companies)"
+        fix: "Gunakan process.cdist() untuk batch computation, atau pre-filter dengan TF-IDF similarity sebelum fuzzy matching."
+
+  - id: tldextract
+    name: "tldextract"
+    category: "URL & Domain Parsing"
+    description: >
+      tldextract adalah library untuk extract domain components dari URL secara akurat.
+      Menggunakan Public Suffix List untuk mengenali semua TLD yang valid termasuk
+      country-code TLD (ccTLD) yang kompleks: .co.id, .or.id, .ac.id, .co.uk, .com.sg.
+      Berbeda dari urllib.parse yang sering salah parse TLD multi-level.
+    specific_function: >
+      Parse domain dari semua URL yang di-crawl RETRO. Extract: subdomain, domain,
+      suffix (TLD). Penting untuk: mengenali "www.majujaya.co.id" -> domain "majujaya",
+      suffix "co.id". Membandingkan dua URL yang merujuk ke company yang sama:
+      "https://www.telkom.co.id/about" dan "http://telkom.co.id" -> sama.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2024"
+    url: "https://github.com/john-kurkowski/tldextract"
+
+    retro:
+      phase: "Phase 1 — URL normalization setelah crawling"
+      role: >
+        URL normalization untuk dedup dan canonical domain extraction. Setiap URL
+        yang ditemukan RETRO di-parse ke komponen domain-nya. Hasil normalized domain
+        digunakan sebagai primary key untuk dedup (sebelum cek Redis SETNX).
+      when_to_use: >
+        Gunakan tldextract setiap kali perlu extract domain dari URL:
+        - Website URL dari expo participant list
+        - Social media profile URLs (linkedin.com/company/xxx -> company name)
+        - Email domain extraction (info@majujaya.co.id -> majujaya.co.id)
+      priority: "primary untuk URL/domain operations"
+      output_goes_to: "Normalized domain -> Redis dedup key dan PostgreSQL company key"
+
+    setup:
+      install: |
+        pip install tldextract
+      requirements:
+        - "Python 3.8+"
+        - "Internet untuk update Public Suffix List (pertama kali atau update berkala)"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import tldextract
+
+        urls = [
+            "https://www.majujaya.co.id/about-us",
+            "http://telkom.co.id",
+            "https://sub.domain.company.com.sg/page",
+            "https://mail.google.com",
+        ]
+
+        for url in urls:
+            ext = tldextract.extract(url)
+            print(f"URL: {url}")
+            print(f"  subdomain: {ext.subdomain}")  # "www", "sub.domain", "mail"
+            print(f"  domain:    {ext.domain}")     # "majujaya", "telkom", "company", "google"
+            print(f"  suffix:    {ext.suffix}")     # "co.id", "co.id", "com.sg", "com"
+            print(f"  full domain: {ext.registered_domain}")  # "majujaya.co.id", dll
+            print()
+
+      retro_example: |
+        import tldextract
+        import re
+        from typing import Optional
+        from urllib.parse import urlparse
+
+        def normalize_domain(url_or_domain: str) -> Optional[str]:
+            """
+            Extract dan normalize domain dari URL atau domain string.
+            Return: normalized domain (e.g., "majujaya.co.id") atau None jika invalid.
+            """
+            if not url_or_domain:
+                return None
+
+            # Tambahkan scheme jika tidak ada (untuk tldextract)
+            if not url_or_domain.startswith(('http://', 'https://')):
+                url_or_domain = 'https://' + url_or_domain
+
+            try:
+                ext = tldextract.extract(url_or_domain)
+
+                # Validasi: harus punya domain dan suffix
+                if not ext.domain or not ext.suffix:
+                    return None
+
+                # Exclude: email provider, social media (bukan company domain)
+                generic_domains = {
+                    'gmail', 'yahoo', 'hotmail', 'outlook', 'live',
+                    'google', 'facebook', 'linkedin', 'twitter', 'instagram',
+                    'blogspot', 'wordpress', 'wix', 'weebly'
+                }
+                if ext.domain.lower() in generic_domains:
+                    return None
+
+                return ext.registered_domain.lower()
+
+            except Exception:
+                return None
+
+        def extract_company_domain_from_email(email: str) -> Optional[str]:
+            """
+            Extract company domain dari email address.
+            info@majujaya.co.id -> majujaya.co.id
+            (Filter email provider generic)
+            """
+            if not email or '@' not in email:
+                return None
+
+            domain_part = email.split('@')[-1].lower().strip()
+            return normalize_domain(domain_part)
+
+        def is_same_company_domain(url1: str, url2: str) -> bool:
+            """
+            Cek apakah dua URL merujuk ke company domain yang sama.
+            "https://www.telkom.co.id/about" vs "http://telkom.co.id" -> True
+            """
+            domain1 = normalize_domain(url1)
+            domain2 = normalize_domain(url2)
+
+            if not domain1 or not domain2:
+                return False
+
+            return domain1 == domain2
+
+        # Test cases
+        test_urls = [
+            "https://www.majujaya.co.id/about-us",
+            "majujaya.co.id",
+            "info@majujaya.co.id",
+            "https://docs.sub.company.com.sg/page?ref=1",
+            "https://gmail.com",  # Harus return None
+            "https://linkedin.com/company/telkom",  # Harus return None (generic)
+        ]
+
+        for url in test_urls:
+            if '@' in url:
+                result = extract_company_domain_from_email(url)
+            else:
+                result = normalize_domain(url)
+            print(f"{url!r:50} -> {result}")
+
+      expected_output: |
+        "https://www.majujaya.co.id/about-us"      -> "majujaya.co.id"
+        "majujaya.co.id"                            -> "majujaya.co.id"
+        "info@majujaya.co.id"                       -> "majujaya.co.id"
+        "https://docs.sub.company.com.sg/page?ref=1" -> "company.com.sg"
+        "https://gmail.com"                         -> None (generic email provider)
+        "https://linkedin.com/company/telkom"       -> None (social media)
+
+    notes: >
+      tldextract update Public Suffix List secara berkala dari Mozilla.
+      Untuk offline/air-gapped deployment: tldextract.TLDExtract(suffix_list_urls=[]).
+      CACHE_DIR bisa dikonfigurasi untuk Docker: TLDEXTRACT_CACHE=/app/cache.
+
+    pitfalls:
+      - issue: "Lambat pada first run karena download PSL"
+        fix: "Pre-warm cache: python -c 'import tldextract; tldextract.extract(\"test.com\")' saat build Docker image"
+      - issue: "Beberapa domain Indonesia tidak dikenali"
+        fix: "tldextract pakai Mozilla PSL yang sudah include .co.id, .or.id, dll. Jika ada yang tidak dikenali, cek tldextract versi terbaru."
+
+  - id: phonenumbers
+    name: "phonenumbers"
+    category: "Phone Number Validation"
+    description: >
+      phonenumbers adalah Python port dari Google's libphonenumber — library validasi
+      nomor telepon terlengkap dan paling akurat. Mendukung 200+ countries dengan
+      format dan validation rules yang selalu di-update. Untuk Indonesia: mengenali
+      format +62-21-xxx (Jakarta), +62-8xx-xxx (mobile), format lokal 0811-xxx.
+    specific_function: >
+      Validasi dan normalisasi nomor telepon yang ditemukan dari website company,
+      PDF expo brochure, dan contact pages. Extract nomor telepon dari teks freeform,
+      validate apakah nomor valid untuk country yang benar, dan normalize ke format
+      E.164 (+62xxxxxxxxx) untuk konsisten di database.
+    language: "Python"
+    pricing: "Gratis & open-source"
+    last_updated: "2025"
+    url: "https://github.com/daviddrysdale/python-phonenumbers"
+
+    retro:
+      phase: "Phase 1 dan Phase 2 — contact enrichment"
+      role: >
+        Validasi dan normalisasi nomor telepon dari crawling. Data telepon yang tidak
+        valid dihapus dari company profile untuk mencegah bounce di outreach.
+        Normalisasi ke E.164 format memastikan konsistensi di PostgreSQL.
+      when_to_use: >
+        Gunakan phonenumbers ketika:
+        1. Extract telepon dari teks crawl (website, PDF)
+        2. Validate telepon dari Apollo.io atau database lain
+        3. Normalize format sebelum simpan ke DB
+        4. Detect country dari nomor untuk segmentasi
+      priority: "medium (nice to have untuk B2B outreach completeness)"
+      output_goes_to: "Validated phone ke company_profiles table"
+
+    setup:
+      install: |
+        pip install phonenumbers
+      requirements:
+        - "Python 3.8+"
+      env_vars: []
+
+    usage:
+      basic_example: |
+        import phonenumbers
+        from phonenumbers import geocoder, carrier
+
+        # Parse nomor Indonesia
+        number_str = "+62-21-555-1234"
+        number = phonenumbers.parse(number_str, "ID")  # ID = Indonesia country hint
+
+        print(phonenumbers.is_valid_number(number))  # True
+        print(phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164))    # +622155551234
+        print(phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.NATIONAL)) # (021) 555-1234
+
+        # Geocoding
+        print(geocoder.description_for_number(number, "id"))  # "Jakarta" atau "Indonesia"
+
+        # Detect nomor mobile vs landline
+        import phonenumbers
+        num_type = phonenumbers.number_type(number)
+        print(num_type == phonenumbers.PhoneNumberType.FIXED_LINE)  # True untuk 021-xxx
+
+      retro_example: |
+        import phonenumbers
+        from phonenumbers import geocoder
+        import re
+        from typing import Optional, List
+
+        def extract_and_validate_phones(text: str, default_country: str = "ID") -> List[str]:
+            """
+            Extract semua nomor telepon dari teks freeform dan validasi.
+            Return: list nomor valid dalam format E.164 (+62xxxxxxxxx)
+            """
+            if not text:
+                return []
+
+            valid_phones = []
+
+            # phonenumbers.PhoneNumberMatcher menemukan semua nomor dalam teks
+            for match in phonenumbers.PhoneNumberMatcher(text, default_country):
+                number = match.number
+                if phonenumbers.is_valid_number(number):
+                    e164 = phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
+                    if e164 not in valid_phones:
+                        valid_phones.append(e164)
+
+            return valid_phones
+
+        def normalize_indonesian_phone(raw_phone: str) -> Optional[str]:
+            """
+            Normalize nomor telepon Indonesia ke format E.164.
+            Input: "0811-555-1234", "08115551234", "+62 811 555 1234", dll
+            Output: "+628115551234" atau None jika invalid
+            """
+            if not raw_phone:
+                return None
+
+            # Bersihkan karakter non-numerik kecuali +
+            cleaned = re.sub(r'[^\d+]', '', raw_phone)
+
+            # Ganti prefix lokal 0 dengan +62
+            if cleaned.startswith('0'):
+                cleaned = '+62' + cleaned[1:]
+            elif cleaned.startswith('62') and not cleaned.startswith('+62'):
+                cleaned = '+' + cleaned
+
+            try:
+                number = phonenumbers.parse(cleaned, "ID")
+                if phonenumbers.is_valid_number(number):
+                    return phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
+                return None
+            except Exception:
+                return None
+
+        def classify_phone_type(e164_number: str) -> dict:
+            """
+            Classify nomor telepon: mobile vs landline, area/operator.
+            """
+            try:
+                number = phonenumbers.parse(e164_number)
+                num_type = phonenumbers.number_type(number)
+                location = geocoder.description_for_number(number, "id")
+
+                return {
+                    "number": e164_number,
+                    "type": "mobile" if num_type == phonenumbers.PhoneNumberType.MOBILE else "landline",
+                    "location": location or "Indonesia",
+                    "is_valid": True,
+                }
+            except Exception:
+                return {"number": e164_number, "is_valid": False}
+
+        # Test
+        texts = [
+            "Hubungi kami di (021) 555-1234 atau 0811-555-6789",
+            "Tel: +62-21-555-4321, WhatsApp: 08123456789",
+        ]
+        for text in texts:
+            phones = extract_and_validate_phones(text, "ID")
+            print(f"Found: {phones}")
+
+        print(normalize_indonesian_phone("0811-555-1234"))  # "+628115551234"
+        print(classify_phone_type("+628115551234"))  # {type: "mobile", location: "Indonesia"}
+
+      expected_output: |
+        # extract_and_validate_phones("Hubungi kami di (021) 555-1234 atau 0811-555-6789"):
+        ["+62215551234", "+628115556789"]
+
+        # normalize_indonesian_phone("0811-555-1234"):
+        "+628115551234"
+
+        # classify_phone_type("+628115551234"):
+        {"number": "+628115551234", "type": "mobile", "location": "Indonesia", "is_valid": True}
+
+    notes: >
+      Indonesia memiliki banyak format nomor telepon yang berbeda-beda per operator.
+      phonenumbers secara otomatis menangani semua format yang valid. Untuk WhatsApp
+      business outreach (optional RETRO feature), nomor mobile Indonesia (+628xx)
+      adalah target utama. Update library berkala: pip install --upgrade phonenumbers.
+
+    pitfalls:
+      - issue: "Parse gagal untuk nomor lokal tanpa country code"
+        fix: "Selalu provide default_country='ID' di phonenumbers.parse(). Tanpa ini, nomor lokal (0811-xxx) tidak bisa di-parse."
+      - issue: "Nomor valid secara format tapi tidak aktif"
+        fix: "phonenumbers hanya validasi format, bukan apakah nomor aktif. Untuk cek aktif butuh carrier lookup API (berbayar)."

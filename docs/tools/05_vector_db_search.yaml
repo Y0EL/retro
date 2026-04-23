@@ -1,0 +1,1700 @@
+---
+# RETRO Pipeline Tools Documentation
+# Category: Vector Database & Semantic Search
+# File: 05_vector_db_search.yaml
+# Purpose: Stores company embeddings produced by sentence-transformers (see 04_nlp_entity_extraction.yaml)
+#          and enables semantic similarity search so Synthesis Agent can find matching companies
+#          without keyword collision. All tools in this file operate in Phase 4 (Vector Storage)
+#          and Phase 5 (Synthesis) of the RETRO pipeline.
+#
+# ARCHITECTURE NOTE:
+#   sentence-transformers (04) --> embedding vectors (768-dim) --> stored HERE
+#   Synthesis Agent queries HERE --> ranked company profiles --> sent to LLM context window
+#
+# RECOMMENDED STACK (minimal viable RETRO):
+#   Primary:   Qdrant (self-hosted Docker, HTTP API, excellent filtering)
+#   Embedding: sentence-transformers/all-MiniLM-L6-v2 (local, 768-dim)
+#   Fallback:  FAISS (in-memory, zero infra cost, no persistence)
+
+tools:
+
+  - id: qdrant
+    name: "Qdrant"
+    category: "Vector Database"
+    description: >
+      Qdrant adalah vector database open-source yang ditulis dalam Rust. Dirancang
+      khusus untuk menyimpan dan mencari high-dimensional embedding vectors secara
+      efisien. Mendukung payload filtering (filter by metadata), named vectors
+      (multiple vector spaces per document), shard replication, dan REST/gRPC API.
+      Tersedia sebagai Docker image (self-hosted), binary, dan Qdrant Cloud (managed).
+      RETRO menggunakan Qdrant sebagai penyimpanan utama Company Profile embeddings
+      sehingga Synthesis Agent bisa mencari perusahaan yang paling relevan secara
+      semantik bukan hanya keyword matching.
+    specific_function: >
+      Menyimpan embedding vector dari setiap company profile card yang dihasilkan
+      Context Agent. Setiap vector dilengkapi payload JSON berisi nama perusahaan,
+      industri, domain, sumber data, dan timestamp. Synthesis Agent melakukan
+      similarity search terhadap RETRO company embedding untuk menemukan kandidat
+      kolaborasi terbaik.
+    language: "Python (qdrant-client), REST API, gRPC"
+    pricing: "Free (self-hosted), Qdrant Cloud mulai $0 (1GB free tier)"
+    last_updated: "2025"
+    url: "https://qdrant.tech"
+    retro:
+      phase: "Phase 4 (Vector Storage) + Phase 5 (Synthesis Query)"
+      role: >
+        Penyimpanan utama semua company profile embeddings. Setiap perusahaan yang
+        berhasil di-profile Context Agent disimpan sebagai satu Qdrant point dengan
+        vector 768-dim dan payload metadata. Synthesis Agent query Qdrant untuk
+        mendapatkan Top-K perusahaan yang paling mirip secara semantik dengan
+        profile RETRO sendiri.
+      when_to_use: >
+        Gunakan setiap kali Context Agent selesai membuat Company Profile Card.
+        Upsert embedding ke Qdrant segera setelah profiling selesai. Query Qdrant
+        ketika Synthesis Agent perlu memilih kandidat terbaik dari pool perusahaan
+        yang sudah di-profile. Juga gunakan untuk dedup semantik: jika company baru
+        memiliki cosine similarity > 0.97 dengan entry existing, kemungkinan duplikat
+        dan bisa di-skip atau di-merge.
+      priority: "primary"
+      output_goes_to: "Synthesis Agent (ranked company list with scores)"
+    setup:
+      install: "pip install qdrant-client"
+      docker: "docker run -p 6333:6333 -p 6334:6334 -v $(pwd)/qdrant_storage:/qdrant/storage qdrant/qdrant"
+      requirements:
+        - "Docker Desktop (untuk self-hosted)"
+        - "qdrant-client>=1.7.0"
+        - "sentence-transformers (untuk generate embeddings sebelum upsert)"
+      env_vars:
+        - name: QDRANT_URL
+          description: "URL Qdrant instance, default http://localhost:6333"
+        - name: QDRANT_API_KEY
+          description: "Hanya diperlukan untuk Qdrant Cloud, kosongkan untuk self-hosted"
+    usage:
+      basic_example: |
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams, PointStruct
+
+        client = QdrantClient(url="http://localhost:6333")
+
+        # Buat collection baru
+        client.create_collection(
+            collection_name="companies",
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        )
+
+        # Upsert satu point
+        client.upsert(
+            collection_name="companies",
+            points=[
+                PointStruct(
+                    id=1,
+                    vector=[0.1, 0.2, ...],  # 768-dim float list
+                    payload={"company_name": "PT Maju Bersama", "industry": "logistics"},
+                )
+            ],
+        )
+
+        # Search
+        results = client.search(
+            collection_name="companies",
+            query_vector=[0.15, 0.22, ...],
+            limit=5,
+        )
+        for r in results:
+            print(r.score, r.payload["company_name"])
+
+      retro_example: |
+        import os
+        import uuid
+        import json
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import (
+            Distance, VectorParams, PointStruct,
+            Filter, FieldCondition, MatchValue,
+            PayloadSchemaType,
+        )
+        from sentence_transformers import SentenceTransformer
+
+        QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+        COLLECTION  = "retro_companies"
+        EMBED_MODEL = "all-MiniLM-L6-v2"
+
+        _qdrant_client = None
+        _embed_model   = None
+
+        def get_qdrant():
+            global _qdrant_client
+            if _qdrant_client is None:
+                _qdrant_client = QdrantClient(url=QDRANT_URL)
+                _ensure_collection(_qdrant_client)
+            return _qdrant_client
+
+        def get_embedder():
+            global _embed_model
+            if _embed_model is None:
+                _embed_model = SentenceTransformer(EMBED_MODEL)
+            return _embed_model
+
+        def _ensure_collection(client):
+            existing = [c.name for c in client.get_collections().collections]
+            if COLLECTION not in existing:
+                client.create_collection(
+                    collection_name=COLLECTION,
+                    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                )
+                # Index payload fields for fast filtering
+                client.create_payload_index(COLLECTION, "industry", PayloadSchemaType.KEYWORD)
+                client.create_payload_index(COLLECTION, "country",  PayloadSchemaType.KEYWORD)
+                client.create_payload_index(COLLECTION, "expo",     PayloadSchemaType.KEYWORD)
+                print(f"[Qdrant] Collection '{COLLECTION}' created.")
+
+        def build_embedding_text(profile_card: dict) -> str:
+            """
+            Gabungkan field terpenting dari Company Profile Card menjadi satu
+            string untuk di-embed. Urutan field mempengaruhi bobot semantik.
+            """
+            parts = [
+                profile_card.get("company_name", ""),
+                profile_card.get("tagline", ""),
+                profile_card.get("industry", ""),
+                profile_card.get("products_services", ""),
+                profile_card.get("value_proposition", ""),
+                " ".join(profile_card.get("keywords", [])),
+            ]
+            return " | ".join(p for p in parts if p)
+
+        def upsert_company_profile(profile_card: dict, expo_name: str) -> str:
+            """
+            Simpan Company Profile Card ke Qdrant setelah Context Agent selesai.
+            Return: point_id (UUID string)
+            """
+            client   = get_qdrant()
+            embedder = get_embedder()
+
+            text      = build_embedding_text(profile_card)
+            vector    = embedder.encode(text, normalize_embeddings=True).tolist()
+            point_id  = str(uuid.uuid5(uuid.NAMESPACE_URL, profile_card["domain"]))
+
+            payload = {
+                "company_name":       profile_card.get("company_name"),
+                "domain":             profile_card.get("domain"),
+                "industry":           profile_card.get("industry"),
+                "country":            profile_card.get("country"),
+                "expo":               expo_name,
+                "value_proposition":  profile_card.get("value_proposition"),
+                "keywords":           profile_card.get("keywords", []),
+                "profile_card_json":  json.dumps(profile_card),
+                "profiled_at":        profile_card.get("profiled_at"),
+            }
+
+            client.upsert(
+                collection_name=COLLECTION,
+                points=[PointStruct(id=point_id, vector=vector, payload=payload)],
+            )
+            print(f"[Qdrant] Upserted: {profile_card['company_name']} ({point_id})")
+            return point_id
+
+        def search_similar_companies(
+            retro_profile_text: str,
+            top_k: int = 20,
+            filter_industry: str | None = None,
+            filter_expo: str | None = None,
+            score_threshold: float = 0.55,
+        ) -> list[dict]:
+            """
+            Synthesis Agent memanggil fungsi ini untuk menemukan kandidat
+            kolaborasi terbaik berdasarkan kemiripan semantik.
+            """
+            client   = get_qdrant()
+            embedder = get_embedder()
+
+            query_vec = embedder.encode(retro_profile_text, normalize_embeddings=True).tolist()
+
+            # Bangun filter opsional
+            conditions = []
+            if filter_industry:
+                conditions.append(FieldCondition(key="industry", match=MatchValue(value=filter_industry)))
+            if filter_expo:
+                conditions.append(FieldCondition(key="expo",     match=MatchValue(value=filter_expo)))
+
+            search_filter = Filter(must=conditions) if conditions else None
+
+            results = client.search(
+                collection_name=COLLECTION,
+                query_vector=query_vec,
+                limit=top_k,
+                score_threshold=score_threshold,
+                query_filter=search_filter,
+                with_payload=True,
+            )
+
+            candidates = []
+            for r in results:
+                card = json.loads(r.payload["profile_card_json"])
+                candidates.append({
+                    "similarity_score": round(r.score, 4),
+                    "company_name":     r.payload["company_name"],
+                    "domain":           r.payload["domain"],
+                    "profile_card":     card,
+                })
+            return candidates
+
+        def is_semantic_duplicate(profile_card: dict, threshold: float = 0.97) -> bool:
+            """
+            Cek apakah company sudah ada di Qdrant secara semantik (bukan hanya domain).
+            Berguna untuk deteksi duplikat dengan nama berbeda tapi company sama.
+            """
+            client   = get_qdrant()
+            embedder = get_embedder()
+
+            text      = build_embedding_text(profile_card)
+            query_vec = embedder.encode(text, normalize_embeddings=True).tolist()
+
+            results = client.search(
+                collection_name=COLLECTION,
+                query_vector=query_vec,
+                limit=1,
+                score_threshold=threshold,
+                with_payload=True,
+            )
+            if results:
+                existing = results[0].payload["company_name"]
+                print(f"[Qdrant] Semantic duplicate detected: '{profile_card['company_name']}' ~ '{existing}' (score={results[0].score:.4f})")
+                return True
+            return False
+
+        # ---- Contoh penggunaan oleh Synthesis Agent ----
+        if __name__ == "__main__":
+            RETRO_PROFILE_TEXT = (
+                "RETRO adalah platform B2B intelligence untuk corporate partnerships "
+                "di sektor logistik, supply chain, dan manufaktur Indonesia. "
+                "Kami mencari perusahaan teknologi, distributor, dan integrator sistem."
+            )
+
+            candidates = search_similar_companies(
+                retro_profile_text=RETRO_PROFILE_TEXT,
+                top_k=20,
+                filter_expo="LogiSEA 2025",
+                score_threshold=0.60,
+            )
+            for c in candidates:
+                print(f"  [{c['similarity_score']:.4f}] {c['company_name']} | {c['domain']}")
+
+      expected_output: |
+        [Qdrant] Collection 'retro_companies' created.
+        [Qdrant] Upserted: PT Sinar Logistik Nusantara (a3f7c2d1-...)
+        [Qdrant] Upserted: Global Supply Chain Solutions (b1e4d9a2-...)
+
+        Synthesis Agent search results:
+          [0.8821] PT Sinar Logistik Nusantara | sinarlogistik.co.id
+          [0.8345] Global Supply Chain Solutions | gsc-solutions.com
+          [0.7912] Nexus Distribution Hub | nexusdist.sg
+          [0.7103] APAC Freight Technologies | apacfreight.io
+          [0.6891] IndoPort Logistics | indoportlog.com
+
+    notes:
+      - "Gunakan UUID v5 dengan namespace URL dan domain sebagai name untuk point ID yang deterministik dan idempotent (upsert berkali-kali aman, tidak duplikat)"
+      - "Vector size HARUS match dengan model embedding: all-MiniLM-L6-v2 = 384-dim, all-mpnet-base-v2 = 768-dim. Tentukan saat create_collection dan jangan ubah."
+      - "normalize_embeddings=True wajib aktif di sentence-transformers agar cosine similarity bekerja benar di Qdrant"
+      - "payload_index pada field industry/country/expo memungkinkan Qdrant melakukan pre-filter sebelum vector search, jauh lebih cepat dari full scan"
+      - "Qdrant mendukung upsert (update jika ID sudah ada), sehingga re-profiling perusahaan yang sama akan menimpa entry lama"
+      - "Gunakan Qdrant Docker volume mount ke local folder agar data persisten setelah container restart"
+      - "score_threshold 0.55-0.65 cocok untuk general similarity, naikkan ke 0.80+ jika hanya ingin hasil yang sangat mirip"
+    pitfalls:
+      - "JANGAN buat collection ulang setiap run, cek existing collections dulu dengan get_collections()"
+      - "JANGAN simpan raw PDF atau teks panjang di payload, simpan hanya metadata compact. Profile card JSON boleh tapi harus di-compress jika besar"
+      - "JANGAN lupa jalankan Docker Qdrant sebelum menjalankan pipeline. Tanpa Qdrant running, semua upsert akan gagal dengan ConnectionRefused"
+      - "UUID v5 menggunakan domain sebagai seed, sehingga subdomain berbeda (shop.example.com vs www.example.com) akan menghasilkan UUID berbeda. Normalisasi domain dengan tldextract sebelum generate UUID"
+      - "Qdrant Cloud free tier hanya 1GB storage dan 1 collection. Untuk production RETRO, gunakan self-hosted atau upgrade ke paid plan"
+
+  - id: chromadb
+    name: "ChromaDB"
+    category: "Vector Database"
+    description: >
+      ChromaDB adalah vector database open-source yang dibuat dengan Python-first API.
+      Sangat mudah di-setup (tidak perlu Docker, bisa in-process), mendukung persistence
+      ke disk, dan memiliki built-in embedding function (bisa pakai sentence-transformers
+      atau OpenAI embeddings). Cocok untuk prototyping cepat dan pengembangan lokal RETRO
+      sebelum migrasi ke Qdrant untuk production.
+    specific_function: >
+      Alternatif ringan untuk Qdrant selama development dan testing. Tidak perlu
+      Docker, langsung berjalan sebagai library Python dengan persistence ke folder
+      lokal. Synthesis Agent bisa query ChromaDB dengan query string langsung
+      (tanpa perlu generate embedding manual, ChromaDB handle sendiri).
+    language: "Python"
+    pricing: "Free (open-source)"
+    last_updated: "2025"
+    url: "https://www.trychroma.com"
+    retro:
+      phase: "Phase 4 (Vector Storage) - Development/Testing alternatif"
+      role: >
+        Digunakan saat development dan testing pipeline RETRO secara lokal tanpa
+        perlu menjalankan Docker. Setelah pipeline stabil, migrasi ke Qdrant untuk
+        production.
+      when_to_use: >
+        Gunakan ChromaDB ketika ingin prototype cepat tanpa setup infrastruktur.
+        Jangan gunakan di production RETRO karena tidak se-scalable Qdrant dan
+        kurang fitur filtering yang advanced.
+      priority: "secondary (development only)"
+      output_goes_to: "Synthesis Agent (kandidat companies, development mode)"
+    setup:
+      install: "pip install chromadb"
+      requirements:
+        - "chromadb>=0.4.0"
+        - "sentence-transformers (optional, ChromaDB punya built-in)"
+      env_vars: []
+    usage:
+      basic_example: |
+        import chromadb
+        from chromadb.utils import embedding_functions
+
+        # In-memory (tidak persistent)
+        client = chromadb.Client()
+
+        # Persistent ke disk
+        client = chromadb.PersistentClient(path="./chroma_storage")
+
+        # Buat collection dengan sentence-transformers embedding
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        collection = client.get_or_create_collection(
+            name="companies",
+            embedding_function=ef,
+        )
+
+        # Tambah dokumen (ChromaDB auto-embed)
+        collection.add(
+            documents=["PT Maju Bersama is a logistics technology company in Jakarta"],
+            metadatas=[{"industry": "logistics", "country": "Indonesia"}],
+            ids=["company-001"],
+        )
+
+        # Query dengan teks (ChromaDB auto-embed query juga)
+        results = collection.query(
+            query_texts=["supply chain technology partnerships"],
+            n_results=5,
+        )
+        print(results["documents"])
+
+      retro_example: |
+        import chromadb
+        from chromadb.utils import embedding_functions
+
+        CHROMA_PATH = "./retro_chroma_dev"
+        COLLECTION_NAME = "retro_companies_dev"
+
+        _chroma_collection = None
+
+        def get_collection():
+            global _chroma_collection
+            if _chroma_collection is None:
+                client = chromadb.PersistentClient(path=CHROMA_PATH)
+                ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                    model_name="all-MiniLM-L6-v2"
+                )
+                _chroma_collection = client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    embedding_function=ef,
+                    metadata={"hnsw:space": "cosine"},  # Gunakan cosine similarity
+                )
+            return _chroma_collection
+
+        def upsert_company_chroma(profile_card: dict, expo_name: str):
+            collection = get_collection()
+            company_id = f"company-{profile_card['domain'].replace('.', '-')}"
+            doc_text   = (
+                f"{profile_card['company_name']}. "
+                f"{profile_card.get('tagline', '')}. "
+                f"{profile_card.get('products_services', '')}. "
+                f"{profile_card.get('value_proposition', '')}."
+            )
+            metadata = {
+                "company_name": profile_card["company_name"],
+                "domain":       profile_card["domain"],
+                "industry":     profile_card.get("industry", ""),
+                "expo":         expo_name,
+            }
+            collection.upsert(
+                documents=[doc_text],
+                metadatas=[metadata],
+                ids=[company_id],
+            )
+
+        def search_chroma(query_text: str, top_k: int = 10, expo: str | None = None):
+            collection = get_collection()
+            where = {"expo": expo} if expo else None
+            results = collection.query(
+                query_texts=[query_text],
+                n_results=top_k,
+                where=where,
+            )
+            output = []
+            for i, meta in enumerate(results["metadatas"][0]):
+                output.append({
+                    "company_name": meta["company_name"],
+                    "domain":       meta["domain"],
+                    "distance":     results["distances"][0][i],
+                })
+            return output
+
+      expected_output: |
+        [
+          {"company_name": "PT Sinar Logistik", "domain": "sinarlogistik.co.id", "distance": 0.211},
+          {"company_name": "Global SCM Tech",   "domain": "globalscm.io",         "distance": 0.298},
+        ]
+        # Catatan: ChromaDB output distance bukan similarity, semakin kecil = semakin mirip
+
+    notes:
+      - "ChromaDB distance adalah 1 - cosine_similarity, jadi 0.0 = identik, 2.0 = berlawanan"
+      - "PersistentClient menyimpan data ke folder lokal, restart Python tidak kehilangan data"
+      - "ChromaDB bisa auto-embed dokumen dan query sekaligus jika embedding_function di-set di collection"
+      - "Filter metadata di ChromaDB hanya mendukung equality match sederhana (where={'field': 'value'}), tidak se-powerful Qdrant"
+      - "Untuk production RETRO dengan ribuan perusahaan, pindah ke Qdrant yang lebih scalable"
+    pitfalls:
+      - "ChromaDB WHERE filter hanya support satu key satu value per query dalam versi lama, cek dokumentasi versi terbaru untuk AND/OR support"
+      - "upsert() di ChromaDB memerlukan ID unik yang konsisten, gunakan domain-based ID yang deterministik"
+      - "JANGAN mix dokumen dengan dan tanpa embedding_function dalam satu collection"
+
+  - id: faiss
+    name: "FAISS (Facebook AI Similarity Search)"
+    category: "Vector Search Library"
+    description: >
+      FAISS adalah library C++ dengan Python binding dari Meta/Facebook untuk
+      approximate nearest neighbor search pada vector spaces. Tidak memerlukan
+      server atau Docker, berjalan sepenuhnya in-memory. Sangat cepat untuk
+      batch similarity search. Tidak memiliki built-in persistence (harus save/load
+      index manual ke file). Cocok sebagai fallback ketika Qdrant tidak tersedia
+      atau untuk batch processing offline yang tidak membutuhkan real-time query.
+    specific_function: >
+      In-memory similarity search engine sebagai fallback Qdrant. Berguna
+      untuk batch processing satu kali (load semua embeddings dari DB, search,
+      buang). Tidak ada overhead server.
+    language: "Python (faiss-cpu / faiss-gpu)"
+    pricing: "Free (open-source, Meta)"
+    last_updated: "2025"
+    url: "https://github.com/facebookresearch/faiss"
+    retro:
+      phase: "Phase 5 (Synthesis) - Fallback / Offline Batch"
+      role: >
+        Digunakan ketika Synthesis Agent perlu melakukan batch similarity search
+        satu kali terhadap seluruh company pool tanpa kebutuhan real-time query.
+        Juga berguna sebagai fallback jika Qdrant down.
+      when_to_use: >
+        Gunakan FAISS untuk offline batch processing: misalnya awal minggu, load
+        semua embeddings dari PostgreSQL, buat FAISS index, cari Top-50 matches,
+        simpan hasil ke DB, lalu buang FAISS index. Jangan gunakan sebagai
+        pengganti Qdrant untuk real-time online search.
+      priority: "fallback / offline batch"
+      output_goes_to: "Synthesis Agent batch results, PostgreSQL ranking table"
+    setup:
+      install: "pip install faiss-cpu  # CPU version, cukup untuk RETRO"
+      requirements:
+        - "faiss-cpu>=1.7.0"
+        - "numpy"
+        - "sentence-transformers (untuk generate embeddings)"
+      env_vars: []
+    usage:
+      basic_example: |
+        import faiss
+        import numpy as np
+
+        # Buat index cosine similarity (Inner Product setelah normalisasi = cosine)
+        dim = 384  # sesuaikan dengan model embedding
+        index = faiss.IndexFlatIP(dim)  # IP = Inner Product
+
+        # Tambah vectors (harus numpy float32, normalize dulu untuk cosine)
+        vectors = np.random.rand(100, dim).astype(np.float32)
+        faiss.normalize_L2(vectors)  # Normalize untuk cosine similarity
+        index.add(vectors)
+
+        # Search
+        query = np.random.rand(1, dim).astype(np.float32)
+        faiss.normalize_L2(query)
+        distances, indices = index.search(query, k=5)
+        print("Top-5 matches:", indices[0], "Scores:", distances[0])
+
+      retro_example: |
+        import faiss
+        import numpy as np
+        import json
+        from sentence_transformers import SentenceTransformer
+
+        def batch_similarity_search_faiss(
+            profiles: list[dict],
+            retro_profile_text: str,
+            top_k: int = 20,
+        ) -> list[dict]:
+            """
+            Offline batch search: semua company profiles diload ke memory,
+            di-embed, diindex FAISS, lalu di-search. Dibuang setelah selesai.
+
+            profiles: list of Company Profile Card dicts dari PostgreSQL
+            """
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            dim = 384
+
+            # 1. Build teks untuk setiap company
+            texts = []
+            for p in profiles:
+                t = (
+                    f"{p.get('company_name', '')} "
+                    f"{p.get('industry', '')} "
+                    f"{p.get('products_services', '')} "
+                    f"{p.get('value_proposition', '')}"
+                )
+                texts.append(t)
+
+            # 2. Encode semua sekaligus (batch lebih efisien)
+            embeddings = embedder.encode(
+                texts,
+                normalize_embeddings=True,
+                batch_size=64,
+                show_progress_bar=True,
+            ).astype(np.float32)
+
+            # 3. Build FAISS index
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings)
+
+            # 4. Encode query
+            query_vec = embedder.encode(
+                [retro_profile_text],
+                normalize_embeddings=True,
+            ).astype(np.float32)
+
+            # 5. Search
+            scores, indices = index.search(query_vec, k=top_k)
+
+            # 6. Compile hasil
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1:  # FAISS returns -1 for unfilled slots
+                    continue
+                results.append({
+                    "similarity_score": float(score),
+                    "company_name":     profiles[idx]["company_name"],
+                    "domain":           profiles[idx]["domain"],
+                    "profile_card":     profiles[idx],
+                })
+
+            # Index di-garbage-collected setelah return (tidak persisten)
+            return results
+
+        # Contoh: load profiles dari PostgreSQL lalu batch search
+        if __name__ == "__main__":
+            import psycopg2
+
+            conn = psycopg2.connect("postgresql://retro:retro@localhost/retro_db")
+            cur  = conn.cursor()
+            cur.execute("SELECT profile_card_json FROM companies WHERE profiled = TRUE")
+            rows = cur.fetchall()
+            profiles = [json.loads(r[0]) for r in rows]
+
+            RETRO_TEXT = (
+                "RETRO mencari mitra logistik dan supply chain teknologi "
+                "untuk kolaborasi B2B di pasar ASEAN."
+            )
+
+            results = batch_similarity_search_faiss(profiles, RETRO_TEXT, top_k=20)
+            for r in results[:5]:
+                print(f"  [{r['similarity_score']:.4f}] {r['company_name']}")
+
+      expected_output: |
+        Encoding 500 company profiles...: 100%|██████████| 8/8 [00:12<00:00,  1.56s/it]
+          [0.9123] PT Sinar Logistik Nusantara
+          [0.8847] Global SCM Technologies
+          [0.8612] APAC Freight Solutions
+          [0.8341] Nexus Distribution Hub
+          [0.8105] IndoPort Digital Cargo
+
+    notes:
+      - "FAISS tidak memiliki persistence built-in. Gunakan faiss.write_index(index, 'file.index') dan faiss.read_index('file.index') untuk simpan/load manual"
+      - "IndexFlatIP dengan normalize_L2 menghasilkan cosine similarity (bukan euclidean), pastikan normalize SEBELUM add dan search"
+      - "Untuk lebih dari 1 juta vectors, gunakan IndexIVFFlat (approximate, lebih cepat) bukan IndexFlatIP (exact, lambat di scale besar)"
+      - "FAISS sangat memory-intensive: 1 juta vectors x 384 dim x 4 bytes = ~1.5GB RAM"
+      - "batch_size=64 saat encode adalah tradeoff speed vs memory, naikkan ke 128+ jika RAM mencukupi"
+    pitfalls:
+      - "JANGAN lupa normalize_L2 SEBELUM add() dan SEBELUM search(), tanpa ini hasilnya bukan cosine similarity"
+      - "FAISS tidak thread-safe untuk concurrent write, jangan add() dari multiple threads secara bersamaan"
+      - "indices[0] bisa berisi -1 jika top_k > jumlah vectors di index, selalu filter idx != -1"
+      - "faiss-gpu jauh lebih cepat tapi butuh CUDA setup yang kompleks, gunakan faiss-cpu untuk RETRO"
+
+  - id: pgvector
+    name: "pgvector"
+    category: "Vector Extension for PostgreSQL"
+    description: >
+      pgvector adalah extension PostgreSQL open-source yang menambahkan tipe data
+      vector dan operator similarity search langsung di dalam PostgreSQL. Memungkinkan
+      menyimpan dan mencari embeddings di database yang sama dengan data relasional
+      lainnya tanpa server vector DB terpisah. Mendukung exact (IVFFlat) dan
+      approximate (HNSW) nearest neighbor search. Sangat cocok untuk RETRO jika
+      ingin menyederhanakan infrastruktur: satu PostgreSQL instance untuk semua data.
+    specific_function: >
+      Menyimpan company profile embeddings langsung di PostgreSQL bersama dengan
+      data relasional (URL, metadata, staging data). Memungkinkan JOIN antara
+      company profiles dan data lain dalam satu SQL query.
+    language: "Python (psycopg2, asyncpg, sqlalchemy, pgvector-python)"
+    pricing: "Free (open-source extension)"
+    last_updated: "2025"
+    url: "https://github.com/pgvector/pgvector"
+    retro:
+      phase: "Phase 4 (Vector Storage) - Single-DB alternatif"
+      role: >
+        Digunakan jika RETRO ingin mengurangi jumlah services yang perlu dijalankan.
+        Dengan pgvector, satu PostgreSQL menangani semua: staging data, company profiles,
+        relational queries, DAN vector similarity search. Mengorbankan sedikit performance
+        dibanding Qdrant tapi menyederhanakan infrastruktur.
+      when_to_use: >
+        Pertimbangkan pgvector jika budget server terbatas (tidak mau bayar untuk
+        Qdrant Cloud dan tidak mau setup Docker dua container). Jika company pool
+        < 10.000, pgvector sudah sangat memadai. Untuk > 100.000 perusahaan,
+        pertimbangkan HNSW index atau migrasi ke Qdrant.
+      priority: "secondary (single-DB architecture)"
+      output_goes_to: "Synthesis Agent via SQL query"
+    setup:
+      install: |
+        pip install pgvector psycopg2-binary
+        # Di PostgreSQL server:
+        # CREATE EXTENSION vector;
+      docker: "docker run -e POSTGRES_PASSWORD=retro -p 5432:5432 pgvector/pgvector:pg16"
+      requirements:
+        - "PostgreSQL 14+ dengan pgvector extension"
+        - "pgvector>=0.2.0"
+        - "psycopg2-binary atau asyncpg"
+      env_vars:
+        - name: DATABASE_URL
+          description: "postgresql://user:password@host:5432/retro_db"
+    usage:
+      basic_example: |
+        import psycopg2
+        from pgvector.psycopg2 import register_vector
+
+        conn = psycopg2.connect("postgresql://retro:retro@localhost/retro_db")
+        register_vector(conn)  # Register tipe vector
+
+        cur = conn.cursor()
+
+        # Buat tabel dengan kolom vector
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS companies (
+                id          SERIAL PRIMARY KEY,
+                name        TEXT,
+                domain      TEXT UNIQUE,
+                embedding   vector(384)
+            )
+        """)
+
+        # Insert dengan embedding
+        import numpy as np
+        vec = np.random.rand(384).astype(np.float32)
+        cur.execute(
+            "INSERT INTO companies (name, domain, embedding) VALUES (%s, %s, %s)",
+            ("PT Maju", "maju.co.id", vec)
+        )
+        conn.commit()
+
+        # Similarity search (cosine distance = 1 - cosine_similarity)
+        query_vec = np.random.rand(384).astype(np.float32)
+        cur.execute("""
+            SELECT name, domain, 1 - (embedding <=> %s::vector) AS similarity
+            FROM companies
+            ORDER BY embedding <=> %s::vector
+            LIMIT 5
+        """, (query_vec, query_vec))
+
+        for row in cur.fetchall():
+            print(f"[{row[2]:.4f}] {row[0]} | {row[1]}")
+
+      retro_example: |
+        import psycopg2
+        import numpy as np
+        from pgvector.psycopg2 import register_vector
+        from sentence_transformers import SentenceTransformer
+
+        _conn = None
+        _embedder = None
+
+        def get_conn():
+            global _conn
+            if _conn is None or _conn.closed:
+                _conn = psycopg2.connect("postgresql://retro:retro@localhost/retro_db")
+                register_vector(_conn)
+                _ensure_schema(_conn)
+            return _conn
+
+        def _ensure_schema(conn):
+            cur = conn.cursor()
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS company_vectors (
+                    id              SERIAL PRIMARY KEY,
+                    company_name    TEXT NOT NULL,
+                    domain          TEXT UNIQUE NOT NULL,
+                    industry        TEXT,
+                    country         TEXT,
+                    expo            TEXT,
+                    profile_card    JSONB,
+                    embedding       vector(384),
+                    created_at      TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            # HNSW index untuk approximate search yang lebih cepat
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS company_vectors_hnsw_idx
+                ON company_vectors
+                USING hnsw (embedding vector_cosine_ops)
+                WITH (m = 16, ef_construction = 64)
+            """)
+            conn.commit()
+
+        def upsert_company_pgvector(profile_card: dict, expo: str):
+            embedder = get_embedder()
+            conn = get_conn()
+            cur  = conn.cursor()
+
+            text = (
+                f"{profile_card['company_name']} "
+                f"{profile_card.get('industry', '')} "
+                f"{profile_card.get('products_services', '')} "
+                f"{profile_card.get('value_proposition', '')}"
+            )
+            vec = embedder.encode(text, normalize_embeddings=True).astype(np.float32)
+
+            import json
+            cur.execute("""
+                INSERT INTO company_vectors
+                    (company_name, domain, industry, country, expo, profile_card, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (domain) DO UPDATE SET
+                    embedding    = EXCLUDED.embedding,
+                    profile_card = EXCLUDED.profile_card,
+                    expo         = EXCLUDED.expo
+            """, (
+                profile_card["company_name"],
+                profile_card["domain"],
+                profile_card.get("industry"),
+                profile_card.get("country"),
+                expo,
+                json.dumps(profile_card),
+                vec,
+            ))
+            conn.commit()
+
+        def search_pgvector(retro_text: str, top_k: int = 20, expo: str | None = None):
+            embedder = get_embedder()
+            conn = get_conn()
+            cur  = conn.cursor()
+
+            query_vec = embedder.encode(retro_text, normalize_embeddings=True).astype(np.float32)
+
+            where_clause = "WHERE expo = %s" if expo else ""
+            params = [query_vec, query_vec]
+            if expo:
+                params = [query_vec, expo, query_vec]
+
+            sql = f"""
+                SELECT
+                    company_name,
+                    domain,
+                    industry,
+                    1 - (embedding <=> %s::vector) AS similarity,
+                    profile_card
+                FROM company_vectors
+                {where_clause}
+                ORDER BY embedding <=> %s::vector
+                LIMIT {top_k}
+            """
+            if expo:
+                cur.execute(sql, (query_vec, expo, query_vec))
+            else:
+                cur.execute(sql, (query_vec, query_vec))
+
+            rows = cur.fetchall()
+            return [
+                {
+                    "company_name":     r[0],
+                    "domain":           r[1],
+                    "industry":         r[2],
+                    "similarity_score": round(float(r[3]), 4),
+                    "profile_card":     r[4],
+                }
+                for r in rows
+            ]
+
+        def get_embedder():
+            global _embedder
+            if _embedder is None:
+                _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            return _embedder
+
+      expected_output: |
+        # Query result dari PostgreSQL:
+        [0.8821] PT Sinar Logistik Nusantara | sinarlogistik.co.id | logistics
+        [0.8345] Global Supply Chain Solutions | gsc-solutions.com  | technology
+        [0.7912] Nexus Distribution Hub       | nexusdist.sg        | logistics
+
+    notes:
+      - "Operator <=> adalah cosine distance (1 - similarity), <#> adalah inner product, <-> adalah euclidean"
+      - "HNSW index jauh lebih cepat dari IVFFlat untuk query, tapi lebih lambat saat build dan butuh lebih banyak RAM"
+      - "ON CONFLICT (domain) DO UPDATE memungkinkan upsert yang idempotent, aman dipanggil berkali-kali"
+      - "JSONB untuk profile_card memungkinkan query JSON langsung dari PostgreSQL: profile_card->>'company_name'"
+      - "pgvector Docker image pgvector/pgvector sudah include extension, tidak perlu install manual"
+    pitfalls:
+      - "JANGAN lupa jalankan CREATE EXTENSION IF NOT EXISTS vector; sebelum membuat tabel dengan kolom vector"
+      - "Vector dimension harus konsisten, tidak bisa ubah setelah tabel dibuat tanpa DROP dan CREATE ulang"
+      - "Tanpa HNSW atau IVFFlat index, pgvector melakukan sequential scan (lambat untuk > 10K rows)"
+      - "pgvector menyimpan embeddings sebagai float32, pastikan numpy array di-cast ke float32 sebelum insert"
+
+  - id: milvus
+    name: "Milvus"
+    category: "Vector Database"
+    description: >
+      Milvus adalah vector database open-source cloud-native yang dirancang untuk
+      skala besar (billion-scale vectors). Mendukung multiple index types (IVF_FLAT,
+      HNSW, SCANN), dynamic schema, time travel queries, dan multi-tenancy. Jauh
+      lebih complex dari Qdrant dalam setup tapi lebih scalable untuk enterprise
+      use case. Tersedia sebagai Milvus Lite (embedded, tanpa Docker), Milvus
+      Standalone (Docker), dan Zilliz Cloud (managed).
+    specific_function: >
+      Enterprise-grade vector storage untuk RETRO jika company pool mencapai
+      jutaan entries. Milvus Lite bisa digunakan sebagai development alternative
+      tanpa Docker (mirip ChromaDB tapi dengan Milvus API).
+    language: "Python (pymilvus)"
+    pricing: "Free (open-source), Zilliz Cloud mulai $0 (free tier)"
+    last_updated: "2025"
+    url: "https://milvus.io"
+    retro:
+      phase: "Phase 4 (Vector Storage) - Enterprise scale"
+      role: >
+        Digunakan jika RETRO scale menjadi enterprise product dengan jutaan company
+        profiles. Untuk RETRO MVP, Qdrant lebih simple. Milvus direkomendasikan
+        hanya jika company pool > 1 juta entries.
+      when_to_use: >
+        Pertimbangkan Milvus ketika RETRO sudah production dan company pool
+        berkembang pesat melampaui kemampuan Qdrant. Untuk awal, gunakan Qdrant.
+        Milvus Lite bisa digunakan untuk testing tanpa Docker.
+      priority: "optional (enterprise scale)"
+      output_goes_to: "Synthesis Agent (enterprise mode)"
+    setup:
+      install: "pip install pymilvus  # Include Milvus Lite"
+      requirements:
+        - "pymilvus>=2.4.0"
+        - "Docker (untuk Milvus Standalone)"
+      env_vars:
+        - name: MILVUS_URI
+          description: "URI Milvus instance, e.g., http://localhost:19530 atau ./milvus_lite.db untuk Lite"
+    usage:
+      basic_example: |
+        from pymilvus import MilvusClient
+
+        # Milvus Lite (tanpa Docker, simpan ke file lokal)
+        client = MilvusClient("./retro_milvus.db")
+
+        # Buat collection
+        client.create_collection(
+            collection_name="companies",
+            dimension=384,
+        )
+
+        # Insert
+        import numpy as np
+        vec = np.random.rand(384).tolist()
+        client.insert(
+            collection_name="companies",
+            data=[{"id": 1, "vector": vec, "company_name": "PT Maju", "domain": "maju.co.id"}],
+        )
+
+        # Search
+        query_vec = np.random.rand(384).tolist()
+        results = client.search(
+            collection_name="companies",
+            data=[query_vec],
+            limit=5,
+            output_fields=["company_name", "domain"],
+        )
+        print(results)
+
+      retro_example: |
+        # Milvus Lite untuk development, mudah switch ke Standalone untuk production
+        from pymilvus import MilvusClient, DataType
+        from sentence_transformers import SentenceTransformer
+        import numpy as np
+
+        def get_milvus_client(uri: str = "./retro_milvus.db") -> MilvusClient:
+            client = MilvusClient(uri)
+            if "retro_companies" not in client.list_collections():
+                schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
+                schema.add_field("id",        DataType.VARCHAR, max_length=200, is_primary=True)
+                schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=384)
+
+                index_params = client.prepare_index_params()
+                index_params.add_index("embedding", metric_type="COSINE", index_type="HNSW")
+
+                client.create_collection("retro_companies", schema=schema, index_params=index_params)
+            return client
+
+        def upsert_company_milvus(client: MilvusClient, profile_card: dict, expo: str, embedder):
+            text = f"{profile_card['company_name']} {profile_card.get('industry', '')} {profile_card.get('value_proposition', '')}"
+            vec  = embedder.encode(text, normalize_embeddings=True).tolist()
+            doc_id = profile_card["domain"].replace(".", "-")[:200]
+
+            client.upsert(
+                collection_name="retro_companies",
+                data=[{
+                    "id":           doc_id,
+                    "embedding":    vec,
+                    "company_name": profile_card["company_name"],
+                    "domain":       profile_card["domain"],
+                    "industry":     profile_card.get("industry", ""),
+                    "expo":         expo,
+                }]
+            )
+
+        def search_milvus(client: MilvusClient, retro_text: str, embedder, top_k: int = 20):
+            query_vec = embedder.encode(retro_text, normalize_embeddings=True).tolist()
+            results = client.search(
+                collection_name="retro_companies",
+                data=[query_vec],
+                limit=top_k,
+                output_fields=["company_name", "domain", "industry"],
+            )
+            return [
+                {
+                    "similarity_score": r["distance"],
+                    "company_name":     r["entity"]["company_name"],
+                    "domain":           r["entity"]["domain"],
+                }
+                for r in results[0]
+            ]
+
+      expected_output: |
+        [0.8821] PT Sinar Logistik | sinarlogistik.co.id
+        [0.8345] Global SCM Tech   | globalscm.io
+
+    notes:
+      - "Milvus Lite (file URI) cocok untuk development, tidak perlu Docker apapun"
+      - "Untuk production, switch ke Milvus Standalone Docker atau Zilliz Cloud hanya dengan mengubah URI"
+      - "Dynamic fields (enable_dynamic_field=True) memungkinkan insert field arbitrary tanpa define schema dulu"
+      - "Milvus mendukung partition untuk multi-tenancy: bisa partition per expo atau per industri"
+    pitfalls:
+      - "Milvus Lite tidak support semua fitur Milvus Standalone, cek dokumentasi sebelum menggunakan fitur advanced"
+      - "String ID di Milvus memiliki max_length, pastikan domain-based ID tidak melebihi limit"
+      - "COSINE metric memerlukan HNSW atau IVF index, tidak bisa dengan FLAT index"
+
+  - id: annoy
+    name: "Annoy (Approximate Nearest Neighbors Oh Yeah)"
+    category: "Vector Search Library"
+    description: >
+      Annoy adalah library C++ dengan Python binding dari Spotify untuk approximate
+      nearest neighbor search. Menggunakan random projection trees sebagai indexing
+      structure. Sangat ringan, tidak ada server, index disimpan sebagai memory-mapped
+      file (bisa dibagi antar proses). Cocok untuk static datasets yang jarang berubah.
+      Setelah index di-build, tidak bisa di-update (harus rebuild dari scratch).
+    specific_function: >
+      Static similarity search untuk company pool yang sudah fix (misalnya setelah
+      semua exhibitor satu expo selesai di-profile). Build index satu kali, query
+      berkali-kali. Lebih cepat dari FAISS untuk query tunggal karena memory-mapped.
+    language: "Python (annoy)"
+    pricing: "Free (open-source, Spotify)"
+    last_updated: "2024"
+    url: "https://github.com/spotify/annoy"
+    retro:
+      phase: "Phase 5 (Synthesis) - Static index untuk satu expo"
+      role: >
+        Setelah semua perusahaan dari satu expo selesai di-profile, build Annoy
+        index untuk expo tersebut. Index ini bisa di-load berkali-kali oleh
+        Synthesis Agent tanpa re-compute. Ideal untuk periodic batch synthesis
+        (misal: setiap malam setelah crawling selesai).
+      when_to_use: >
+        Gunakan Annoy ketika company pool untuk satu expo sudah stabil dan tidak
+        akan berubah dalam satu malam. Build index malam hari, query pagi hari.
+        Jangan gunakan jika company profiles sering diupdate secara real-time.
+      priority: "optional (static batch mode)"
+      output_goes_to: "Synthesis Agent (static expo index)"
+    setup:
+      install: "pip install annoy"
+      requirements:
+        - "annoy>=1.17.0"
+        - "numpy"
+        - "sentence-transformers"
+      env_vars: []
+    usage:
+      basic_example: |
+        from annoy import AnnoyIndex
+
+        dim = 384
+        index = AnnoyIndex(dim, 'angular')  # 'angular' = cosine similarity
+
+        # Build index
+        index.add_item(0, [0.1, 0.2, ...])  # item ID, vector
+        index.add_item(1, [0.3, 0.4, ...])
+        index.build(n_trees=10)  # Lebih banyak trees = lebih akurat tapi lebih lambat build
+
+        # Save dan load
+        index.save('companies.ann')
+        new_index = AnnoyIndex(dim, 'angular')
+        new_index.load('companies.ann')
+
+        # Query
+        similar_ids, distances = new_index.get_nns_by_vector(
+            [0.15, 0.25, ...],
+            n=5,
+            include_distances=True
+        )
+        print(similar_ids, distances)
+
+      retro_example: |
+        import json
+        import os
+        from annoy import AnnoyIndex
+        from sentence_transformers import SentenceTransformer
+
+        DIM = 384
+        MODEL_NAME = "all-MiniLM-L6-v2"
+
+        def build_expo_annoy_index(
+            profiles: list[dict],
+            expo_name: str,
+            index_dir: str = "./annoy_indexes",
+            n_trees: int = 20,
+        ) -> tuple[AnnoyIndex, list[dict]]:
+            """
+            Build Annoy index untuk satu expo. Simpan ke disk untuk reuse.
+            Return: (AnnoyIndex, list of profiles in index order)
+            """
+            os.makedirs(index_dir, exist_ok=True)
+            index_path    = os.path.join(index_dir, f"{expo_name.replace(' ', '_')}.ann")
+            metadata_path = os.path.join(index_dir, f"{expo_name.replace(' ', '_')}_meta.json")
+
+            embedder = SentenceTransformer(MODEL_NAME)
+            index    = AnnoyIndex(DIM, 'angular')
+
+            texts = [
+                f"{p.get('company_name', '')} {p.get('industry', '')} {p.get('value_proposition', '')}"
+                for p in profiles
+            ]
+            embeddings = embedder.encode(texts, normalize_embeddings=True, batch_size=64)
+
+            for i, vec in enumerate(embeddings):
+                index.add_item(i, vec.tolist())
+
+            index.build(n_trees=n_trees)
+            index.save(index_path)
+
+            with open(metadata_path, 'w') as f:
+                json.dump(profiles, f, ensure_ascii=False)
+
+            print(f"[Annoy] Built index for {expo_name}: {len(profiles)} companies, {n_trees} trees")
+            return index, profiles
+
+        def load_expo_index(expo_name: str, index_dir: str = "./annoy_indexes"):
+            index_path    = os.path.join(index_dir, f"{expo_name.replace(' ', '_')}.ann")
+            metadata_path = os.path.join(index_dir, f"{expo_name.replace(' ', '_')}_meta.json")
+
+            index = AnnoyIndex(DIM, 'angular')
+            index.load(index_path)
+
+            with open(metadata_path) as f:
+                profiles = json.load(f)
+
+            return index, profiles
+
+        def search_annoy(expo_name: str, retro_text: str, top_k: int = 20):
+            embedder = SentenceTransformer(MODEL_NAME)
+            index, profiles = load_expo_index(expo_name)
+
+            query_vec = embedder.encode(retro_text, normalize_embeddings=True).tolist()
+            ids, distances = index.get_nns_by_vector(query_vec, n=top_k, include_distances=True)
+
+            results = []
+            for idx, dist in zip(ids, distances):
+                similarity = 1 - (dist ** 2) / 2  # Convert angular distance ke cosine similarity
+                results.append({
+                    "similarity_score": round(similarity, 4),
+                    "company_name":     profiles[idx]["company_name"],
+                    "domain":           profiles[idx]["domain"],
+                })
+            return results
+
+      expected_output: |
+        [Annoy] Built index for LogiSEA 2025: 342 companies, 20 trees
+        Saved to ./annoy_indexes/LogiSEA_2025.ann
+
+        Search results for expo LogiSEA 2025:
+        [0.8921] PT Sinar Logistik Nusantara | sinarlogistik.co.id
+        [0.8534] Global SCM Tech             | globalscm.io
+        [0.8102] Nexus Distribution          | nexusdist.sg
+
+    notes:
+      - "Angular distance di Annoy bisa dikonversi ke cosine similarity: cosine = 1 - (angular^2 / 2)"
+      - "Annoy index immutable setelah build, tidak bisa add_item setelah build(). Harus rebuild dari scratch jika ada company baru"
+      - "Memory-mapped file: multiple Python processes bisa load AnnoyIndex yang sama tanpa duplikasi RAM"
+      - "n_trees lebih banyak = search lebih akurat, build lebih lambat. n_trees=20 sudah sangat baik untuk < 10K items"
+      - "Annoy file .ann lebih compact dari pickle numpy array karena menggunakan binary format"
+    pitfalls:
+      - "JANGAN call build() dua kali pada index yang sama, gunakan new AnnoyIndex"
+      - "Item ID di Annoy harus integer 0-based, tidak support string ID. Simpan mapping ID -> profile di metadata JSON terpisah"
+      - "Annoy tidak support batch deletion, untuk remove company harus rebuild seluruh index"
+
+  - id: usearch
+    name: "USearch"
+    category: "Vector Search Library"
+    description: >
+      USearch adalah vector search library dari Unum Cloud yang mengklaim sebagai
+      alternatif FAISS yang lebih cepat dan lebih memory-efficient. Ditulis dalam
+      C++ dengan Python binding. Mendukung HNSW indexing, multiple distance metrics,
+      dan filtering. Relatif baru dibanding FAISS tapi semakin populer karena
+      performa tinggi pada commodity hardware.
+    specific_function: >
+      Alternative ke FAISS untuk in-memory atau file-based vector search di RETRO.
+      Lebih cepat dari FAISS untuk single query dan memiliki API yang lebih modern
+      (support numpy array langsung tanpa manual normalize).
+    language: "Python (usearch)"
+    pricing: "Free (open-source, Apache 2.0)"
+    last_updated: "2025"
+    url: "https://github.com/unum-cloud/usearch"
+    retro:
+      phase: "Phase 5 (Synthesis) - Fallback / High-performance offline batch"
+      role: >
+        Fallback kedua setelah FAISS jika performa FAISS tidak mencukupi.
+        Juga berguna untuk single-file deployment di edge device (seluruh index
+        dalam satu file .usearch).
+      when_to_use: >
+        Pertimbangkan USearch jika FAISS terlalu lambat atau terlalu banyak memory.
+        Untuk RETRO MVP, FAISS atau Qdrant sudah cukup.
+      priority: "optional"
+      output_goes_to: "Synthesis Agent"
+    setup:
+      install: "pip install usearch"
+      requirements:
+        - "usearch>=2.9.0"
+        - "numpy"
+      env_vars: []
+    usage:
+      basic_example: |
+        from usearch.index import Index
+        import numpy as np
+
+        index = Index(
+            ndim=384,
+            metric='cos',       # Cosine similarity
+            dtype='f32',
+            connectivity=16,    # HNSW M parameter
+            expansion_add=128,  # HNSW ef_construction
+        )
+
+        # Add vectors
+        vectors = np.random.rand(100, 384).astype(np.float32)
+        labels  = np.arange(100)  # Integer labels
+        index.add(labels, vectors)
+
+        # Save dan load
+        index.save('companies.usearch')
+        index2 = Index.restore('companies.usearch')
+
+        # Search
+        query = np.random.rand(384).astype(np.float32)
+        matches = index.search(query, 5)
+        for m in matches:
+            print(f"Label: {m.key}, Score: {m.distance:.4f}")
+
+      retro_example: |
+        from usearch.index import Index
+        import numpy as np
+        import json
+        from sentence_transformers import SentenceTransformer
+
+        def build_usearch_index(profiles: list[dict], output_path: str):
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            texts    = [
+                f"{p.get('company_name', '')} {p.get('industry', '')} {p.get('value_proposition', '')}"
+                for p in profiles
+            ]
+            embeddings = embedder.encode(texts, normalize_embeddings=True).astype(np.float32)
+            labels     = np.arange(len(profiles))
+
+            index = Index(ndim=384, metric='cos')
+            index.add(labels, embeddings)
+            index.save(output_path)
+
+            meta_path = output_path.replace('.usearch', '_meta.json')
+            with open(meta_path, 'w') as f:
+                json.dump(profiles, f, ensure_ascii=False)
+            print(f"[USearch] Saved index: {len(profiles)} companies -> {output_path}")
+
+        def search_usearch(index_path: str, retro_text: str, top_k: int = 20) -> list[dict]:
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            index    = Index.restore(index_path)
+            meta_path = index_path.replace('.usearch', '_meta.json')
+            with open(meta_path) as f:
+                profiles = json.load(f)
+
+            query_vec = embedder.encode(retro_text, normalize_embeddings=True).astype(np.float32)
+            matches   = index.search(query_vec, top_k)
+
+            return [
+                {
+                    "similarity_score": round(1 - float(m.distance), 4),
+                    "company_name":     profiles[int(m.key)]["company_name"],
+                    "domain":           profiles[int(m.key)]["domain"],
+                }
+                for m in matches
+            ]
+
+      expected_output: |
+        [USearch] Saved index: 500 companies -> ./logisea2025.usearch
+        [0.8921] PT Sinar Logistik | sinarlogistik.co.id
+        [0.8534] Global SCM Tech   | globalscm.io
+
+    notes:
+      - "USearch metric='cos' menggunakan angular distance, konversi ke similarity: 1 - distance"
+      - "USearch mendukung int8 quantization untuk mengurangi memory 4x: dtype='i8'"
+      - "Save/restore jauh lebih cepat dari Annoy untuk index besar karena binary format yang lebih efisien"
+    pitfalls:
+      - "Labels harus numpy integer array (np.arange()), bukan Python list biasa"
+      - "USearch cukup baru, API bisa berubah antar versi, pin versi di requirements.txt"
+
+  - id: ollama_embedding
+    name: "Ollama (Local Embedding)"
+    category: "Local Embedding Provider"
+    description: >
+      Ollama adalah tool untuk menjalankan LLM dan embedding models secara lokal.
+      Selain generasi teks, Ollama mendukung embedding generation via HTTP API yang
+      kompatibel dengan OpenAI API format. Model embedding yang tersedia di Ollama:
+      nomic-embed-text (768-dim), mxbai-embed-large (1024-dim), all-minilm (384-dim).
+      Berguna ketika ingin generate embeddings tanpa internet atau tanpa API key.
+    specific_function: >
+      Alternative embedding provider untuk RETRO yang berjalan 100% lokal. Generate
+      embeddings untuk company profiles tanpa mengirim data ke cloud. Cocok untuk
+      data sensitif atau environment tanpa internet.
+    language: "Python (via HTTP requests atau openai client)"
+    pricing: "Free (lokal, butuh GPU/CPU)"
+    last_updated: "2025"
+    url: "https://ollama.com"
+    retro:
+      phase: "Phase 4 (Embedding Generation) - Local alternative"
+      role: >
+        Menghasilkan embeddings untuk company profiles secara lokal tanpa bergantung
+        pada API eksternal. Digunakan ketika RETRO berjalan di environment tertutup
+        atau ketika ingin zero-cost embeddings.
+      when_to_use: >
+        Gunakan Ollama embedding ketika data company profile bersifat confidential
+        dan tidak boleh dikirim ke cloud. Atau ketika internet tidak tersedia.
+        Untuk performa terbaik, Ollama membutuhkan GPU; di CPU akan lambat.
+      priority: "secondary (local deployment)"
+      output_goes_to: "Qdrant atau FAISS (embeddings siap disimpan)"
+    setup:
+      install: |
+        # 1. Install Ollama dari https://ollama.com/download
+        # 2. Pull model embedding
+        ollama pull nomic-embed-text
+        # 3. Install Python client
+        pip install ollama
+      requirements:
+        - "Ollama Desktop atau CLI terinstall"
+        - "Model embedding sudah di-pull"
+        - "ollama Python package"
+      env_vars:
+        - name: OLLAMA_BASE_URL
+          description: "URL Ollama server, default http://localhost:11434"
+    usage:
+      basic_example: |
+        import ollama
+
+        # Generate embedding untuk satu teks
+        response = ollama.embeddings(
+            model='nomic-embed-text',
+            prompt='PT Maju Bersama adalah perusahaan logistik di Jakarta',
+        )
+        embedding = response['embedding']
+        print(f"Embedding dim: {len(embedding)}")  # 768 untuk nomic-embed-text
+
+        # Via openai-compatible API
+        from openai import OpenAI
+        client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+        resp = client.embeddings.create(
+            model="nomic-embed-text",
+            input="company description text",
+        )
+        vec = resp.data[0].embedding
+
+      retro_example: |
+        import ollama
+        import numpy as np
+
+        OLLAMA_EMBED_MODEL = "nomic-embed-text"  # 768-dim, free, local
+
+        _ollama_available = None
+
+        def check_ollama() -> bool:
+            global _ollama_available
+            if _ollama_available is None:
+                try:
+                    ollama.list()
+                    _ollama_available = True
+                except Exception:
+                    _ollama_available = False
+                    print("[Ollama] Ollama tidak berjalan, fallback ke sentence-transformers")
+            return _ollama_available
+
+        def embed_text_ollama(text: str) -> list[float] | None:
+            """Return embedding atau None jika Ollama tidak tersedia."""
+            if not check_ollama():
+                return None
+            response = ollama.embeddings(model=OLLAMA_EMBED_MODEL, prompt=text)
+            vec = np.array(response['embedding'], dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm  # Manual normalize untuk cosine similarity
+            return vec.tolist()
+
+        def embed_company_profile(profile_card: dict) -> list[float]:
+            """
+            Embed company profile, coba Ollama dulu, fallback ke sentence-transformers.
+            """
+            text = (
+                f"{profile_card.get('company_name', '')} "
+                f"{profile_card.get('industry', '')} "
+                f"{profile_card.get('products_services', '')} "
+                f"{profile_card.get('value_proposition', '')}"
+            )
+
+            vec = embed_text_ollama(text)
+            if vec is not None:
+                return vec
+
+            # Fallback ke sentence-transformers
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            return model.encode(text, normalize_embeddings=True).tolist()
+
+      expected_output: |
+        Embedding dim: 768
+        Vector (first 5 dims): [0.0234, -0.1123, 0.3412, -0.0567, 0.2891]
+
+    notes:
+      - "nomic-embed-text menghasilkan 768-dim embeddings, cocok untuk similarity search yang akurat"
+      - "Ollama embedding jauh lebih lambat dari sentence-transformers untuk batch processing (tidak ada GPU batching)"
+      - "Normalize manual diperlukan karena Ollama tidak otomatis normalize seperti sentence-transformers dengan normalize_embeddings=True"
+      - "Ollama mendukung concurrent requests, bisa jalankan beberapa embedding request bersamaan dengan asyncio"
+      - "all-minilm model di Ollama menghasilkan 384-dim, kompatibel dengan sentence-transformers all-MiniLM-L6-v2"
+    pitfalls:
+      - "Ollama harus running sebelum embed_text_ollama dipanggil, gunakan check_ollama() untuk graceful fallback"
+      - "JANGAN gunakan Ollama untuk batch embedding besar (> 1000 texts) tanpa GPU, akan sangat lambat"
+      - "Model harus sudah di-pull dengan ollama pull sebelum bisa digunakan"
+
+  - id: litellm_embedding
+    name: "LiteLLM (Embedding Interface)"
+    category: "LLM Router / Unified API"
+    description: >
+      LiteLLM adalah library Python yang menyediakan unified interface untuk 100+
+      LLM providers (OpenAI, Anthropic, Groq, Ollama, Azure, Cohere, dll) termasuk
+      untuk embedding generation. Dengan LiteLLM, kode RETRO bisa switch antara
+      OpenAI embeddings, Ollama embeddings, Cohere embeddings, atau Voyage AI embeddings
+      hanya dengan mengubah satu string model name tanpa mengubah kode sama sekali.
+    specific_function: >
+      Unified embedding interface untuk RETRO. Synthesis Agent memanggil
+      litellm.embedding() dengan model name yang dikonfigurasi di env, sehingga
+      bisa switch provider embedding tanpa ubah kode. Mendukung async dengan
+      litellm.aembedding() untuk batch processing.
+    language: "Python"
+    pricing: "Free (open-source router, biaya embedding tergantung provider)"
+    last_updated: "2025"
+    url: "https://litellm.ai"
+    retro:
+      phase: "Phase 4 (Embedding Generation) - Unified provider interface"
+      role: >
+        Single interface untuk semua embedding providers. RETRO menggunakan
+        EMBED_MODEL env variable untuk pilih provider: 'ollama/nomic-embed-text'
+        untuk lokal, 'text-embedding-3-small' untuk OpenAI, 'cohere/embed-multilingual-v3.0'
+        untuk Cohere.
+      when_to_use: >
+        Gunakan LiteLLM embedding ketika RETRO perlu flexibility untuk ganti
+        embedding provider berdasarkan cost/availability. Sangat berguna untuk
+        A/B test kualitas embedding dari provider berbeda.
+      priority: "secondary (provider flexibility)"
+      output_goes_to: "Qdrant (embeddings dari any provider)"
+    setup:
+      install: "pip install litellm"
+      requirements:
+        - "litellm>=1.0.0"
+        - "API key untuk provider yang dipilih (jika cloud)"
+      env_vars:
+        - name: EMBED_MODEL
+          description: "Model embedding, e.g., 'text-embedding-3-small', 'ollama/nomic-embed-text'"
+        - name: OPENAI_API_KEY
+          description: "Diperlukan jika menggunakan OpenAI embeddings"
+        - name: COHERE_API_KEY
+          description: "Diperlukan jika menggunakan Cohere embeddings"
+    usage:
+      basic_example: |
+        import litellm
+        import os
+
+        # OpenAI embeddings
+        os.environ["OPENAI_API_KEY"] = "sk-..."
+        response = litellm.embedding(
+            model="text-embedding-3-small",
+            input=["Company profile text here"],
+        )
+        vec = response.data[0]['embedding']
+        print(f"Dimension: {len(vec)}")  # 1536 untuk text-embedding-3-small
+
+        # Ollama embeddings (lokal, tidak perlu API key)
+        response = litellm.embedding(
+            model="ollama/nomic-embed-text",
+            input=["Company profile text here"],
+        )
+
+        # Async (untuk batch)
+        import asyncio
+        async def embed_batch(texts: list[str]):
+            tasks = [
+                litellm.aembedding(model="text-embedding-3-small", input=[t])
+                for t in texts
+            ]
+            results = await asyncio.gather(*tasks)
+            return [r.data[0]['embedding'] for r in results]
+
+      retro_example: |
+        import litellm
+        import numpy as np
+        import asyncio
+        import os
+
+        EMBED_MODEL = os.getenv("EMBED_MODEL", "ollama/nomic-embed-text")
+
+        async def embed_profiles_batch(profiles: list[dict]) -> list[list[float]]:
+            """
+            Embed semua company profiles secara async concurrent.
+            Works dengan model apapun yang LiteLLM support.
+            """
+            texts = [
+                (
+                    f"{p.get('company_name', '')} "
+                    f"{p.get('industry', '')} "
+                    f"{p.get('products_services', '')} "
+                    f"{p.get('value_proposition', '')}"
+                )
+                for p in profiles
+            ]
+
+            # Batch dengan semaphore untuk rate limiting
+            semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+
+            async def embed_one(text: str) -> list[float]:
+                async with semaphore:
+                    response = await litellm.aembedding(
+                        model=EMBED_MODEL,
+                        input=[text],
+                    )
+                    vec = np.array(response.data[0]['embedding'], dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                    return vec.tolist()
+
+            embeddings = await asyncio.gather(*[embed_one(t) for t in texts])
+            return embeddings
+
+        def embed_profile_sync(profile_card: dict) -> list[float]:
+            """Synchronous wrapper untuk Context Agent yang tidak async."""
+            text = (
+                f"{profile_card.get('company_name', '')} "
+                f"{profile_card.get('industry', '')} "
+                f"{profile_card.get('value_proposition', '')}"
+            )
+            response = litellm.embedding(model=EMBED_MODEL, input=[text])
+            vec = np.array(response.data[0]['embedding'], dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            return (vec / norm if norm > 0 else vec).tolist()
+
+        # Switch provider hanya dengan ganti env variable:
+        # EMBED_MODEL=text-embedding-3-small              -> OpenAI (1536-dim, $0.02/1M tokens)
+        # EMBED_MODEL=ollama/nomic-embed-text             -> Local Ollama (768-dim, gratis)
+        # EMBED_MODEL=cohere/embed-multilingual-v3.0      -> Cohere (1024-dim, $0.10/1M tokens)
+        # EMBED_MODEL=voyage/voyage-3                     -> Voyage AI (1024-dim, $0.06/1M tokens)
+
+      expected_output: |
+        # Menggunakan EMBED_MODEL=ollama/nomic-embed-text:
+        Embedding dim: 768
+        Normalize: True
+        Provider: Ollama (local)
+
+        # Menggunakan EMBED_MODEL=text-embedding-3-small:
+        Embedding dim: 1536
+        Normalize: True
+        Provider: OpenAI
+
+    notes:
+      - "LiteLLM menggunakan OpenAI-compatible response format untuk semua providers, jadi response.data[0]['embedding'] selalu benar"
+      - "Normalize manual TETAP diperlukan karena LiteLLM tidak selalu normalize output dari setiap provider"
+      - "Dimension embedding berbeda per model, Qdrant collection harus dibuat dengan dimension yang sesuai"
+      - "litellm.aembedding() mendukung true async, gunakan dengan asyncio.gather() untuk batch yang efisien"
+      - "LiteLLM memiliki built-in retry, timeout, dan fallback logic yang bisa dikonfigurasi"
+      - "Untuk switch provider, cukup ganti EMBED_MODEL env variable, tidak perlu ubah satu baris kode pun"
+    pitfalls:
+      - "JANGAN simpan embedding dari provider A ke Qdrant yang sudah berisi embedding dari provider B, dimensinya beda"
+      - "Rate limit berbeda tiap provider, sesuaikan semaphore limit: OpenAI lebih longgar, Cohere lebih ketat"
+      - "Ollama via LiteLLM lebih lambat dari direct ollama.embeddings() karena ada overhead routing"
+      - "Cek EMBED_MODEL di awal startup dan validasi dimension match dengan Qdrant collection sebelum pipeline jalan"
+
+  - id: weaviate
+    name: "Weaviate"
+    category: "Vector Database"
+    description: >
+      Weaviate adalah vector database open-source berbasis Go yang mendukung
+      hybrid search (vector + BM25 keyword search secara bersamaan), GraphQL API,
+      built-in vectorizer (otomatis embed dokumen saat insert tanpa kode Python
+      tambahan), dan multi-tenancy. Tersedia sebagai Docker, Kubernetes, dan
+      Weaviate Cloud (managed). Hybrid search sangat berguna untuk RETRO karena
+      kombinasi semantic similarity dan keyword matching menghasilkan recall yang lebih baik.
+    specific_function: >
+      Hybrid vector + keyword search untuk RETRO. Ketika Synthesis Agent mencari
+      perusahaan, bisa search berdasarkan semantic meaning DAN keyword spesifik
+      secara bersamaan dalam satu query. Contoh: cari perusahaan yang secara
+      semantik mirip RETRO AND mengandung kata "logistics" atau "supply chain".
+    language: "Python (weaviate-client v4)"
+    pricing: "Free (open-source), Weaviate Cloud: mulai $0 (sandbox 14 hari)"
+    last_updated: "2025"
+    url: "https://weaviate.io"
+    retro:
+      phase: "Phase 4 (Vector Storage) + Phase 5 (Hybrid Search)"
+      role: >
+        Alternative Qdrant dengan kemampuan hybrid search. Berguna ketika company
+        pool besar dan pure semantic search sering mengembalikan hasil yang kurang
+        precise. Hybrid search menggabungkan BM25 (keyword) dan HNSW (semantic).
+      when_to_use: >
+        Pertimbangkan Weaviate jika hasil Qdrant kurang precise karena terlalu
+        banyak companies dengan profil generik. Hybrid search bisa narrow down
+        hasil dengan filter keyword yang lebih ketat.
+      priority: "optional (hybrid search use case)"
+      output_goes_to: "Synthesis Agent (hybrid ranked results)"
+    setup:
+      install: "pip install weaviate-client"
+      docker: "docker run -p 8080:8080 -p 50051:50051 cr.weaviate.io/semitechnologies/weaviate:latest"
+      requirements:
+        - "weaviate-client>=4.0.0"
+        - "Docker untuk self-hosted"
+      env_vars:
+        - name: WEAVIATE_URL
+          description: "URL Weaviate instance, default http://localhost:8080"
+        - name: WEAVIATE_API_KEY
+          description: "Hanya untuk Weaviate Cloud"
+    usage:
+      basic_example: |
+        import weaviate
+        from weaviate.classes.config import Configure, Property, DataType
+
+        client = weaviate.connect_to_local()  # Connect ke http://localhost:8080
+
+        # Buat collection
+        client.collections.create(
+            name="Company",
+            vectorizer_config=Configure.Vectorizer.none(),  # Manual embedding
+            properties=[
+                Property(name="company_name", data_type=DataType.TEXT),
+                Property(name="industry",     data_type=DataType.TEXT),
+                Property(name="domain",       data_type=DataType.TEXT),
+            ],
+        )
+
+        # Insert dengan manual vector
+        collection = client.collections.get("Company")
+        collection.data.insert(
+            properties={"company_name": "PT Maju", "industry": "logistics", "domain": "maju.co.id"},
+            vector=[0.1, 0.2, ...],
+        )
+
+        # Hybrid search
+        results = collection.query.hybrid(
+            query="supply chain technology",
+            vector=[0.1, 0.2, ...],
+            alpha=0.5,   # 0=pure BM25, 1=pure vector, 0.5=balanced
+            limit=5,
+        )
+        for r in results.objects:
+            print(r.properties["company_name"], r.metadata.score)
+
+        client.close()
+
+      retro_example: |
+        import weaviate
+        from weaviate.classes.config import Configure, Property, DataType
+        from sentence_transformers import SentenceTransformer
+        import contextlib
+
+        COLLECTION_NAME = "RetroCompany"
+        _weaviate_client = None
+
+        @contextlib.contextmanager
+        def get_weaviate():
+            global _weaviate_client
+            if _weaviate_client is None:
+                _weaviate_client = weaviate.connect_to_local()
+                _ensure_schema(_weaviate_client)
+            yield _weaviate_client
+
+        def _ensure_schema(client):
+            existing = [c.name for c in client.collections.list_all().values()]
+            if COLLECTION_NAME not in existing:
+                client.collections.create(
+                    name=COLLECTION_NAME,
+                    vectorizer_config=Configure.Vectorizer.none(),
+                    properties=[
+                        Property(name="company_name",    data_type=DataType.TEXT),
+                        Property(name="domain",          data_type=DataType.TEXT),
+                        Property(name="industry",        data_type=DataType.TEXT),
+                        Property(name="expo",            data_type=DataType.TEXT),
+                        Property(name="value_prop_text", data_type=DataType.TEXT),
+                    ],
+                )
+
+        def hybrid_search_weaviate(
+            retro_text: str,
+            keywords: list[str],
+            top_k: int = 20,
+            alpha: float = 0.6,  # 60% semantic, 40% BM25
+        ) -> list[dict]:
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            query_vec = embedder.encode(retro_text, normalize_embeddings=True).tolist()
+
+            # Gabung keywords untuk BM25 query
+            keyword_query = " ".join(keywords)
+
+            with get_weaviate() as client:
+                collection = client.collections.get(COLLECTION_NAME)
+                results = collection.query.hybrid(
+                    query=keyword_query,
+                    vector=query_vec,
+                    alpha=alpha,
+                    limit=top_k,
+                    return_metadata=["score", "explain_score"],
+                )
+
+            return [
+                {
+                    "hybrid_score":  r.metadata.score,
+                    "company_name":  r.properties["company_name"],
+                    "domain":        r.properties["domain"],
+                    "industry":      r.properties["industry"],
+                }
+                for r in results.objects
+            ]
+
+      expected_output: |
+        Hybrid search results (alpha=0.6: 60% semantic, 40% keyword):
+        [0.8234] PT Sinar Logistik Nusantara | sinarlogistik.co.id | logistics
+        [0.7891] Global SCM Tech             | globalscm.io        | technology
+        [0.7645] Nexus Distribution Hub      | nexusdist.sg        | logistics
+
+    notes:
+      - "alpha=0.5 adalah balanced hybrid, alpha=0.7 lebih condong ke semantic search, alpha=0.3 lebih condong ke keyword"
+      - "Weaviate BM25 bekerja pada field TEXT yang di-index, pastikan company_name dan industry adalah DataType.TEXT"
+      - "Weaviate v4 (weaviate-client>=4.0.0) memiliki breaking change dari v3, pastikan gunakan v4 API"
+      - "Hybrid search Weaviate sangat berguna ketika ada industry-specific terms yang semantic search saja tidak bisa tangkap"
+    pitfalls:
+      - "Weaviate lebih complex setup dibanding Qdrant, hanya worth it jika memang butuh hybrid search"
+      - "JANGAN lupa client.close() setelah selesai, gunakan context manager atau try/finally"
+      - "Weaviate Cloud sandbox expired setelah 14 hari, tidak cocok untuk production tanpa upgrade"

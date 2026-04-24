@@ -206,7 +206,7 @@ export const RETRO_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          domain: { type: "string", description: "Domain name without protocol (e.g. pindad.com)" }
+          domain: { type: "string", description: "Domain name without protocol (e.g. example.com)" }
         },
         required: ["domain"]
       }

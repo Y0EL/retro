@@ -6,7 +6,7 @@ import { AgentType } from "../types.js"
 
 const RunSchema = z.object({
   intent: z.string().min(1),
-  agentType: z.enum(["discovery", "briefing", "proposal", "admin"]).default("discovery"),
+  agentType: z.enum(["discovery", "briefing", "proposal", "admin", "full"]).default("full"),
   context: z.record(z.unknown()).optional(),
   priority: z.number().optional(),
 })
@@ -276,8 +276,9 @@ agentsRouter.get("/graph", (c) => {
               } catch { /* */ }
             }
 
-            // Only add as company if looks like a company name
-            if (title && title.length > 3 && title.length < 55 && !title.includes(". ") && !title.startsWith("http")) {
+            // Only add as company if it looks like an actual company name (has company identifier)
+            const COMPANY_PATTERN = /\b(PT|CV|UD|PD|BUMD|Inc\.?|Corp\.?|Ltd\.?|LLC|GmbH|S\.A\.|Tbk|Persero)\b/i
+            if (title && title.length > 3 && title.length < 55 && !title.includes(". ") && !title.startsWith("http") && COMPANY_PATTERN.test(title)) {
               const cId = `company-${title.toLowerCase().replace(/\W+/g, "-")}`
               const existing = nodeMap.get(cId)
               const prevVia = existing?.meta?.foundVia ?? []
@@ -309,30 +310,6 @@ agentsRouter.get("/graph", (c) => {
               }
             }
           }
-        }
-      }
-    }
-  }
-
-  // ── Auto-connect: entities discovered in the same job → "context" edge ──────
-  // Group confirmed (non-pending) nodes by jobId
-  const nodesByJob = new Map<string, string[]>()
-  for (const [id, node] of nodeMap) {
-    if (!node.pending) {
-      const list = nodesByJob.get(node.jobId) ?? []
-      list.push(id)
-      nodesByJob.set(node.jobId, list)
-    }
-  }
-  // Add context edges between company nodes from the same job (max 10 per job to avoid clutter)
-  for (const [, ids] of nodesByJob) {
-    const companies = ids.filter(id => nodeMap.get(id)?.type === "company")
-    for (let i = 0; i < Math.min(companies.length, 6); i++) {
-      for (let j = i + 1; j < Math.min(companies.length, 6); j++) {
-        const key = `${companies[i]}>${companies[j]}`
-        if (!edgeSet.has(key)) {
-          edgeSet.add(key)
-          edges.push({ source: companies[i], target: companies[j], sourceId: companies[i], targetId: companies[j], type: "context" as "owns" })
         }
       }
     }

@@ -5,6 +5,7 @@ import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 import { agentsRouter } from "./routes/agents.js"
 import { kbRouter } from "./routes/kb.js"
+import { authRouter } from "./routes/auth.js"
 import { setupWebSocket } from "./routes/ws.js"
 import { startWorker } from "./queue/worker.js"
 import { startOrchestrator } from "./pipeline/orchestrator.js"
@@ -22,6 +23,7 @@ app.use("*", (c, next) => {
 app.get("/health", (c) => c.json({ status: "ok", service: "retro-backend" }))
 app.route("/api/agents", agentsRouter)
 app.route("/api/kb", kbRouter)
+app.route("/api/auth", authRouter)
 
 // Proxy download PDF dari gateway — supaya frontend cukup tahu URL backend saja
 app.get("/api/files/:filename", async (c) => {

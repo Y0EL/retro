@@ -3,6 +3,7 @@ import { listJobs } from "../lib/api"
 import type { Job } from "../lib/api"
 import { extractDownloadUrls, fmtDate, fmtTime } from "../lib/utils"
 import KPICard from "../components/KPICard"
+import EmailDraftPanel from "../components/EmailDraftPanel"
 
 interface Report {
   jobId: string
@@ -11,12 +12,27 @@ interface Report {
   url: string
   type: "outbound" | "internal" | "unknown"
   createdAt: string
+  emailSubject?: string
+  emailBody?: string
+  targetCompany?: string
+}
+
+function deepFind(obj: unknown, key: string): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined
+  const rec = obj as Record<string, unknown>
+  if (typeof rec[key] === "string") return rec[key] as string
+  for (const v of Object.values(rec)) {
+    const found = deepFind(v, key)
+    if (found) return found
+  }
+  return undefined
 }
 
 export default function Laporan() {
   const [reports,   setReports]   = useState<Report[]>([])
   const [filter,    setFilter]    = useState<"all" | "outbound" | "internal">("all")
   const [loading,   setLoading]   = useState(true)
+  const [expanded,  setExpanded]  = useState<Set<string>>(new Set())
 
   useEffect(() => {
     async function fetch() {
@@ -32,12 +48,15 @@ export default function Laporan() {
               : url.includes("internal")          ? "internal"
               : "unknown"
             all.push({
-              jobId:     job.jobId,
-              intent:    job.intent,
-              agentType: job.agentType,
+              jobId:         job.jobId,
+              intent:        job.intent,
+              agentType:     job.agentType,
               url,
-              type: type as Report["type"],
-              createdAt: job.completedAt || job.createdAt,
+              type:          type as Report["type"],
+              createdAt:     job.completedAt || job.createdAt,
+              emailSubject:  deepFind(job.result, "email_subject"),
+              emailBody:     deepFind(job.result, "email_body_preview"),
+              targetCompany: deepFind(job.result, "target_company"),
             })
           }
         }
@@ -105,39 +124,69 @@ export default function Laporan() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((r, i) => (
-                  <tr key={`${r.jobId}-${i}`}>
-                    <td className="mono" style={{ fontSize: 10 }}>{i + 1}</td>
-                    <td>
-                      <div style={{ fontSize: 12, color: "var(--cc-data-primary)", fontWeight: 500 }}>
-                        {r.intent.slice(0, 60)}
-                      </div>
-                      <div style={{ fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
-                        {r.jobId.slice(0, 12)}…
-                      </div>
-                    </td>
-                    <td>
-                      <span className={`cc-badge ${r.type === "outbound" ? "cc-badge--proposal" : r.type === "internal" ? "cc-badge--discovery" : "cc-badge--idle"}`}>
-                        {r.type}
-                      </span>
-                    </td>
-                    <td>
-                      <span className={`cc-badge cc-badge--${r.agentType}`}>{r.agentType}</span>
-                    </td>
-                    <td className="mono" style={{ fontSize: 10 }}>{fmtDate(r.createdAt)}</td>
-                    <td>
-                      <a
-                        href={r.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="btn-cc btn-standard"
-                        style={{ textDecoration: "none", fontSize: 11, padding: "4px 10px" }}
+                {filtered.map((r, i) => {
+                  const rowKey = `${r.jobId}-${i}`
+                  const isExp  = expanded.has(rowKey)
+                  const hasEmail = !!(r.emailSubject || r.emailBody)
+                  return (
+                    <>
+                      <tr key={rowKey}
+                        style={{ cursor: hasEmail ? "pointer" : "default" }}
+                        onClick={() => {
+                          if (!hasEmail) return
+                          setExpanded(prev => {
+                            const next = new Set(prev)
+                            isExp ? next.delete(rowKey) : next.add(rowKey)
+                            return next
+                          })
+                        }}
                       >
-                        Download
-                      </a>
-                    </td>
-                  </tr>
-                ))}
+                        <td className="mono" style={{ fontSize: 10 }}>{i + 1}</td>
+                        <td>
+                          <div style={{ fontSize: 12, color: "var(--cc-data-primary)", fontWeight: 500 }}>
+                            {r.intent.slice(0, 60)}
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
+                            {r.jobId.slice(0, 12)}…
+                            {hasEmail && <span style={{ color: "var(--cc-warn-elevated)", marginLeft: 8 }}>✉ draft email</span>}
+                          </div>
+                        </td>
+                        <td>
+                          <span className={`cc-badge ${r.type === "outbound" ? "cc-badge--proposal" : r.type === "internal" ? "cc-badge--discovery" : "cc-badge--idle"}`}>
+                            {r.type}
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`cc-badge cc-badge--${r.agentType}`}>{r.agentType}</span>
+                        </td>
+                        <td className="mono" style={{ fontSize: 10 }}>{fmtDate(r.createdAt)}</td>
+                        <td>
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <a href={r.url} target="_blank" rel="noopener noreferrer"
+                              className="btn-cc btn-standard"
+                              style={{ textDecoration: "none", fontSize: 11, padding: "4px 10px" }}
+                              onClick={e => e.stopPropagation()}
+                            >
+                              ↓ PDF
+                            </a>
+                            {hasEmail && (
+                              <span style={{ fontSize: 10, color: "var(--cc-data-muted)" }}>{isExp ? "▲" : "▼"}</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                      {isExp && hasEmail && (
+                        <tr key={`${rowKey}-email`}>
+                          <td colSpan={6} style={{ padding: 0 }}>
+                            <div style={{ padding: "0 12px 12px" }}>
+                              <EmailDraftPanel subject={r.emailSubject} body={r.emailBody} targetCompany={r.targetCompany} />
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  )
+                })}
               </tbody>
             </table>
           )}

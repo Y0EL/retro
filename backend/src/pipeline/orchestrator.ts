@@ -5,7 +5,7 @@ const GATEWAY = process.env.GATEWAY_URL || "http://localhost:8000"
 
 async function getRecentCompanyProfiles(): Promise<Array<{ company_name: string; domain?: string }>> {
   try {
-    const res = await fetch(`${GATEWAY}/query-runs`)
+    const res = await fetch(`${GATEWAY}/query-runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) })
     if (!res.ok) return []
     const data = await res.json() as { data?: { runs?: Array<{ run_data?: string }> } }
     const runs = data?.data?.runs || []

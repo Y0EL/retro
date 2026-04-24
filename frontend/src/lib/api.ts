@@ -81,7 +81,7 @@ export interface GraphNode {
     articles?: { title: string; url: string; snippet: string }[]
   }
 }
-export interface GraphEdge { source: string; target: string; type: "owns" | "found_at" | "has_email" | "context" }
+export interface GraphEdge { source: string; target: string; sourceId: string; targetId: string; type: "owns" | "found_at" | "has_email" | "context" }
 
 export const getGraphData = () => req<{ nodes: GraphNode[]; edges: GraphEdge[] }>("/api/agents/graph")
 

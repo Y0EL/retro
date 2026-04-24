@@ -1,4 +1,4 @@
-export type AgentType = "discovery" | "briefing" | "proposal" | "admin"
+export type AgentType = "discovery" | "briefing" | "proposal" | "admin" | "full"
 
 export interface JobPayload {
   intent: string

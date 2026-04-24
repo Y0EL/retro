@@ -1,5 +1,6 @@
 import { useLocation, useNavigate } from "react-router-dom"
 import { useTheme } from "../contexts/ThemeContext"
+import { useAuth } from "../contexts/AuthContext"
 
 const ROUTE_LABEL: Record<string, string> = {
   "/":            "IKHTISAR",
@@ -22,6 +23,7 @@ export default function GlobalHeader({ onToggleRail, railOpen }: Props) {
   const location  = useLocation()
   const navigate  = useNavigate()
   const { theme, toggleTheme } = useTheme()
+  const { user } = useAuth()
 
   const label = ROUTE_LABEL[location.pathname] ??
     (location.pathname.startsWith("/profil") ? "PROFIL PERUSAHAAN" : "RETRO")
@@ -54,7 +56,7 @@ export default function GlobalHeader({ onToggleRail, railOpen }: Props) {
         <button className="cc-hdr-btn" onClick={() => navigate("/lookup")}>
           <span className="cc-kbd">/</span> CARI
         </button>
-        <span className="cc-hdr-operator">PT GSP</span>
+        <span className="cc-hdr-operator">{user?.username ?? "PT GSP"}</span>
         <button className="cc-hdr-btn" onClick={toggleTheme} title="Toggle Theme">
           {theme === "dark" ? "LIGHT" : "DARK"}
         </button>

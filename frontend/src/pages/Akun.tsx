@@ -1,4 +1,6 @@
 import { useState, useEffect } from "react"
+import { useNavigate } from "react-router-dom"
+import { useAuth } from "../contexts/AuthContext"
 
 interface Config {
   ollamaUrl:   string
@@ -36,8 +38,12 @@ function loadConfig(): Config {
 }
 
 export default function Akun() {
+  const navigate  = useNavigate()
+  const { user, logout, refreshProfile } = useAuth()
   const [cfg,   setCfg]   = useState<Config>(loadConfig)
   const [saved, setSaved] = useState(false)
+
+  useEffect(() => { refreshProfile() }, [refreshProfile])
 
   function set<K extends keyof Config>(k: K, v: Config[K]) {
     setCfg(prev => ({ ...prev, [k]: v }))
@@ -54,6 +60,11 @@ export default function Akun() {
     localStorage.removeItem("retro-config")
   }
 
+  function handleLogout() {
+    logout()
+    navigate("/login", { replace: true })
+  }
+
   return (
     <div className="cc-page">
       {saved && (
@@ -61,6 +72,51 @@ export default function Akun() {
           Konfigurasi berhasil disimpan ke localStorage.
         </div>
       )}
+
+      {/* Profil Operator */}
+      <div className="cc-panel" style={{ borderTop: "3px solid var(--cc-signal-high)" }}>
+        <div className="cc-panel-hdr">
+          <span className="cc-panel-title">
+            <span className="cc-panel-title-num">00</span>PROFIL OPERATOR
+          </span>
+          <button onClick={handleLogout} className="btn-cc btn-standard" style={{ fontSize: 10, padding: "4px 12px" }}>
+            KELUAR
+          </button>
+        </div>
+        <div className="cc-panel-body">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+            <div>
+              <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "var(--font-ui)", color: "var(--cc-data-primary)", marginBottom: 4 }}>
+                {user?.username ?? "—"}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--cc-signal-high)", fontFamily: "var(--font-data)", marginBottom: 2 }}>
+                {user?.org ?? "PT Gemilang Satria Perkasa"}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--cc-data-muted)" }}>
+                {user?.role ?? "Operator Intelijen"} · {user?.division ?? "Defense & Security Intelligence"}
+              </div>
+              {user?.loginAt && (
+                <div style={{ fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)", marginTop: 6 }}>
+                  Login: {new Date(user.loginAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB
+                </div>
+              )}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {[
+                { label: "TOTAL JOBS", value: user?.stats?.totalJobs ?? 0, color: "var(--cc-data-primary)" },
+                { label: "SELESAI",    value: user?.stats?.completedJobs ?? 0, color: "var(--cc-status-done)" },
+                { label: "ENTITAS KB", value: user?.stats?.totalEntities ?? 0, color: "var(--cc-signal-high)" },
+                { label: "PROFIL TERSIMPAN", value: user?.stats?.entitiesByType?.company_profile ?? 0, color: "var(--cc-warn-elevated)" },
+              ].map(s => (
+                <div key={s.label} style={{ background: "var(--cc-elevated)", padding: "10px 12px", border: "1px solid var(--cc-border)" }}>
+                  <div style={{ fontSize: 8, fontFamily: "var(--font-data)", letterSpacing: "0.1em", color: "var(--cc-data-muted)", marginBottom: 4 }}>{s.label}</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, fontFamily: "var(--font-data)", color: s.color }}>{s.value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* Ollama */}
       <div className="cc-panel">

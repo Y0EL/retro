@@ -2,8 +2,20 @@ import { useEffect, useState } from "react"
 import { useParams, useNavigate } from "react-router-dom"
 import { getKBEntry, listJobs } from "../lib/api"
 import type { KBEntry, Job } from "../lib/api"
-import { fmtDate } from "../lib/utils"
+import { fmtDate, extractDownloadUrls } from "../lib/utils"
 import JobTable from "../components/JobTable"
+import EmailDraftPanel from "../components/EmailDraftPanel"
+
+function deepFind(obj: unknown, key: string): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined
+  const rec = obj as Record<string, unknown>
+  if (typeof rec[key] === "string") return rec[key] as string
+  for (const v of Object.values(rec)) {
+    const found = deepFind(v, key)
+    if (found) return found
+  }
+  return undefined
+}
 
 type Tab = "profil" | "kontak" | "laporan" | "aktivitas"
 
@@ -178,15 +190,51 @@ export default function ProfilPerusahaan() {
         </div>
       )}
 
-      {tab === "laporan" && (
-        <div className="cc-panel">
-          <div className="cc-panel-hdr"><span className="cc-panel-title">LAPORAN TERKAIT</span></div>
-          <div className="cc-empty">
-            <div className="cc-empty-icon">PDF</div>
-            <div>Lihat laporan PDF di halaman <button className="btn-cc btn-ghost" onClick={() => navigate("/laporan")} style={{ display: "inline" }}>Laporan</button></div>
+      {tab === "laporan" && (() => {
+        // Collect PDF links and email drafts from related jobs
+        const relatedReports = jobs.flatMap(job => {
+          const urls = extractDownloadUrls(job.result)
+          return urls.map(url => ({
+            jobId:     job.jobId,
+            intent:    job.intent,
+            url,
+            type:      url.includes("outbound") ? "outbound" : url.includes("internal") ? "internal" : "unknown",
+            emailSubject:  deepFind(job.result, "email_subject"),
+            emailBody:     deepFind(job.result, "email_body_preview"),
+            targetCompany: name,
+          }))
+        })
+        return (
+          <div className="cc-panel">
+            <div className="cc-panel-hdr">
+              <span className="cc-panel-title">LAPORAN TERKAIT</span>
+              <span style={{ fontSize: 10, color: "var(--cc-data-muted)" }}>{relatedReports.length} laporan</span>
+            </div>
+            <div className="cc-panel-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {relatedReports.length === 0 ? (
+                <div className="cc-empty">
+                  <div className="cc-empty-icon">PDF</div>
+                  <div>Belum ada laporan PDF untuk perusahaan ini. Jalankan agent Discovery atau Proposal.</div>
+                </div>
+              ) : relatedReports.map((r, i) => (
+                <div key={i} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "var(--cc-elevated)", border: "1px solid var(--cc-border)" }}>
+                    <span className={`cc-badge ${r.type === "outbound" ? "cc-badge--proposal" : "cc-badge--discovery"}`}>{r.type}</span>
+                    <span style={{ fontSize: 11, color: "var(--cc-data-secondary)", flex: 1 }}>{r.intent.slice(0, 60)}</span>
+                    <a href={r.url} target="_blank" rel="noopener noreferrer"
+                      className="btn-cc btn-standard" style={{ textDecoration: "none", fontSize: 10, padding: "4px 10px" }}>
+                      ↓ PDF
+                    </a>
+                  </div>
+                  {(r.emailSubject || r.emailBody) && (
+                    <EmailDraftPanel subject={r.emailSubject} body={r.emailBody} targetCompany={r.targetCompany} />
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
     </div>
   )
 }

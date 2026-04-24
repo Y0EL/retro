@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, useMemo } from "react"
 import * as d3 from "d3"
 import { listJobs, getGraphData } from "../lib/api"
 import type { Job, GraphNode, GraphEdge } from "../lib/api"
 import DetailDrawer from "../components/DetailDrawer"
 import SearchBar from "../components/SearchBar"
 import { useNavigate, useSearchParams } from "react-router-dom"
+import { useTheme } from "../contexts/ThemeContext"
 
 interface SimNode extends GraphNode, d3.SimulationNodeDatum {}
 interface SimEdge extends d3.SimulationLinkDatum<SimNode> {
@@ -13,116 +14,134 @@ interface SimEdge extends d3.SimulationLinkDatum<SimNode> {
   targetId: string
 }
 
-// ── Ki-node visual config (mirrors GUIV1 ki-node card style) ─────────────────
-const NODE_ACCENT: Record<string, string> = {
-  company: "#5b9bd5",
-  domain:  "#7898b0",
-  email:   "#d4845a",
+// ── Visual config ─────────────────────────────────────────────────────────────
+const NODE_FILL: Record<string, string> = {
+  company: "#1d4ed8",
+  domain:  "#15803d",
+  email:   "#b45309",
 }
-const NODE_HEADER_BG: Record<string, string> = {
-  company: "#5b9bd518",
-  domain:  "#7898b010",
-  email:   "#d4845a18",
+const NODE_RING: Record<string, string> = {
+  company: "#93c5fd",
+  domain:  "#86efac",
+  email:   "#fcd34d",
 }
-const NODE_LABEL: Record<string, string> = {
+const NODE_R: Record<string, number> = {
+  company: 34,
+  domain:  26,
+  email:   26,
+}
+const NODE_TYPE_LABEL: Record<string, string> = {
   company: "PERUSAHAAN",
   domain:  "DOMAIN",
   email:   "EMAIL",
 }
-// Card width/height
-const CW: Record<string, number> = { company: 148, domain: 130, email: 140 }
-const CH: Record<string, number> = { company: 52,  domain: 40,  email: 40  }
+const MAX_JOBS = 5
+const JOB_PALETTE = ["#2563eb","#16a34a","#ea580c","#9333ea","#dc2626","#0891b2","#b45309","#65a30d"]
 
 export default function Orkestrasi() {
-  const svgRef                    = useRef<SVGSVGElement>(null)
-  const posCache                  = useRef<Map<string, { x: number; y: number }>>(new Map())
-  const zoomCache                 = useRef<d3.ZoomTransform>(d3.zoomIdentity)
-  const [nodes,   setNodes]       = useState<SimNode[]>([])
-  const [edges,   setEdges]       = useState<SimEdge[]>([])
-  const [jobs,    setJobs]        = useState<Job[]>([])
-  const [search,  setSearch]      = useState("")
+  const { theme }   = useTheme()
+  const svgRef      = useRef<SVGSVGElement>(null)
+  const posCache    = useRef<Map<string, { x: number; y: number }>>(new Map())
+  const zoomCache   = useRef<d3.ZoomTransform>(d3.zoomIdentity)
+  const jobColorRef = useRef<Map<string, string>>(new Map())
+
+  const [nodes,     setNodes]     = useState<SimNode[]>([])
+  const [edges,     setEdges]     = useState<SimEdge[]>([])
+  const [jobs,      setJobs]      = useState<Job[]>([])
+  const [search,    setSearch]    = useState("")
   const [jobFilter, setJobFilter] = useState("all")
-  const [drawer,  setDrawer]      = useState<SimNode | null>(null)
-  const [loading, setLoading]     = useState(true)
+  const [drawer,    setDrawer]    = useState<SimNode | null>(null)
+  const [loading,   setLoading]   = useState(true)
   const [searchParams]            = useSearchParams()
-  const navigate                  = useNavigate()
-  const jobParam                  = searchParams.get("job")
+  const navigate    = useNavigate()
+  const jobParam    = searchParams.get("job")
 
-  // ── Load data — single loop, visibility-aware ─────────────────────────────
+  // ── 5 most-recent jobs + per-job color map ────────────────────────────────
+  const recentJobs = useMemo(() =>
+    [...jobs].sort((a, b) =>
+      new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime()
+    ).slice(0, MAX_JOBS)
+  , [jobs])
+
+  const jobColorMap = useMemo(() => {
+    const m = new Map<string, string>()
+    recentJobs.forEach((j, i) => m.set(j.jobId, JOB_PALETTE[i % JOB_PALETTE.length]))
+    jobColorRef.current = m
+    return m
+  }, [recentJobs])
+
+  const recentJobIds = useMemo(() => new Set(recentJobs.map(j => j.jobId)), [recentJobs])
+
+  const visibleNodes = useMemo(() => {
+    if (jobFilter === "all") return nodes.filter(n => !n.jobId || recentJobIds.has(n.jobId))
+    return nodes.filter(n => n.jobId === jobFilter)
+  }, [nodes, jobFilter, recentJobIds])
+
+  const visibleEdges = useMemo(() => {
+    const ids = new Set(visibleNodes.map(n => n.id))
+    return edges.filter(e => e.type !== "context" && ids.has(e.sourceId) && ids.has(e.targetId))
+  }, [edges, visibleNodes])
+
+  // ── Fetch loop ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    let timerId: ReturnType<typeof setTimeout>
+    let timer: ReturnType<typeof setTimeout>
     let alive = true
-
     async function load() {
       if (!alive) return
-      // Skip fetch when tab is hidden (saves requests when user switches tabs)
-      if (document.visibilityState === "hidden") {
-        timerId = setTimeout(load, 10_000)
-        return
-      }
+      if (document.visibilityState === "hidden") { timer = setTimeout(load, 10_000); return }
       try {
-        const [jobsData, graphData] = await Promise.all([listJobs(), getGraphData()])
+        const [jd, gd] = await Promise.all([listJobs(), getGraphData()])
         if (!alive) return
-
-        const allJobs = jobsData.jobs || []
+        const allJobs = jd.jobs || []
         setJobs(allJobs)
-
-        let gn = (graphData.nodes || []) as SimNode[]
-        let ge = (graphData.edges || []) as SimEdge[]
-
+        let gn = (gd.nodes || []) as SimNode[]
+        let ge = (gd.edges || []) as SimEdge[]
         if (jobParam) {
-          const jobNodeIds = new Set(gn.filter(n => n.jobId === jobParam).map(n => n.id))
-          const relatedIds = new Set<string>()
-          ge.forEach(e => {
-            if (jobNodeIds.has(e.sourceId) || jobNodeIds.has(e.targetId)) {
-              relatedIds.add(e.sourceId); relatedIds.add(e.targetId)
-            }
-          })
-          gn = gn.filter(n => jobNodeIds.has(n.id) || relatedIds.has(n.id))
-          ge = ge.filter(e => relatedIds.has(e.sourceId) && relatedIds.has(e.targetId))
+          const jIds = new Set(gn.filter(n => n.jobId === jobParam).map(n => n.id))
+          const rel  = new Set<string>()
+          ge.forEach(e => { if (jIds.has(e.sourceId) || jIds.has(e.targetId)) { rel.add(e.sourceId); rel.add(e.targetId) } })
+          gn = gn.filter(n => jIds.has(n.id) || rel.has(n.id))
+          ge = ge.filter(e => rel.has(e.sourceId) && rel.has(e.targetId))
         }
-
         setNodes(gn)
         setEdges(ge)
-
-        const hasRunning = allJobs.some(j => j.status === "running" || j.status === "queued")
-        timerId = setTimeout(load, hasRunning ? 5_000 : 30_000)
+        const running = allJobs.some(j => j.status === "running" || j.status === "queued")
+        timer = setTimeout(load, running ? 5_000 : 30_000)
       } catch {
-        if (alive) timerId = setTimeout(load, 30_000)
+        if (alive) timer = setTimeout(load, 30_000)
       } finally {
         if (alive) setLoading(false)
       }
     }
-
     load()
-    return () => { alive = false; clearTimeout(timerId) }
+    return () => { alive = false; clearTimeout(timer) }
   }, [jobParam])
 
-  // ── D3 force simulation — ki-node entity cards ───────────────────────────
+  // ── D3 force graph ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!svgRef.current || nodes.length === 0) return
+    if (!svgRef.current || visibleNodes.length === 0) return
 
     const el = svgRef.current
-    const W  = el.clientWidth  || 800
-    const H  = el.clientHeight || 600
+    const W  = el.clientWidth  || 900
+    const H  = el.clientHeight || 650
 
-    // ── Save current zoom + node positions before clearing ──────────────────
-    try { zoomCache.current = d3.zoomTransform(el) } catch { /* first render */ }
-    for (const n of nodes) {
+    // Save zoom + positions
+    try { zoomCache.current = d3.zoomTransform(el) } catch { /* first */ }
+    for (const n of visibleNodes) {
       if (n.x != null && n.y != null) posCache.current.set(n.id, { x: n.x, y: n.y })
     }
-    const newNodeIds = new Set(nodes.filter(n => !posCache.current.has(n.id)).map(n => n.id))
+    const newNodeIds = new Set(visibleNodes.filter(n => !posCache.current.has(n.id)).map(n => n.id))
 
-    // Seed positions: restore cached, place new nodes near cluster centre
+    // Seed positions
     const cx = W / 2, cy = H / 2
-    for (const n of nodes) {
+    for (const n of visibleNodes) {
       const pos = posCache.current.get(n.id)
       if (pos) { n.x = pos.x; n.y = pos.y }
-      else { n.x = cx + (Math.random() - 0.5) * 300; n.y = cy + (Math.random() - 0.5) * 300 }
+      else { n.x = cx + (Math.random() - 0.5) * 200; n.y = cy + (Math.random() - 0.5) * 200 }
     }
 
-    // Pin existing nodes so they don't move — only new nodes get animated
-    for (const n of nodes) {
+    // Pin existing nodes
+    for (const n of visibleNodes) {
       if (!newNodeIds.has(n.id) && n.x != null) { n.fx = n.x; n.fy = n.y }
     }
 
@@ -131,302 +150,280 @@ export default function Orkestrasi() {
     const svg = d3.select(el)
     const g   = svg.append("g")
 
+    // Theme-aware colors — read CSS variables from document root
+    const cssVars  = getComputedStyle(document.documentElement)
+    const canvasBg   = cssVars.getPropertyValue("--cc-abyss").trim()   || (theme === "dark" ? "#090d14" : "#f8fafc")
+    const outerText  = cssVars.getPropertyValue("--cc-data-primary").trim() || (theme === "dark" ? "#c8d8e8" : "#1e293b")
+    const isDark     = theme === "dark"
+
+    svg.insert("rect", ":first-child")
+      .attr("width", "100%").attr("height", "100%")
+      .attr("fill", canvasBg)
+
+    // Zoom (user only, no auto)
     const zoom = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.1, 6])
+      .scaleExtent([0.08, 6])
       .on("zoom", e => { zoomCache.current = e.transform; g.attr("transform", e.transform) })
     svg.call(zoom)
-    // Restore camera — never auto-move user's view
     svg.call(zoom.transform, zoomCache.current)
 
-    // Arrowhead defs per edge type
+    // Arrowhead markers per job color
     const defs = svg.append("defs")
-    const ARROW_COLORS: Record<string, string> = {
-      owns:      "#5b9bd5",
-      has_email: "#d4845a",
-      found_at:  "#7898b0",
-      context:   "#4a7090",
+    const colorMap = jobColorRef.current
+    const usedColors = new Set<string>()
+    for (const n of visibleNodes) {
+      if (n.jobId) usedColors.add(colorMap.get(n.jobId) ?? "#64748b")
     }
-    for (const [type, color] of Object.entries(ARROW_COLORS)) {
+    usedColors.add("#64748b")
+    for (const color of usedColors) {
+      const sid = color.replace("#", "mk")
       defs.append("marker")
-        .attr("id", `arrow-${type}`)
+        .attr("id", `arr-${sid}`)
         .attr("viewBox", "0 -4 8 8").attr("refX", 8)
-        .attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto")
-        .append("path").attr("d", "M0,-4L8,0L0,4").attr("fill", color).attr("opacity", 1)
+        .attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
+        .append("path").attr("d", "M0,-4L8,0L0,4")
+        .attr("fill", color).attr("opacity", 0.8)
     }
 
-    // Simulation — only animate new nodes; freeze everything else
-    const sim = d3.forceSimulation<SimNode>(nodes)
-      .force("link",    d3.forceLink<SimNode, SimEdge>(edges).id(d => d.id).distance(180))
-      .force("charge",  d3.forceManyBody().strength(-400))
-      .force("center",  newNodeIds.size > 0 ? d3.forceCenter(W / 2, H / 2).strength(0.04) : null)
-      .force("collide", d3.forceCollide(90))
+    function edgeColor(d: SimEdge): string {
+      const src = d.source as SimNode
+      return colorMap.get(src.jobId ?? "") ?? colorMap.get(src.id) ?? "#64748b"
+    }
+
+    // Simulation
+    const sim = d3.forceSimulation<SimNode>(visibleNodes)
+      .velocityDecay(0.72)          // tinggi = lebih banyak gesekan → gerakan lambat
+      .force("link",    d3.forceLink<SimNode, SimEdge>(visibleEdges).id(d => d.id).distance(d => {
+        const s = d.source as SimNode, t = d.target as SimNode
+        return (NODE_R[s.type] ?? 26) + (NODE_R[t.type] ?? 26) + 80
+      }).strength(0.4))             // link lemah → tidak menarik terlalu keras
+      .force("charge",  d3.forceManyBody().strength(-280).distanceMax(400))  // repulsion lebih kecil
+      .force("center",  newNodeIds.size > 0 ? d3.forceCenter(W / 2, H / 2).strength(0.015) : null)
+      .force("collide", d3.forceCollide<SimNode>(n => (NODE_R[n.type] ?? 26) + 22).strength(0.7))
 
     if (newNodeIds.size === 0) {
       sim.alpha(0).stop()
     } else {
-      sim.alphaDecay(0.06).alpha(0.25).restart()
+      // alpha rendah + alphaDecay tinggi = animasi pelan lalu cepat berhenti
+      sim.alphaDecay(0.04).alpha(0.12).restart()
     }
 
-    // Edges
-    const link = g.selectAll<SVGLineElement, SimEdge>("line.edge")
-      .data(edges).join("line").attr("class", "edge")
-      .attr("stroke", d => ARROW_COLORS[d.type] ?? "#4a7090")
-      .attr("stroke-width", d => {
-        if (d.type === "owns")      return 2.5
-        if (d.type === "has_email") return 2
-        if (d.type === "found_at")  return 1.8
-        return 1.5   // context
-      })
-      .attr("stroke-dasharray", d => d.type === "found_at" ? "6,3" : "none")
-      .attr("marker-end", d => `url(#arrow-${d.type})`)
-      .attr("opacity", d => {
-        if (d.type === "owns")      return 0.9
-        if (d.type === "has_email") return 0.85
-        if (d.type === "found_at")  return 0.7
-        return 0.45  // context — visible but secondary
-      })
+    // Edges — glow layer (tebal + transparan) di belakang agar jelas
+    g.selectAll<SVGLineElement, SimEdge>("line.edge-glow")
+      .data(visibleEdges).join("line").attr("class", "edge-glow")
+      .attr("stroke", edgeColor)
+      .attr("stroke-width", d => d.type === "context" ? 0 : (d.type === "owns" ? 8 : 6))
+      .attr("opacity", isDark ? 0.18 : 0.12)
+      .attr("stroke-linecap", "round")
 
-    // Edge label
-    const edgeLabel = g.selectAll<SVGTextElement, SimEdge>("text.elabel")
-      .data(edges).join("text").attr("class", "elabel")
-      .attr("text-anchor", "middle").attr("font-size", 8)
-      .attr("font-family", "Courier New, monospace")
-      .attr("fill", d => ARROW_COLORS[d.type] ?? "#4a7090")
-      .attr("opacity", d => d.type === "context" ? 0.4 : 0.8)
-      .text(d => d.type === "owns" ? "owns" : d.type === "has_email" ? "email" : d.type === "found_at" ? "at" : "ctx")
+    // Edges — garis utama
+    const link = g.selectAll<SVGLineElement, SimEdge>("line.edge")
+      .data(visibleEdges).join("line").attr("class", "edge")
+      .attr("stroke", edgeColor)
+      .attr("stroke-width", d => d.type === "owns" ? 3 : d.type === "has_email" ? 2.5 : 2)
+      .attr("stroke-dasharray", d => d.type === "found_at" ? "6,4" : "none")
+      .attr("stroke-linecap", "round")
+      .attr("opacity", d => d.type === "context" ? 0.2 : (isDark ? 0.92 : 0.85))
+      .attr("marker-end", d => {
+        const c = edgeColor(d).replace("#", "mk")
+        return `url(#arr-${c})`
+      })
 
     // Node groups
     const nodeG = g.selectAll<SVGGElement, SimNode>("g.node")
-      .data(nodes, d => d.id).join("g").attr("class", "node")
+      .data(visibleNodes, d => d.id).join("g").attr("class", "node")
       .style("cursor", "pointer")
       .call(
         d3.drag<SVGGElement, SimNode>()
           .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.2).restart(); d.fx = d.x; d.fy = d.y })
           .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y })
-          // Pin the node at drop position — never release (stays still after drag)
           .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = d.x; d.fy = d.y })
       )
       .on("click", (_, d) => setDrawer(d))
       .on("dblclick", (_, d) => { if (d.type === "company") navigate(`/profil/${d.id}`) })
 
-    // Build ki-node card per entity
+    // Draw circles
     nodeG.each(function(d) {
-      const gEl      = d3.select(this)
-      const w        = CW[d.type] ?? 130
-      const h        = CH[d.type] ?? 40
-      const accent   = NODE_ACCENT[d.type]  ?? "#445060"
-      const headerBg = NODE_HEADER_BG[d.type] ?? "#1a2130"
-      const typeLabel = NODE_LABEL[d.type] ?? d.type.toUpperCase()
-      const isPending = d.pending ?? false
-      const hw = w / 2; const hh = h / 2
+      const gEl  = d3.select(this)
+      const r    = NODE_R[d.type] ?? 26
+      const fill = NODE_FILL[d.type] ?? "#475569"
+      const ring = NODE_RING[d.type] ?? "#cbd5e1"
+      const isPending   = d.pending ?? false
+      const strokeColor = isDark ? "#ffffff" : "#ffffff"
+      const pendingFill = isDark ? "#334155" : "#94a3b8"
+      const ringOpacity = isDark ? 0.28 : 0.18
 
-      // Outer border (selection glow placeholder)
-      gEl.append("rect")
-        .attr("x", -hw).attr("y", -hh)
-        .attr("width", w).attr("height", h)
-        .attr("fill", "#0d1117")
-        .attr("stroke", accent + (isPending ? "44" : "88"))
-        .attr("stroke-width", 1.5)
-        .attr("stroke-dasharray", isPending ? "5,3" : "none")
+      // Glow ring
+      gEl.append("circle")
+        .attr("r", r + 6)
+        .attr("fill", ring)
+        .attr("opacity", isPending ? 0.08 : ringOpacity)
 
-      // Header strip (top ~14px)
-      const headerH = 14
-      gEl.append("rect")
-        .attr("x", -hw).attr("y", -hh)
-        .attr("width", w).attr("height", headerH)
-        .attr("fill", headerBg)
+      // Main circle
+      gEl.append("circle")
+        .attr("r", r)
+        .attr("fill", isPending ? pendingFill : fill)
+        .attr("stroke", strokeColor)
+        .attr("stroke-width", 2.5)
 
-      // Left accent line
-      gEl.append("rect")
-        .attr("x", -hw).attr("y", -hh)
-        .attr("width", 3).attr("height", h)
-        .attr("fill", accent).attr("opacity", isPending ? 0.3 : 0.9)
-
-      // Type label in header
+      // Type badge inside top
       gEl.append("text")
-        .attr("x", -hw + 7).attr("y", -hh + 10)
-        .attr("font-size", 7).attr("font-family", "Courier New, monospace")
-        .attr("fill", accent).attr("font-weight", "700")
-        .attr("letter-spacing", "0.12em")
-        .text(typeLabel)
-
-      // Pending badge
-      if (isPending) {
-        gEl.append("text")
-          .attr("x", hw - 5).attr("y", -hh + 10)
-          .attr("font-size", 6).attr("font-family", "Courier New, monospace")
-          .attr("fill", accent).attr("opacity", 0.5)
-          .attr("text-anchor", "end")
-          .text("…")
-      }
-
-      // Main label
-      const maxChars = Math.floor((w - 14) / 5.8)
-      const mainLabel = d.label.length > maxChars ? d.label.slice(0, maxChars - 1) + "…" : d.label
-      gEl.append("text")
-        .attr("x", -hw + 7).attr("y", -hh + headerH + 12)
-        .attr("font-size", d.type === "company" ? 10 : 9)
+        .attr("text-anchor", "middle")
+        .attr("dy", d.type === "company" ? -6 : -4)
+        .attr("font-size", d.type === "company" ? 7.5 : 6.5)
         .attr("font-family", "Courier New, monospace")
-        .attr("fill", isPending ? "#445060" : (d.type === "company" ? "#c8d8e8" : "#8898a8"))
-        .attr("font-weight", d.type === "company" ? "600" : "400")
-        .text(mainLabel)
+        .attr("fill", "#ffffff")
+        .attr("opacity", 0.7)
+        .attr("letter-spacing", "0.06em")
+        .text(d.type === "company" ? "PERUS." : d.type === "domain" ? "DOM." : "EMAIL")
 
-      // Sub-line (meta)
-      if (d.type === "company" && d.meta?.domain) {
-        const sub = String(d.meta.domain)
-        gEl.append("text")
-          .attr("x", -hw + 7).attr("y", -hh + headerH + 24)
-          .attr("font-size", 7).attr("font-family", "Courier New, monospace")
-          .attr("fill", "#445060")
-          .text(sub.slice(0, 22))
-      }
-      if (d.type === "email") {
-        gEl.append("text")
-          .attr("x", -hw + 7).attr("y", -hh + headerH + 22)
-          .attr("font-size", 7).attr("font-family", "Courier New, monospace")
-          .attr("fill", "#5a3020")
-          .text("contact")
-      }
+      // Name inside circle
+      const maxChars = Math.floor((r * 1.6) / 5.5)
+      const shortLabel = d.label.length > maxChars ? d.label.slice(0, maxChars - 1) + "…" : d.label
+      gEl.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", d.type === "company" ? 7 : 6)
+        .attr("font-size", d.type === "company" ? 9.5 : 8)
+        .attr("font-family", "Courier New, monospace")
+        .attr("fill", "#ffffff")
+        .attr("font-weight", "600")
+        .text(shortLabel)
+
+      // Label outside (below circle) — uses theme text color
+      const outerLabel = d.label.length > 20 ? d.label.slice(0, 19) + "…" : d.label
+      gEl.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", r + 17)
+        .attr("font-size", 9)
+        .attr("font-family", "Courier New, monospace")
+        .attr("fill", isPending ? (isDark ? "#4a6080" : "#94a3b8") : outerText)
+        .attr("font-weight", d.type === "company" ? "700" : "400")
+        .text(outerLabel)
     })
 
     // Tooltip
     const tooltip = d3.select("body").append("div")
-      .style("position", "fixed")
-      .style("background", "#0d1117")
-      .style("border", "1px solid #253040")
-      .style("border-left", d => `3px solid ${NODE_ACCENT[d as unknown as string] ?? "#5b9bd5"}`)
-      .style("padding", "8px 12px")
-      .style("font-size", "11px").style("font-family", "Courier New, monospace")
-      .style("color", "#c8d8e8").style("pointer-events", "none")
-      .style("opacity", 0).style("z-index", 9999)
-      .style("max-width", "240px").style("line-height", "1.6")
+      .style("position", "fixed").style("pointer-events", "none")
+      .style("background", "#1e293b").style("border", "1px solid #334155")
+      .style("color", "#f1f5f9").style("border-radius", "4px")
+      .style("padding", "8px 12px").style("font-size", "11px")
+      .style("font-family", "Courier New, monospace")
+      .style("opacity", 0).style("z-index", "9999")
+      .style("max-width", "220px").style("line-height", "1.6")
 
     nodeG
       .on("mouseover", (_, d) => {
-        const accent = NODE_ACCENT[d.type] ?? "#5b9bd5"
-        const extra  = d.type === "company" ? `<br/><span style="color:#445060;font-size:9px">dbl-click → profil lengkap</span>` : ""
-        tooltip
-          .style("border-left", `3px solid ${accent}`)
-          .style("opacity", 1)
-          .html(`<span style="color:${accent};font-size:9px;letter-spacing:.12em">${NODE_LABEL[d.type]}</span><br/><strong>${d.label}</strong>${d.meta?.domain ? `<br/><span style="color:#445060;font-size:9px">${d.meta.domain}</span>` : ""}${extra}`)
+        const fill = NODE_FILL[d.type] ?? "#475569"
+        tooltip.style("border-top", `3px solid ${fill}`).style("opacity", 1)
+          .html(`<span style="font-size:8px;opacity:0.6">${NODE_TYPE_LABEL[d.type]}</span><br/><strong>${d.label}</strong>${d.meta?.domain ? `<br/><span style="opacity:0.6;font-size:9px">${d.meta.domain}</span>` : ""}${d.type === "company" ? `<br/><span style="font-size:8px;opacity:0.5">dblclick → profil</span>` : ""}`)
       })
-      .on("mousemove", e => {
-        tooltip.style("left", (e.clientX + 14) + "px").style("top", (e.clientY - 28) + "px")
-      })
+      .on("mousemove", e => tooltip.style("left", (e.clientX + 14) + "px").style("top", (e.clientY - 28) + "px"))
       .on("mouseleave", () => tooltip.style("opacity", 0))
 
-    // Tick — attach edge endpoints to card edges
-    function cardEdge(node: SimNode, other: SimNode): [number, number] {
-      const w  = CW[node.type] ?? 130; const h = CH[node.type] ?? 40
-      const nx = node.x ?? 0; const ny = node.y ?? 0
-      const ox = other.x ?? 0; const oy = other.y ?? 0
-      const dx = ox - nx; const dy = oy - ny
+    // Tick
+    function circleEdge(n: SimNode, o: SimNode): [number, number] {
+      const r  = NODE_R[n.type] ?? 26
+      const nx = n.x ?? 0, ny = n.y ?? 0
+      const ox = o.x  ?? 0, oy = o.y  ?? 0
+      const dx = ox - nx, dy = oy - ny
       const len = Math.sqrt(dx * dx + dy * dy) || 1
-      const sx = dx / len; const sy = dy / len
-      const tx = Math.abs(sx) > 1e-9 ? (w / 2) / Math.abs(sx) : Infinity
-      const ty = Math.abs(sy) > 1e-9 ? (h / 2) / Math.abs(sy) : Infinity
-      const t  = Math.min(tx, ty)
-      return [nx + sx * t, ny + sy * t]
+      return [nx + (dx / len) * r, ny + (dy / len) * r]
     }
 
+    // Select glow layer for tick updates
+    const glowLink = g.selectAll<SVGLineElement, SimEdge>("line.edge-glow")
+
     function applyTick() {
-      // Keep posCache up-to-date on every tick so positions survive API refreshes
-      for (const n of nodes) {
+      for (const n of visibleNodes) {
         if (n.x != null && n.y != null) posCache.current.set(n.id, { x: n.x, y: n.y })
       }
-
-      link
-        .attr("x1", d => cardEdge(d.source as SimNode, d.target as SimNode)[0])
-        .attr("y1", d => cardEdge(d.source as SimNode, d.target as SimNode)[1])
-        .attr("x2", d => cardEdge(d.target as SimNode, d.source as SimNode)[0])
-        .attr("y2", d => cardEdge(d.target as SimNode, d.source as SimNode)[1])
-
-      edgeLabel
-        .attr("x", d => (((d.source as SimNode).x ?? 0) + ((d.target as SimNode).x ?? 0)) / 2)
-        .attr("y", d => (((d.source as SimNode).y ?? 0) + ((d.target as SimNode).y ?? 0)) / 2 - 5)
-
+      const x1 = (d: SimEdge) => circleEdge(d.source as SimNode, d.target as SimNode)[0]
+      const y1 = (d: SimEdge) => circleEdge(d.source as SimNode, d.target as SimNode)[1]
+      const x2 = (d: SimEdge) => circleEdge(d.target as SimNode, d.source as SimNode)[0]
+      const y2 = (d: SimEdge) => circleEdge(d.target as SimNode, d.source as SimNode)[1]
+      glowLink.attr("x1", x1).attr("y1", y1).attr("x2", x2).attr("y2", y2)
+      link.attr("x1", x1).attr("y1", y1).attr("x2", x2).attr("y2", y2)
       nodeG.attr("transform", d => `translate(${d.x ?? 0},${d.y ?? 0})`)
     }
 
     sim.on("tick", applyTick)
-
-    // If sim is stopped (no new nodes), fire one layout pass so SVG elements get positioned
     if (newNodeIds.size === 0) applyTick()
 
     return () => { tooltip.remove(); sim.stop() }
-  }, [nodes, edges, navigate])
+  }, [visibleNodes, visibleEdges, navigate, theme])
 
   function handleSearch(q: string) {
     setSearch(q)
-    if (!q || !svgRef.current) return
-    const match = nodes.find(n => n.label.toLowerCase().includes(q.toLowerCase()))
+    if (!q) return
+    const match = visibleNodes.find(n => n.label.toLowerCase().includes(q.toLowerCase()))
     if (match) setDrawer(match)
   }
 
-  const displayNodes = jobFilter === "all"
-    ? nodes
-    : nodes.filter(n => n.jobId === jobFilter)
-
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+
       {/* Toolbar */}
       <div className="cc-graph-toolbar">
-        <SearchBar value={search} onChange={handleSearch} placeholder="Cari entitas (perusahaan, domain, email)..." />
+        <SearchBar value={search} onChange={handleSearch} placeholder="Cari entitas..." />
+
         <select className="cc-select" value={jobFilter} onChange={e => setJobFilter(e.target.value)}>
-          <option value="all">Semua Job</option>
-          {jobs.map(j => (
-            <option key={j.jobId} value={j.jobId}>{j.jobId.slice(0, 10)}… — {j.intent.slice(0, 30)}</option>
+          <option value="all">Semua Job (maks {MAX_JOBS})</option>
+          {recentJobs.map(j => (
+            <option key={j.jobId} value={j.jobId}>
+              {j.jobId.slice(0, 8)}… · {j.intent.slice(0, 26)}
+            </option>
           ))}
         </select>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <span style={{ fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
-            {displayNodes.length} entitas · {edges.length} relasi
-          </span>
-        </div>
-        {/* Legend */}
-        <div style={{ display: "flex", gap: 10, alignItems: "center", marginLeft: "auto" }}>
-          {Object.entries(NODE_LABEL).map(([type, label]) => (
-            <div key={type} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: "var(--cc-data-muted)" }}>
-              <span style={{ width: 8, height: 8, background: NODE_ACCENT[type], display: "inline-block" }} />
-              {label}
+
+        <span style={{ fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
+          {visibleNodes.length} entitas · {visibleEdges.length} relasi
+        </span>
+
+        {/* Legend — entity types only */}
+        <div style={{ display: "flex", gap: 14, alignItems: "center", marginLeft: "auto" }}>
+          {(["company", "domain", "email"] as const).map(t => (
+            <div key={t} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
+              <span style={{
+                width: 12, height: 12, borderRadius: "50%",
+                background: NODE_FILL[t],
+                display: "inline-block", flexShrink: 0,
+              }} />
+              {NODE_TYPE_LABEL[t]}
             </div>
           ))}
         </div>
       </div>
 
-      {/* Graph canvas */}
+      {/* Canvas — follows theme via --cc-abyss */}
       <div style={{ flex: 1, position: "relative", overflow: "hidden", background: "var(--cc-abyss)" }}>
         {loading ? (
-          <div className="cc-loading" style={{ height: "100%" }}>
+          <div className="cc-loading" style={{ height: "100%", background: "var(--cc-abyss)" }}>
             <span className="cc-spinner" /> Memuat graf entitas...
           </div>
-        ) : nodes.length === 0 ? (
-          <div className="cc-empty" style={{ height: "100%" }}>
+        ) : visibleNodes.length === 0 ? (
+          <div className="cc-empty" style={{ height: "100%", background: "var(--cc-abyss)" }}>
             <div className="cc-empty-icon">--</div>
-            <div>Belum ada entitas. Jalankan agent Discovery untuk membangun knowledge graph.</div>
+            <div>Belum ada entitas. Jalankan agent untuk membangun knowledge graph.</div>
           </div>
         ) : (
-          <svg ref={svgRef} style={{ width: "100%", height: "100%" }} />
+          <svg ref={svgRef} style={{ width: "100%", height: "100%", display: "block" }} />
         )}
       </div>
 
       {/* Detail drawer */}
-      <DetailDrawer
-        open={drawer !== null}
-        title={drawer?.label ?? ""}
-        onClose={() => setDrawer(null)}
-      >
+      <DetailDrawer open={drawer !== null} title={drawer?.label ?? ""} onClose={() => setDrawer(null)}>
         {drawer && (
           <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-            {/* Entity header */}
-            <div style={{ padding: "0 0 12px" }}>
+            <div style={{ paddingBottom: 12 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                 <span style={{
                   fontSize: 9, fontFamily: "var(--font-data)", letterSpacing: "0.12em",
-                  color: NODE_ACCENT[drawer.type], background: NODE_ACCENT[drawer.type] + "18",
-                  padding: "2px 6px", borderLeft: `2px solid ${NODE_ACCENT[drawer.type]}`,
+                  color: NODE_FILL[drawer.type] ?? "#475569",
+                  background: (NODE_FILL[drawer.type] ?? "#475569") + "18",
+                  padding: "2px 6px",
+                  borderLeft: `2px solid ${NODE_FILL[drawer.type] ?? "#475569"}`,
                 }}>
-                  {NODE_LABEL[drawer.type]}
+                  {NODE_TYPE_LABEL[drawer.type] ?? drawer.type.toUpperCase()}
                 </span>
                 {drawer.meta?.sourceTool && (
                   <span style={{ fontSize: 9, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)" }}>
@@ -449,103 +446,54 @@ export default function Orkestrasi() {
               )}
             </div>
 
-            {/* Description */}
             {drawer.meta?.deskripsi && (
-              <>
-                <div className="cc-divider" style={{ margin: "0 0 10px" }} />
-                <div style={{ fontSize: 11, color: "var(--cc-data-secondary)", lineHeight: 1.6, marginBottom: 12 }}>
-                  {drawer.meta.deskripsi}
-                </div>
-              </>
+              <><div className="cc-divider" style={{ margin: "0 0 10px" }} />
+              <div style={{ fontSize: 11, color: "var(--cc-data-secondary)", lineHeight: 1.6, marginBottom: 12 }}>{drawer.meta.deskripsi}</div></>
             )}
 
-            {/* Found via queries */}
             {(drawer.meta?.foundVia?.length ?? 0) > 0 && (
-              <>
-                <div className="cc-divider" style={{ margin: "0 0 10px" }} />
-                <div style={{ marginBottom: 12 }}>
-                  <div className="cc-label" style={{ marginBottom: 6 }}>DITEMUKAN LEWAT QUERY</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {drawer.meta!.foundVia!.map((q, i) => (
-                      <div key={i} style={{
-                        fontSize: 10, color: "var(--cc-data-secondary)",
-                        background: "var(--cc-elevated)", padding: "4px 8px",
-                        borderLeft: "2px solid var(--cc-signal-medium)",
-                        fontFamily: "var(--font-data)", lineHeight: 1.4,
-                      }}>
-                        "{q}"
-                      </div>
-                    ))}
+              <><div className="cc-divider" style={{ margin: "0 0 10px" }} />
+              <div style={{ marginBottom: 12 }}>
+                <div className="cc-label" style={{ marginBottom: 6 }}>DITEMUKAN LEWAT QUERY</div>
+                {drawer.meta!.foundVia!.map((q, i) => (
+                  <div key={i} style={{ fontSize: 10, color: "var(--cc-data-secondary)", marginBottom: 4, background: "var(--cc-elevated)", padding: "4px 8px", borderLeft: "2px solid var(--cc-signal-medium)", fontFamily: "var(--font-data)", lineHeight: 1.4 }}>
+                    "{q}"
                   </div>
-                </div>
-              </>
+                ))}
+              </div></>
             )}
 
-            {/* News/web snippets for companies */}
             {(drawer.meta?.snippets?.length ?? 0) > 0 && (
-              <>
-                <div className="cc-divider" style={{ margin: "0 0 10px" }} />
-                <div style={{ marginBottom: 12 }}>
-                  <div className="cc-label" style={{ marginBottom: 6 }}>KONTEKS BERITA</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                    {drawer.meta!.snippets!.map((s, i) => (
-                      <div key={i} style={{
-                        fontSize: 10, color: "var(--cc-data-muted)",
-                        lineHeight: 1.5, padding: "6px 8px",
-                        background: "var(--cc-abyss)",
-                        borderLeft: "2px solid var(--cc-border-subtle)",
-                      }}>
-                        {s}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
+              <><div className="cc-divider" style={{ margin: "0 0 10px" }} />
+              <div style={{ marginBottom: 12 }}>
+                <div className="cc-label" style={{ marginBottom: 6 }}>KONTEKS</div>
+                {drawer.meta!.snippets!.map((s, i) => (
+                  <div key={i} style={{ fontSize: 10, color: "var(--cc-data-muted)", lineHeight: 1.5, padding: "6px 8px", marginBottom: 4, background: "var(--cc-abyss)", borderLeft: "2px solid var(--cc-border-subtle)" }}>{s}</div>
+                ))}
+              </div></>
             )}
 
-            {/* Articles for domain nodes */}
             {(drawer.meta?.articles?.length ?? 0) > 0 && (
-              <>
-                <div className="cc-divider" style={{ margin: "0 0 10px" }} />
-                <div style={{ marginBottom: 12 }}>
-                  <div className="cc-label" style={{ marginBottom: 6 }}>
-                    HALAMAN DITEMUKAN ({drawer.meta!.articles!.length})
+              <><div className="cc-divider" style={{ margin: "0 0 10px" }} />
+              <div style={{ marginBottom: 12 }}>
+                <div className="cc-label" style={{ marginBottom: 6 }}>HALAMAN ({drawer.meta!.articles!.length})</div>
+                {drawer.meta!.articles!.map((a, i) => (
+                  <div key={i} style={{ padding: "6px 8px", marginBottom: 6, background: "var(--cc-abyss)", borderLeft: "2px solid var(--cc-border-subtle)" }}>
+                    <div style={{ fontSize: 10, color: "var(--cc-data-primary)", fontWeight: 600, lineHeight: 1.3, marginBottom: 2 }}>{a.title || a.url}</div>
+                    {a.snippet && <div style={{ fontSize: 9, color: "var(--cc-data-muted)", lineHeight: 1.4 }}>{a.snippet.slice(0, 120)}…</div>}
+                    <div style={{ fontSize: 9, color: "var(--cc-signal-medium)", fontFamily: "var(--font-data)", marginTop: 3, wordBreak: "break-all" }}>{a.url}</div>
                   </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {drawer.meta!.articles!.map((a, i) => (
-                      <div key={i} style={{
-                        padding: "6px 8px", background: "var(--cc-abyss)",
-                        borderLeft: "2px solid var(--cc-border-subtle)",
-                      }}>
-                        <div style={{ fontSize: 10, color: "var(--cc-data-primary)", fontWeight: 600, lineHeight: 1.3, marginBottom: 2 }}>
-                          {a.title || a.url}
-                        </div>
-                        {a.snippet && (
-                          <div style={{ fontSize: 9, color: "var(--cc-data-muted)", lineHeight: 1.4 }}>
-                            {a.snippet.slice(0, 120)}{a.snippet.length > 120 ? "…" : ""}
-                          </div>
-                        )}
-                        <div style={{ fontSize: 9, color: "var(--cc-signal-medium)", fontFamily: "var(--font-data)", marginTop: 3, wordBreak: "break-all" }}>
-                          {a.url}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
+                ))}
+              </div></>
             )}
 
-            {/* Job provenance */}
             {drawer.jobId && (
-              <>
-                <div className="cc-divider" style={{ margin: "0 0 10px" }} />
-                <div style={{ fontSize: 9, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)", marginBottom: 12 }}>
-                  JOB {drawer.jobId.slice(0, 8)}…
-                </div>
-              </>
+              <><div className="cc-divider" style={{ margin: "0 0 10px" }} />
+              <div style={{ fontSize: 9, color: "var(--cc-data-muted)", fontFamily: "var(--font-data)", marginBottom: 12 }}>
+                JOB {drawer.jobId.slice(0, 8)}…
+              </div></>
             )}
 
-            {/* Actions */}
             <div className="cc-divider" style={{ margin: "0 0 10px" }} />
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {drawer.type === "company" && (
@@ -553,15 +501,10 @@ export default function Orkestrasi() {
                   Lihat Profil Lengkap
                 </button>
               )}
-              <button
-                className="btn-cc btn-standard"
-                onClick={() => navigate(`/command?prefill=${encodeURIComponent(drawer.label)}`)}
-              >
-                Run Discovery
+              <button className="btn-cc btn-standard" onClick={() => navigate(`/command?prefill=${encodeURIComponent(drawer.label)}`)}>
+                Run Agent
               </button>
-              <button className="btn-cc btn-ghost" onClick={() => setDrawer(null)}>
-                Tutup
-              </button>
+              <button className="btn-cc btn-ghost" onClick={() => setDrawer(null)}>Tutup</button>
             </div>
           </div>
         )}

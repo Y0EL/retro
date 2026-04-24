@@ -1,6 +1,5 @@
 import { useState } from "react"
 import { useGlobalKeyboard } from "../hooks/useGlobalKeyboard"
-import GlobalCursor from "./GlobalCursor"
 import GlobalContextMenu from "./GlobalContextMenu"
 import GlobalHeader from "./GlobalHeader"
 import GlobalLeftRail from "./GlobalLeftRail"
@@ -15,7 +14,6 @@ export default function CommandShell({ children }: { children: React.ReactNode }
 
   return (
     <div className="cc-shell">
-      <GlobalCursor />
       <GlobalContextMenu />
       <GlobalHeader onToggleRail={toggleRail} railOpen={railOpen} />
       <GlobalLeftRail open={railOpen} onClose={toggleRail} />

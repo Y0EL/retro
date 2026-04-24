@@ -1,29 +1,27 @@
 import { Hono } from "hono"
-
-const GATEWAY = process.env.GATEWAY_URL || "http://localhost:8000"
+import { listKBEntries, getKBEntry, getKBEntryByName } from "../db.js"
 
 export const kbRouter = new Hono()
 
-kbRouter.get("/", async (c) => {
-  const type = c.req.query("type")
-  try {
-    const url = `${GATEWAY}/kb${type ? `?type=${type}` : ""}`
-    const r = await fetch(url)
-    const data = await r.json() as { success?: boolean; data?: unknown }
-    return c.json({ entries: Array.isArray(data) ? data : (data?.data || []) })
-  } catch {
-    return c.json({ entries: [] })
-  }
+// GET /api/kb?type=company_profile|proposal|research|correspondence
+kbRouter.get("/", (c) => {
+  const type = c.req.query("type") || undefined
+  const entries = listKBEntries(type)
+  return c.json({ entries })
 })
 
-kbRouter.get("/:id", async (c) => {
+// GET /api/kb/:id  — falls back to name search if ID not found
+// Handles graph node IDs like "company-pt-sentosa-makanan-indonesia"
+kbRouter.get("/:id", (c) => {
   const { id } = c.req.param()
-  try {
-    const r = await fetch(`${GATEWAY}/kb/${id}`)
-    if (!r.ok) return c.json({ error: "Not found" }, 404)
-    const data = await r.json()
-    return c.json(data)
-  } catch {
-    return c.json({ error: "Gateway error" }, 502)
+  let entry = getKBEntry(id)
+  if (!entry) {
+    // Normalize graph node ID → human name: strip prefix, replace dashes with spaces
+    const name = decodeURIComponent(id)
+      .replace(/^(company|domain|email)-/, "")
+      .replace(/-/g, " ")
+    entry = getKBEntryByName(name)
   }
+  if (!entry) return c.json({ error: "Entry not found" }, 404)
+  return c.json(entry)
 })

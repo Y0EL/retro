@@ -107,6 +107,20 @@ class SynthesisResult(BaseModel):
     primary_target: Optional[str] = None
     batch_notes: str = ""
     collaboration_score: float = 0.0
+    executive_summary: str = ""
+    market_insight: str = ""
+
+
+class BriefingReport(BaseModel):
+    company_info: dict = Field(default_factory=dict, description="Nama, alamat, tahun berdiri, ukuran, website")
+    product_analysis: dict = Field(default_factory=dict, description="Breakdown detail semua produk/solusi")
+    track_record: dict = Field(default_factory=dict, description="Performa masa lalu, penghargaan, isu, reputasi")
+    competitive_landscape: List[dict] = Field(default_factory=list, description="Perusahaan serupa secara global + perbandingan")
+    industry_trends: dict = Field(default_factory=dict, description="Tren terkini di domain spesifik mereka")
+    indonesia_market_analysis: dict = Field(default_factory=dict, description="Relevansi spesifik ke pasar Indonesia")
+    risk_flags: List[str] = Field(default_factory=list, description="Concerns atau red flags yang ditemukan")
+    recommended_questions: List[str] = Field(default_factory=list, description="10 pertanyaan yang harus ditanyakan CEO")
+    executive_summary: str = Field(default="", description="Sintesis 2-3 paragraf")
 
 
 class PipelineRunStats(BaseModel):

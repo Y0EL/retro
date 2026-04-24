@@ -17,6 +17,11 @@ class RetroSettings(BaseSettings):
     groq_model: str = Field(default="llama-3.3-70b-versatile")
     groq_fast_model: str = Field(default="llama-3.1-8b-instant")
 
+    # ===== Ollama (lokal/remote) =====
+    ollama_url: str = Field(default="http://localhost:11434/v1")
+    ollama_model: str = Field(default="qwen3.6:35b-a3b-q4_K_M")
+    use_ollama: bool = Field(default=True)
+
     # ===== Proposal =====
     proposal_author: str = Field(default="Yoel")
     proposal_theme: str = Field(default="light")  # "light" | "dark"
@@ -25,6 +30,7 @@ class RetroSettings(BaseSettings):
     input_file: str = Field(default="sample_companies.csv")
     output_dir: str = Field(default="./output")
     db_path: str = Field(default="./retro.db")
+    profile_context_max_chars: int = Field(default=8000)
 
     # ===== Email Discovery (optional) =====
     hunter_api_key: Optional[str] = None

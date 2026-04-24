@@ -5,6 +5,7 @@ Each node receives PipelineState and returns a partial state update.
 import asyncio
 import json
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from retro.config import get_settings
@@ -24,11 +25,13 @@ log = get_logger("retro.nodes")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=1)
 def _groq_client():
     import groq
     return groq.Groq(api_key=get_settings().groq_api_key)
 
 
+@lru_cache(maxsize=1)
 def _instructor_client():
     import groq, instructor
     return instructor.from_groq(groq.Groq(api_key=get_settings().groq_api_key), mode=instructor.Mode.JSON)
@@ -67,35 +70,49 @@ def load_input_node(state: PipelineState) -> dict:
 
 # ─── Node 2: crawl ────────────────────────────────────────────────────────
 
-def crawl_node(state: PipelineState) -> dict:
-    log_node_start("crawl", companies=len(state.get("companies_input", [])))
-    results, errors = [], []
-
-    for co in state.get("companies_input", []):
-        name = co.get("name") or co.get("company_name") or co.get("Company Name", "")
-        url  = co.get("url") or co.get("website") or co.get("URL") or co.get("Website", "")
-        if not url:
-            errors.append(f"crawl: no URL for {name}")
-            results.append({"name": name, "url": "", "text": "", "success": False, "status_code": 0, "tool_used": "none", "error": "no_url"})
-            continue
-        if not url.startswith("http"):
-            url = "https://" + url
+async def _fetch_one(sem: asyncio.Semaphore, co: dict) -> dict:
+    name = co.get("name") or co.get("company_name") or co.get("Company Name", "")
+    url  = co.get("url") or co.get("website") or co.get("URL") or co.get("Website", "")
+    if not url:
+        return {"name": name, "url": "", "text": "", "success": False,
+                "status_code": 0, "tool_used": "none", "error": "no_url", "_co": co}
+    if not url.startswith("http"):
+        url = "https://" + url
+    async with sem:
         try:
-            raw = asyncio.run(smart_fetch(url)) if asyncio.iscoroutinefunction(smart_fetch) else smart_fetch(url)
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(None, smart_fetch, url)
         except Exception as e:
             raw = {"html": "", "status_code": 0, "tool": "none", "error": str(e), "success": False}
+    text = parse_text(raw.get("html", "")) if raw.get("success") else ""
+    return {
+        "name": name, "url": url, "text": text,
+        "text_length": len(text), "success": raw.get("success", False),
+        "status_code": raw.get("status_code", 0), "tool_used": raw.get("tool", "unknown"),
+        "error": raw.get("error"),
+        **{k: v for k, v in co.items() if k not in ("url", "name")},
+    }
 
-        text = parse_text(raw.get("html", "")) if raw.get("success") else ""
-        results.append({
-            "name": name, "url": url, "text": text,
-            "text_length": len(text), "success": raw.get("success", False),
-            "status_code": raw.get("status_code", 0), "tool_used": raw.get("tool", "unknown"),
-            "error": raw.get("error"),
-            **{k: v for k, v in co.items() if k not in ("url", "name")},
-        })
-        log.info("crawl_result", company=name, success=raw.get("success"), chars=len(text))
 
-    success_count = sum(1 for r in results if r["success"])
+async def _crawl_all(companies: list) -> list:
+    sem = asyncio.Semaphore(10)
+    tasks = [_fetch_one(sem, co) for co in companies]
+    return await asyncio.gather(*tasks)
+
+
+def crawl_node(state: PipelineState) -> dict:
+    companies = state.get("companies_input", [])
+    log_node_start("crawl", companies=len(companies))
+    errors = []
+
+    results = asyncio.run(_crawl_all(companies))
+
+    for r in results:
+        if r.get("error") == "no_url":
+            errors.append(f"crawl: no URL for {r['name']}")
+        log.info("crawl_result", company=r["name"], success=r.get("success"), chars=r.get("text_length", 0))
+
+    success_count = sum(1 for r in results if r.get("success"))
     log_node_done("crawl", success=f"{success_count}/{len(results)}")
     return {"crawl_results": results, "error_log": errors}
 
@@ -168,7 +185,7 @@ def profile_node(state: PipelineState) -> dict:
 
     for ent in state.get("extracted_entities", []):
         name = ent["name"]
-        text = crawl_map.get(name, {}).get("text", "")[:3000]
+        text = crawl_map.get(name, {}).get("text", "")[:cfg.profile_context_max_chars]
 
         if not text or not cfg.is_groq_configured:
             profiles.append(_profile_fallback(name, ent, crawl_map.get(name,{})))
@@ -226,7 +243,7 @@ def synthesis_node(state: PipelineState) -> dict:
                 {"role":"user","content":f"Analisis {len(profiles)} perusahaan berikut:\n{summary}\n\nBuat ranking, pilih top 3, executive summary."},
             ], max_retries=2,
         )
-        log_node_done("synthesis", top=result.top_matches[0].company_name if result.top_matches else "-")
+        log_node_done("synthesis", top=result.top_matches[0].get("company_name", "-") if result.top_matches else "-")
         return {"synthesis_result": result.model_dump()}
     except Exception as e:
         log_error("synthesis", str(e))
@@ -234,10 +251,15 @@ def synthesis_node(state: PipelineState) -> dict:
 
 
 def _synthesis_fallback(profiles: list) -> dict:
-    ranked = sorted(profiles, key=lambda p: p.get("confidence_score",0), reverse=True)
-    return {"top_matches": [{"company_name": p["company_name"], "ranking_reason": "highest confidence", "collaboration_strategy": "", "priority_score": p.get("confidence_score",0)} for p in ranked[:3]],
-            "executive_summary": f"Batch {len(profiles)} perusahaan. Top: {ranked[0]['company_name'] if ranked else 'N/A'}.",
-            "market_insight": "", "batch_notes": "Fallback synthesis (LLM unavailable)."}
+    ranked = sorted(profiles, key=lambda p: p.get("confidence_score", 0), reverse=True)
+    return {
+        "top_matches": [{"company_name": p["company_name"], "ranking_reason": "highest confidence", "collaboration_strategy": "", "priority_score": p.get("confidence_score", 0)} for p in ranked[:3]],
+        "primary_target": ranked[0]["company_name"] if ranked else None,
+        "collaboration_score": ranked[0].get("confidence_score", 0.0) if ranked else 0.0,
+        "executive_summary": f"Batch {len(profiles)} perusahaan. Top: {ranked[0]['company_name'] if ranked else 'N/A'}.",
+        "market_insight": "",
+        "batch_notes": "Fallback synthesis (LLM unavailable).",
+    }
 
 
 # ─── Node 6: proposal ─────────────────────────────────────────────────────
@@ -336,8 +358,9 @@ def save_node(state: PipelineState) -> dict:
     crawl = state.get("crawl_results", [])
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     try:
-        from datetime import datetime as dt
-        dur = (dt.utcnow() - dt.fromisoformat(meta.get("start_time", run_id))).total_seconds()
+        start_str = meta.get("start_time", "")
+        start = datetime.fromisoformat(start_str).replace(tzinfo=None) if start_str else None
+        dur = (datetime.utcnow() - start).total_seconds() if start else 0.0
     except Exception:
         dur = 0.0
 

@@ -50,3 +50,4 @@ logs/
 # ------------------------
 # Jika lo gak mau nge-push file audio .mp3 hasil generate ke git, buka comment di bawah ini:
 docs/audio/
+*/node_modules

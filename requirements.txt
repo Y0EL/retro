@@ -46,5 +46,13 @@ openpyxl>=3.1.0
 # ===== Logging & Observability =====
 structlog>=24.1.0
 
+# ===== Gateway / Microservices =====
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# ===== Web Search =====
+duckduckgo-search>=6.0.0
+
 # ===== Utilities =====
 python-dotenv>=1.0.0
+edge-tts

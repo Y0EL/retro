@@ -1,0 +1,69 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  crawler:
+    build:
+      context: .
+      dockerfile: services/crawler/Dockerfile
+    ports:
+      - "8001:8001"
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  extraction:
+    build:
+      context: .
+      dockerfile: services/extraction/Dockerfile
+    ports:
+      - "8002:8002"
+    env_file: .env
+    restart: unless-stopped
+
+  llm:
+    build:
+      context: .
+      dockerfile: services/llm/Dockerfile
+    ports:
+      - "8003:8003"
+    env_file: .env
+    restart: unless-stopped
+
+  osint:
+    build:
+      context: .
+      dockerfile: services/osint/Dockerfile
+    ports:
+      - "8004:8004"
+    env_file: .env
+    restart: unless-stopped
+
+  pdf:
+    build:
+      context: .
+      dockerfile: services/pdf/Dockerfile
+    ports:
+      - "8005:8005"
+    env_file: .env
+    restart: unless-stopped
+
+  storage:
+    build:
+      context: .
+      dockerfile: services/storage/Dockerfile
+    ports:
+      - "8006:8006"
+    env_file: .env
+    volumes:
+      - storage_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  storage_data:
